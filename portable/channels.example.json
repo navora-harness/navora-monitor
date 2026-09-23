@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "channels": [
+    {
+      "id": "cafe-east",
+      "name": "Cafe East",
+      "group": "一楼",
+      "url": "rtsp://admin:YOUR_PASSWORD@192.168.31.165:554/h264/ch1/main/av_stream",
+      "previewUrl": "rtsp://admin:YOUR_PASSWORD@192.168.31.165:554/h264/ch1/sub/av_stream",
+      "enabled": true,
+      "rtspTransport": "tcp",
+      "segmentTimeSec": 300
+    }
+  ]
+}

@@ -1,0 +1,192 @@
+:root,
+html[data-theme='light'] {
+  color-scheme: light;
+  --bg: #eceff3;
+  --panel: #ffffff;
+  --surface: #f6f8fb;
+  --surface-2: #eef2f7;
+  --hover: #e6ebf2;
+  --active: #e4f4ee;
+  --border: #d5dce6;
+  --border-strong: #9fd4c2;
+  --text: #152033;
+  --muted: #5a6a7c;
+  --accent: #0d6b54;
+  --accent-soft: #e3f3ed;
+  --danger: #b42318;
+  --danger-soft: #fef3f2;
+  --rec: #d92d20;
+  --warn: #b54708;
+  --titlebar: #f1f3f6;
+  --input-bg: #ffffff;
+  --shadow: 0 18px 50px rgb(18 28 40 / 18%);
+  --mask: rgb(18 28 40 / 42%);
+  --radius: 10px;
+  --radius-sm: 7px;
+  --control-h: 32px;
+  --scrollbar-size: 8px;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #c2cad6;
+  --scrollbar-thumb-hover: #97a5b6;
+  --chart-loop: #0d6b54;
+  --chart-saved: #2e90fa;
+  --chart-free: #d5dce6;
+  --chart-warn: #f79009;
+  --chart-stop: #f04438;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --panel: #151b23;
+  --surface: #1b2330;
+  --surface-2: #222b3a;
+  --hover: #2a3444;
+  --active: #17352c;
+  --border: #2a3342;
+  --border-strong: #2f735c;
+  --text: #e8edf3;
+  --muted: #8b98a8;
+  --accent: #3dba8f;
+  --accent-soft: #17352c;
+  --danger: #f97066;
+  --danger-soft: #3b1c1c;
+  --rec: #f04438;
+  --warn: #f79009;
+  --titlebar: #121820;
+  --input-bg: #10161e;
+  --shadow: 0 18px 50px rgb(0 0 0 / 55%);
+  --mask: rgb(0 0 0 / 58%);
+  --scrollbar-thumb: #3a4556;
+  --scrollbar-thumb-hover: #5a6a80;
+  --chart-loop: #3dba8f;
+  --chart-saved: #53b1fd;
+  --chart-free: #2a3342;
+  --chart-warn: #f79009;
+  --chart-stop: #f97066;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+input:not([type='range']):not([type='checkbox']):not([type='radio']),
+select,
+textarea {
+  height: var(--control-h);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
+  background: var(--input-bg);
+  outline: none;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+textarea {
+  height: auto;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+input:not([type='range']):not([type='checkbox']):not([type='radio']):hover,
+select:hover,
+textarea:hover {
+  border-color: color-mix(in srgb, var(--border-strong) 55%, var(--border));
+}
+
+input:not([type='range']):not([type='checkbox']):not([type='radio']):focus,
+select:focus,
+textarea:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled,
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Shared dialog / panel surface helpers used across components */
+.nm-dialog,
+.dialog {
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.nm-btn,
+.foot .primary,
+.scan-row .primary {
+  border-radius: var(--radius-sm);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 28px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}

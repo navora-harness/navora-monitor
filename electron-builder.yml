@@ -1,0 +1,86 @@
+# electron-builder — Navora Monitor
+# https://www.electron.build/configuration
+#
+# FFmpeg binaries are injected per-target by scripts/pack.mjs via -c.extraResources.
+
+appId: com.navora.monitor
+productName: Navora Monitor
+copyright: Copyright © Navora
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+
+directories:
+  output: release
+  buildResources: build
+
+# Renderer (Vite) + main/preload (esbuild). Main deps are already bundled → no node_modules.
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - '!**/*.map'
+  - '!**/node_modules/**'
+
+asar: true
+
+# Prefer China Electron mirror when unset (override with ELECTRON_MIRROR)
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
+
+win:
+  icon: electron/assets/icon.png
+  target:
+    - target: nsis
+      arch:
+        - x64
+        - arm64
+    - target: portable
+      arch:
+        - x64
+        - arm64
+  # Avoid signing prompts on local builds
+  signAndEditExecutable: false
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Navora Monitor
+  uninstallDisplayName: Navora Monitor
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+  language: '2052'
+  differentialPackage: false
+  preCompressedFileExtensions:
+    - .exe
+    - .mp4
+    - .mkv
+
+portable:
+  artifactName: ${productName}-${version}-${arch}-portable.${ext}
+  requestExecutionLevel: user
+
+linux:
+  icon: electron/assets/icon.png
+  category: Video
+  maintainer: Navora <https://github.com/navora-harness>
+  synopsis: LAN CCTV preview, recording, and playback
+  description: Navora Monitor — local-network camera monitoring with FFmpeg-backed preview and recording.
+  desktop:
+    Name: Navora Monitor
+    Comment: LAN CCTV monitor
+    Categories: AudioVideo;Video;Recorder;
+  target:
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+    - target: tar.gz
+      arch:
+        - x64
+        - arm64
+
+# Keep release folder small in CI logs
+compression: normal
+
+# Do not publish automatically
+publish: null

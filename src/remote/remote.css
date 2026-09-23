@@ -1,0 +1,14 @@
+/* Remote viewer extras — mobile-first scroll mosaic + login */
+
+html.remote-app,
+html.remote-app body,
+html.remote-app #app {
+  height: 100%;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+html.remote-app body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}

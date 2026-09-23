@@ -1,0 +1,29 @@
+node_modules/
+dist/
+dist-electron/
+release/
+
+# Local runtime data (may contain RTSP credentials, recordings, layout)
+portable/**
+!portable/channels.example.json
+
+# Bundled FFmpeg binaries are large GPL artifacts — fetch locally, do not commit
+vendor/ffmpeg/**/ffmpeg
+vendor/ffmpeg/**/ffmpeg.exe
+vendor/.ffmpeg-extract/
+vendor/.ffmpeg-cache/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+*.log
+.DS_Store
+Thumbs.db
+*.local
+.vscode/
+.idea/
