@@ -8,17 +8,19 @@ import {
   mergeSettingsKeepingLocalPaths,
   sanitizeConfigBundle,
   sanitizeConfigParts,
+  stripMachineLocalSettings,
   type ConfigBundle,
   type ConfigBundleParts,
   DEFAULT_CONFIG_PARTS,
 } from '../../shared/config-bundle'
 import { DEFAULT_SETTINGS, type AppSettings } from '../../shared/settings'
-import type { ChannelConfig } from '../../shared/types'
+import { DEFAULT_GROUP, channelGroup } from '../../shared/groups'
 import { defaultUiLayout, type UiLayoutState } from '../../shared/panel-sizes'
 import * as channelStore from './channel-store'
 import * as layoutStore from './layout-store'
 import { loadSettings, replaceSettings } from './settings-store'
 import { ensureDir, recordingsRoot, savedClipsRoot, snapshotsRoot } from './data-root'
+import { findStorageNestConflict } from '../../shared/storage-path'
 import type { PreviewManager } from './preview-manager'
 import type { RecorderManager } from './recorder-manager'
 
@@ -35,6 +37,7 @@ export type PickConfigImportResult =
       exportedAt: string
       available: ConfigBundleParts
       channelCount: number
+      channels: Array<{ id: string; name: string; group: string }>
     }
   | { ok: false; canceled: true }
   | { ok: false; error: string }
@@ -72,7 +75,8 @@ export function buildConfigBundle(parts: ConfigBundleParts = DEFAULT_CONFIG_PART
     appVersion: app.getVersion(),
     channels: parts.channels ? fileChannels : [],
     groupOrder: parts.groupOrder ? groupOrder : [],
-    settings: parts.settings ? settings : { ...DEFAULT_SETTINGS },
+    // Paths / storage / host secrets stay on this machine — never write them out.
+    settings: parts.settings ? stripMachineLocalSettings(settings) : { ...DEFAULT_SETTINGS },
     layout: parts.layout ? layout : defaultUiLayout(),
   }
 }
@@ -117,7 +121,20 @@ export async function pickConfigImportFile(win: BrowserWindow | null): Promise<P
       ? await dialog.showOpenDialog(win, openOpts)
       : await dialog.showOpenDialog(openOpts)
     if (open.canceled || !open.filePaths[0]) return { ok: false, canceled: true }
-    const path = open.filePaths[0]
+    return inspectConfigImportFile(open.filePaths[0])
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/** Validate and summarize a config JSON at an absolute path (dialog pick or drag-drop). */
+export function inspectConfigImportFile(filePath: string): PickConfigImportResult {
+  try {
+    const path = typeof filePath === 'string' ? filePath.trim() : ''
+    if (!path) return { ok: false, error: '未指定配置文件' }
+    if (!/\.json$/i.test(path)) {
+      return { ok: false, error: '请选择 .json 配置文件' }
+    }
 
     let parsed: unknown
     try {
@@ -141,6 +158,11 @@ export async function pickConfigImportFile(win: BrowserWindow | null): Promise<P
       exportedAt: bundle.exportedAt,
       available: configBundleAvailableParts(bundle),
       channelCount: bundle.channels.length,
+      channels: bundle.channels.map((c) => ({
+        id: c.id,
+        name: c.name,
+        group: channelGroup(c),
+      })),
     }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -152,7 +174,10 @@ export async function applyConfigImport(
   args: {
     path: string
     parts?: Partial<ConfigBundleParts>
+    /** @deprecated Ignored — machine-local paths/storage are always preserved. */
     keepLocalPaths?: boolean
+    /** When importing channels, only these ids (from the file). Empty / omit = all. */
+    channelIds?: string[]
   },
   opts: { recorders: RecorderManager; previews: PreviewManager },
 ): Promise<ImportConfigResult> {
@@ -185,15 +210,37 @@ export async function applyConfigImport(
       return { ok: false, error: '所选内容在文件中不可用' }
     }
 
+    let importChannels = bundle.channels
+    if (effective.channels) {
+      if (Array.isArray(args.channelIds)) {
+        const want = new Set(
+          args.channelIds.filter((id): id is string => typeof id === 'string' && !!id.trim()),
+        )
+        importChannels = bundle.channels.filter((c) => want.has(c.id))
+        if (!importChannels.length) {
+          return { ok: false, error: '请至少选择一台要导入的设备' }
+        }
+      }
+      if (!importChannels.length) {
+        return { ok: false, error: '文件中没有可导入的设备' }
+      }
+    }
+
     opts.previews.stopAll()
     if (effective.channels) opts.recorders.stopAll()
 
-    const keepLocalPaths = args.keepLocalPaths !== false
+    const keepLocalPaths = true
     const current = loadSettings()
 
     if (effective.channels) {
-      const order = effective.groupOrder ? bundle.groupOrder : channelStore.loadGroupOrder()
-      channelStore.replaceChannelsFile(bundle.channels, order)
+      let order = effective.groupOrder ? bundle.groupOrder : channelStore.loadGroupOrder()
+      // Keep group order entries that still appear among imported channels
+      const usedGroups = new Set(importChannels.map((c) => channelGroup(c)))
+      order = order.filter((g) => usedGroups.has(g) || g === DEFAULT_GROUP)
+      for (const g of usedGroups) {
+        if (g !== DEFAULT_GROUP && !order.includes(g)) order.push(g)
+      }
+      channelStore.replaceChannelsFile(importChannels, order)
     } else if (effective.groupOrder) {
       channelStore.setGroupOrder(bundle.groupOrder)
     }
@@ -205,11 +252,17 @@ export async function applyConfigImport(
 
     let nextSettings = current
     if (effective.settings) {
-      nextSettings = replaceSettings(
-        keepLocalPaths
-          ? mergeSettingsKeepingLocalPaths(bundle.settings, current)
-          : bundle.settings,
-      )
+      // Always keep this machine's paths, storage policy, and remote password.
+      nextSettings = mergeSettingsKeepingLocalPaths(bundle.settings, current)
+      const nest = findStorageNestConflict({
+        recordingsPath: nextSettings.recordingsPath,
+        savedClipsPath: nextSettings.savedClipsPath,
+        snapshotsPath: nextSettings.snapshotsPath,
+      })
+      if (nest) {
+        return { ok: false, error: `存储路径不安全：${nest}` }
+      }
+      nextSettings = replaceSettings(nextSettings)
     }
 
     ensureDir(recordingsRoot())
@@ -247,8 +300,8 @@ export async function importConfigFromFile(
     message: '确定导入配置？',
     detail:
       `${picked.summary}\n导出时间：${picked.exportedAt}\n\n` +
-      '将按文件内容替换所选项目。建议保留本机路径。',
-    buttons: ['取消', '导入并保留本机路径', '全部导入'],
+      '将按文件内容替换所选项目。本机路径与存储感知设置不会被覆盖。',
+    buttons: ['取消', '导入'],
     defaultId: 1,
     cancelId: 0,
     noLink: true,
@@ -262,7 +315,6 @@ export async function importConfigFromFile(
     {
       path: picked.path,
       parts: DEFAULT_CONFIG_PARTS,
-      keepLocalPaths: choice.response === 1,
     },
     opts,
   )

@@ -59,11 +59,16 @@ export type RecordingSegment = {
   fileName: string
   /** Absolute path on disk */
   path: string
-  /** http://127.0.0.1:<port>/recordings/... or /saved/... */
+  /** http://127.0.0.1:<port>/recordings/... or /saved/... (raw file) */
   url: string
+  /**
+   * Browser-playable MPEG-TS remux URL for mpegts.js.
+   * Prefer this over `url` in the playback UI.
+   */
+  playbackUrl?: string | null
   sizeBytes: number
   mtimeMs: number
-  /** Best-effort from mtime - segmentTime */
+  /** Wall-clock range from filename / index / ffprobe */
   startMs: number | null
   endMs: number | null
   /** True for Tesla-style SavedClips — never auto-cleaned */
@@ -79,6 +84,10 @@ export type ProbeResult =
 export type AppInfo = {
   name: string
   version: string
+  license: string
+  copyright: string
+  homepage: string
+  licenseNote: string
   dataRoot: string
   recordingsPath: string
   snapshotsPath: string

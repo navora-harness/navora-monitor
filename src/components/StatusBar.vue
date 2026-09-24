@@ -4,6 +4,7 @@ defineProps<{
   channelCount: number
   recordingCount: number
   dataRoot: string
+  appVersion?: string
   diskLabel?: string
   diskUsedLabel?: string
   diskSavedLabel?: string
@@ -12,14 +13,16 @@ defineProps<{
   diskBlocked?: boolean
   retentionFit?: boolean
   retentionHint?: string
+  /** Narrow screens — hide long path / keep essentials */
+  compact?: boolean
 }>()
 </script>
 
 <template>
-  <footer class="status">
+  <footer class="status" :class="{ compact }">
     <span class="msg">{{ message }}</span>
     <span
-      v-if="diskLabel"
+      v-if="diskLabel && !compact"
       class="disk"
       :class="diskLevel"
       :title="
@@ -41,22 +44,33 @@ defineProps<{
       <template v-else-if="retentionFit === false"> · 容量不足</template>
       <template v-else-if="diskLevel === 'warn'"> · 告警</template>
     </span>
-    <span class="meta">通道 {{ channelCount }} · 录像中 {{ recordingCount }}</span>
-    <span class="path" :title="dataRoot">{{ dataRoot }}</span>
+    <span class="meta">
+      <template v-if="compact">{{ channelCount }} 路 · 录 {{ recordingCount }}</template>
+      <template v-else>通道 {{ channelCount }} · 录像中 {{ recordingCount }}</template>
+    </span>
+    <span v-if="appVersion" class="ver" :title="`版本 ${appVersion}`">v{{ appVersion }}</span>
+    <span v-if="!compact" class="path" :title="dataRoot">{{ dataRoot }}</span>
   </footer>
 </template>
 
 <style scoped>
 .status {
-  height: 24px;
+  height: 28px;
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 10px;
-  font-size: 11px;
+  padding: 0 12px;
+  font-size: 12px;
   color: var(--muted);
   background: var(--titlebar);
   border-top: 1px solid var(--border);
+}
+.status.compact {
+  height: auto;
+  min-height: 28px;
+  padding: 6px 12px calc(6px + env(safe-area-inset-bottom, 0));
+  gap: 8px;
+  font-size: 11px;
 }
 .msg {
   flex: 1;
@@ -80,6 +94,11 @@ defineProps<{
 }
 .meta {
   flex-shrink: 0;
+}
+.ver {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
 }
 .path {
   flex-shrink: 1;

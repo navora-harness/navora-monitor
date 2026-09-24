@@ -2,10 +2,12 @@ node_modules/
 dist/
 dist-electron/
 release/
+electron-builder.pack.json
 
 # Local runtime data (may contain RTSP credentials, recordings, layout)
 portable/**
 !portable/channels.example.json
+# recording-session.json is local runtime state (channel ids); keep out of git
 
 # Bundled FFmpeg binaries are large GPL artifacts — fetch locally, do not commit
 vendor/ffmpeg/**/ffmpeg

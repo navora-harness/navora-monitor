@@ -61,7 +61,11 @@ cp portable/channels.example.json portable/channels.json     # Linux
 
 跨平台说明：可在 Windows 上打 Linux 包（electron-builder 下载对应 Electron）；Linux ARM / Win ARM 需已下载对应 FFmpeg。
 
-FFmpeg 为 GPLv3，发行包内附带 `resources/ffmpeg/LICENSE.txt`。
+## 开源协议
+
+本仓库源代码采用 [MIT License](./LICENSE)。
+
+发行包中内置的 FFmpeg 二进制来自 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)，遵循 **GPLv3**（见 `resources/ffmpeg/LICENSE.txt` / `vendor/ffmpeg/*/LICENSE.txt`）。分发含 FFmpeg 的安装包时，请一并遵守其 GPL 义务。
 
 ## 仓库隐私约定
 

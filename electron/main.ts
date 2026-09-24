@@ -1,13 +1,19 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from 'electron'
-import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
 import * as channelStore from './modules/channel-store'
 import { channelRecordDir, channelSavedDir, ensureDir, getDataRoot, isRecordCacheActive, recordCacheRoot, recordingsRoot, savedClipsRoot, snapshotsRoot } from './modules/data-root'
 import * as layoutStore from './modules/layout-store'
 import { MediaServer } from './modules/media-server'
+import {
+  registerMediaProtocolHandler,
+  registerMediaSchemePrivileged,
+} from './modules/media-protocol'
 import { getPreviewRoot, PreviewManager } from './modules/preview-manager'
 import { listRecordingSegments } from './modules/recording-index'
 import { deleteSavedClip, listSavedClips, saveRecentClip } from './modules/saved-clips'
+import { exportClipRange } from './modules/export-clip'
+import { formatExportStamp } from '../shared/export-clip'
 import { RecorderManager } from './modules/recorder-manager'
 import { probeChannel } from './modules/ffmpeg/probe'
 import { ScheduleRunner } from './modules/schedule-runner'
@@ -15,14 +21,22 @@ import { saveSnapshotJpeg } from './modules/snapshot-store'
 import { loadAppIcon } from './modules/app-icon'
 import { createAppTray, type TrayController } from './modules/tray'
 import { loadSettings, saveSettings } from './modules/settings-store'
+import { applyOpenAtLogin } from './modules/login-item'
 import { repairConfiguration } from './modules/repair-config'
-import { exportConfigToFile, pickConfigImportFile, applyConfigImport } from './modules/config-transfer'
+import { exportConfigToFile, pickConfigImportFile, inspectConfigImportFile, applyConfigImport } from './modules/config-transfer'
 import { cancelDeviceScan, runDeviceScan, listScanSubnets } from './modules/device-scan'
 import { StorageGuard } from './modules/storage-guard'
 import { runRetentionCleanup } from './modules/retention'
 import { RemoteServer } from './modules/remote-server'
-import { generateSecurePassword, REMOTE_USERNAME } from '../shared/password'
+import { generateSecurePassword } from '../shared/password'
 import { channelGroup } from '../shared/groups'
+import {
+  APP_COPYRIGHT,
+  APP_HOMEPAGE,
+  APP_LICENSE,
+  APP_LICENSE_NOTE,
+  APP_NAME,
+} from '../shared/app-meta'
 import type { AppSettings } from '../shared/settings'
 import type { ChannelConfig, ChannelRuntimeState } from '../shared/types'
 import type { UiLayoutState } from '../shared/panel-sizes'
@@ -32,6 +46,9 @@ declare const __dirname: string
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
+} else {
+  // Must run before app.whenReady()
+  registerMediaSchemePrivileged()
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -57,8 +74,21 @@ const remote = new RemoteServer({
   getGroupOrder: () => channelStore.loadGroupOrder(),
   mergeState,
   allStates,
+  listRecordings: (channelId?: string) => {
+    const seg = loadSettings().defaultSegmentTimeSec || 300
+    return listRecordingSegments(media, channelId, seg)
+  },
+  listSavedClips: (channelId?: string) => listSavedClips(media, channelId),
   getStaticRoot: () => join(__dirname, '../dist'),
   getViteDevUrl: () => process.env.VITE_DEV_SERVER_URL ?? null,
+  getAppMeta: () => ({
+    name: APP_NAME,
+    version: packageVersion(),
+    license: APP_LICENSE,
+    copyright: APP_COPYRIGHT,
+    homepage: APP_HOMEPAGE,
+    licenseNote: APP_LICENSE_NOTE,
+  }),
 })
 
 function ensureRemotePassword(settings: AppSettings): AppSettings {
@@ -77,7 +107,23 @@ function allStates(): ChannelRuntimeState[] {
   return channelStore.loadChannels().map((c) => mergeState(c.id))
 }
 
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+  const win = mainWindow
+  if (!win || win.isDestroyed()) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+function hideMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.hide()
+}
+
 function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return
+
   ensureDir(getDataRoot())
   ensureDir(recordingsRoot())
   ensureDir(snapshotsRoot())
@@ -135,6 +181,19 @@ function createWindow() {
   mainWindow.on('minimize', notifyVisibility)
   mainWindow.on('restore', notifyVisibility)
   mainWindow.on('focus', notifyVisibility)
+
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    const key = input.key.toLowerCase()
+    const toggle =
+      key === 'f12' || (key === 'i' && input.control && input.shift && !input.alt && !input.meta)
+    if (!toggle) return
+    event.preventDefault()
+    const wc = mainWindow?.webContents
+    if (!wc || wc.isDestroyed()) return
+    if (wc.isDevToolsOpened()) wc.closeDevTools()
+    else wc.openDevTools({ mode: 'detach' })
+  })
   mainWindow.on('blur', () => {
     /* keep playing while focused elsewhere but still visible */
   })
@@ -143,7 +202,7 @@ function createWindow() {
     if (isQuitting) return
     if (loadSettings().closeToTray) {
       e.preventDefault()
-      mainWindow?.hide()
+      hideMainWindow()
     }
   })
 
@@ -165,7 +224,8 @@ function quitApp() {
   isQuitting = true
   void remote.stop()
   previews.stopAll()
-  recorders.stopAll()
+  // Keep remembered recording ids so next launch can resume
+  recorders.stopAll({ forget: false })
   scheduler.stop()
   storage.stopTimer()
   if (retentionTimer) clearInterval(retentionTimer)
@@ -179,8 +239,12 @@ function registerIpc() {
     const ff = recorders.getFfmpegInfo()
     const s = loadSettings()
     return {
-      name: 'Navora Monitor',
+      name: APP_NAME,
       version: packageVersion(),
+      license: APP_LICENSE,
+      copyright: APP_COPYRIGHT,
+      homepage: APP_HOMEPAGE,
+      licenseNote: APP_LICENSE_NOTE,
       dataRoot: getDataRoot(),
       recordingsPath: recordingsRoot(),
       snapshotsPath: snapshotsRoot(),
@@ -193,6 +257,12 @@ function registerIpc() {
       defaultSegmentTimeSec: s.defaultSegmentTimeSec,
       savedClipDurationSec: s.savedClipDurationSec,
     }
+  })
+
+  ipcMain.handle('nm:openExternal', (_e, url: unknown) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return { ok: false as const }
+    void shell.openExternal(url)
+    return { ok: true as const }
   })
 
   ipcMain.handle('nm:getSettings', () => loadSettings())
@@ -211,6 +281,7 @@ function registerIpc() {
     ensureDir(savedClipsRoot())
     recorders.refreshFfmpeg()
     previews.refreshFfmpeg()
+    applyOpenAtLogin(next)
     try {
       await remote.applyFromSettings()
     } catch {
@@ -225,7 +296,7 @@ function registerIpc() {
 
   ipcMain.handle('nm:ensureRemotePassword', () => {
     const next = ensureRemotePassword(loadSettings())
-    return { password: next.remotePassword, username: REMOTE_USERNAME }
+    return { password: next.remotePassword, username: next.remoteUsername }
   })
 
   ipcMain.handle('nm:repairConfig', (_e, activePreviewIds?: string[]) => {
@@ -241,6 +312,7 @@ function registerIpc() {
   )
 
   ipcMain.handle('nm:pickConfigImport', () => pickConfigImportFile(mainWindow))
+  ipcMain.handle('nm:inspectConfigImport', (_e, filePath: string) => inspectConfigImportFile(filePath))
 
   ipcMain.handle(
     'nm:applyConfigImport',
@@ -250,6 +322,7 @@ function registerIpc() {
         path: string
         parts?: Partial<import('../shared/config-bundle').ConfigBundleParts>
         keepLocalPaths?: boolean
+        channelIds?: string[]
       },
     ) => {
       const result = await applyConfigImport(mainWindow, args ?? { path: '' }, { recorders, previews })
@@ -301,11 +374,11 @@ function registerIpc() {
       (prev.previewUrl ?? '') !== (channel.previewUrl ?? '') ||
       (prev.rtspTransport ?? 'tcp') !== (channel.rtspTransport ?? 'tcp') ||
       prev.enabled !== channel.enabled
-    if (slice.preview === 'live' || slice.preview === 'starting') {
-      if (!channel.enabled) previews.stop(channel.id)
-      else if (streamChanged) previews.restart(channel)
-    } else if (!channel.enabled) {
+    if (!channel.enabled) {
       previews.stop(channel.id)
+      recorders.stop(channel.id)
+    } else if (slice.preview === 'live' || slice.preview === 'starting') {
+      if (streamChanged) previews.restart(channel)
     }
     return list
   })
@@ -322,11 +395,11 @@ function registerIpc() {
         (prev.previewUrl ?? '') !== (channel.previewUrl ?? '') ||
         (prev.rtspTransport ?? 'tcp') !== (channel.rtspTransport ?? 'tcp') ||
         prev.enabled !== channel.enabled
-      if (slice.preview === 'live' || slice.preview === 'starting') {
-        if (!channel.enabled) previews.stop(channel.id)
-        else if (streamChanged) previews.restart(channel)
-      } else if (!channel.enabled) {
+      if (!channel.enabled) {
         previews.stop(channel.id)
+        recorders.stop(channel.id)
+      } else if (slice.preview === 'live' || slice.preview === 'starting') {
+        if (streamChanged) previews.restart(channel)
       }
     }
     return list
@@ -474,6 +547,43 @@ function registerIpc() {
     }
   })
 
+  ipcMain.handle(
+    'nm:exportClipRange',
+    async (
+      _e,
+      opts: { channelId: string; startMs: number; endMs: number; pickPath?: boolean },
+    ) => {
+      const channelId = typeof opts?.channelId === 'string' ? opts.channelId : ''
+      const ch = channelStore.loadChannels().find((c) => c.id === channelId)
+      if (!ch) return { ok: false as const, error: '通道不存在' }
+      const startMs = Number(opts.startMs)
+      const endMs = Number(opts.endMs)
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        return { ok: false as const, error: '时间范围无效' }
+      }
+
+      let outputPath: string | undefined
+      if (opts.pickPath) {
+        const a = Math.min(startMs, endMs)
+        const b = Math.max(startMs, endMs)
+        const defaultName = `Export_${formatExportStamp(a)}_${formatExportStamp(b)}.mp4`
+        const picked = await dialog.showSaveDialog(mainWindow ?? undefined, {
+          title: '导出合并片段',
+          defaultPath: join(channelSavedDir(channelId), defaultName),
+          filters: [{ name: 'MP4', extensions: ['mp4'] }],
+        })
+        if (picked.canceled || !picked.filePath) {
+          return { ok: false as const, error: '已取消', canceled: true as const }
+        }
+        outputPath = picked.filePath.toLowerCase().endsWith('.mp4')
+          ? picked.filePath
+          : `${picked.filePath}.mp4`
+      }
+
+      return exportClipRange({ channelId, startMs, endMs, outputPath })
+    },
+  )
+
   ipcMain.handle('nm:deleteSavedClip', (_e, segmentId: string) => {
     return deleteSavedClip(segmentId)
   })
@@ -482,6 +592,21 @@ function registerIpc() {
     const dir = id ? channelSavedDir(id) : savedClipsRoot()
     ensureDir(dir)
     shell.openPath(dir)
+  })
+
+  /** Open Explorer/Finder with the file selected (falls back to parent dir). */
+  ipcMain.handle('nm:revealItem', (_e, filePath?: string) => {
+    if (typeof filePath !== 'string' || !filePath.trim()) return
+    const p = filePath.trim()
+    if (existsSync(p)) {
+      shell.showItemInFolder(p)
+      return
+    }
+    const dir = dirname(p)
+    if (dir && existsSync(dir)) {
+      ensureDir(dir)
+      shell.openPath(dir)
+    }
   })
 
   ipcMain.handle('nm:probeChannel', async (_e, id: string) => {
@@ -551,12 +676,23 @@ function registerIpc() {
     else mainWindow.maximize()
   })
   ipcMain.handle('nm:windowClose', () => {
-    if (loadSettings().closeToTray) mainWindow?.hide()
+    if (loadSettings().closeToTray) hideMainWindow()
     else quitApp()
+  })
+  ipcMain.handle('nm:toggleDevTools', () => {
+    const wc = mainWindow?.webContents
+    if (!wc || wc.isDestroyed()) return { open: false }
+    if (wc.isDevToolsOpened()) {
+      wc.closeDevTools()
+      return { open: false }
+    }
+    wc.openDevTools({ mode: 'detach' })
+    return { open: true }
   })
 }
 
 app.whenReady().then(async () => {
+  registerMediaProtocolHandler()
   let settings = loadSettings()
   settings = ensureRemotePassword(settings)
   recorders.refreshFfmpeg()
@@ -572,10 +708,39 @@ app.whenReady().then(async () => {
   createWindow()
   tray = createAppTray({
     getMainWindow: () => mainWindow,
+    ensureMainWindow: () => {
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+    },
     onQuit: () => quitApp(),
+    initialIconVisible: true,
   })
+  applyOpenAtLogin(loadSettings())
+  // Resume manual recordings from last session (before schedule tick)
+  const resolveChannel = (id: string) => channelStore.loadChannels().find((c) => c.id === id)
+  recorders.setChannelResolver(resolveChannel)
+
+  const tryResumeRemembered = async (reason: string) => {
+    const gate = await storage.ensureRecordAllowed()
+    if (!gate.ok) {
+      console.log(`[recording] resume deferred (${reason}): ${gate.error}`)
+      return
+    }
+    const resumed = recorders.resumeRemembered(resolveChannel)
+    if (resumed.started > 0) {
+      console.log(`[recording] resumed ${resumed.started} channel(s) (${reason})`)
+    }
+    if (resumed.errors.length) {
+      console.warn(`[recording] resume issues: ${resumed.errors.slice(0, 3).join('; ')}`)
+    }
+  }
+
+  await tryResumeRemembered('startup')
   scheduler.start(15_000)
   storage.start(15_000)
+  // Retry remembered recordings periodically (disk was full / ffmpeg race / crash)
+  setInterval(() => {
+    void tryResumeRemembered('periodic')
+  }, 30_000)
   void runRetentionCleanup()
   retentionTimer = setInterval(() => {
     void runRetentionCleanup()
@@ -583,14 +748,19 @@ app.whenReady().then(async () => {
 })
 
 app.on('second-instance', () => {
-  tray?.showMain()
+  showMainWindow()
+})
+
+app.on('activate', () => {
+  // macOS dock click
+  showMainWindow()
 })
 
 app.on('before-quit', () => {
   isQuitting = true
   void remote.stop()
   previews.stopAll()
-  recorders.stopAll()
+  recorders.stopAll({ forget: false })
   scheduler.stop()
   storage.stopTimer()
   if (retentionTimer) clearInterval(retentionTimer)
@@ -599,4 +769,9 @@ app.on('before-quit', () => {
 
 app.on('window-all-closed', () => {
   if (process.platform === 'darwin') return
+  // Keep running only while close-to-tray leaves a hidden window.
+  // If the window was actually destroyed, quit (tray icon alone is not enough).
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (!isQuitting) quitApp()
+  }
 })

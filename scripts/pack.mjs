@@ -13,11 +13,10 @@
  * (e.g. nsis, portable, AppImage, tar.gz, --dir).
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
-
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 /** @typedef {{ id: string, platform: 'win' | 'linux', arch: 'x64' | 'arm64', ffmpegDirs: string[], exe: string }} PackTarget */
@@ -123,13 +122,34 @@ function runBuilder(target, extra) {
     return 1
   }
 
+  // Override next to electron-builder.yml so `extends` resolves correctly.
+  // CLI -c.extraResources[0].* is rejected by schema; shell-escaped JSON is unreliable on Windows.
+  const overridePath = join(root, 'electron-builder.pack.json')
+  writeFileSync(
+    overridePath,
+    JSON.stringify(
+      {
+        extends: './electron-builder.yml',
+        extraResources: [
+          {
+            from: ffmpegDir.replace(/\\/g, '/'),
+            to: 'ffmpeg',
+            filter: ['**/*'],
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+
   const builderArgs = [
     `--${target.platform}`,
     `--${target.arch}`,
     ...defaultBuilderArgs(target, extra),
-    `-c.extraResources[0].from=${ffmpegDir}`,
-    `-c.extraResources[0].to=ffmpeg`,
-    `-c.extraResources[0].filter[0]=**/*`,
+    '--config',
+    'electron-builder.pack.json',
   ]
 
   console.log(`\n[pack] ${target.id}`)
@@ -142,18 +162,46 @@ function runBuilder(target, extra) {
       process.env.ELECTRON_MIRROR ||
       process.env.electron_mirror ||
       'https://npmmirror.com/mirrors/electron/',
+    // Allow rcedit to stamp icon/version without triggering code-sign dialogs.
+    CSC_IDENTITY_AUTO_DISCOVERY: process.env.CSC_IDENTITY_AUTO_DISCOVERY || 'false',
   }
 
+  try {
+    const r = spawnSync(
+      process.platform === 'win32' ? 'npx.cmd' : 'npx',
+      ['electron-builder', ...builderArgs],
+      { cwd: root, env, stdio: 'inherit', shell: process.platform === 'win32' },
+    )
+    return r.status ?? 1
+  } finally {
+    try {
+      unlinkSync(overridePath)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function ensureWinInstallerAssets() {
+  if (process.platform !== 'win32') return
+  const script = join(root, 'scripts', 'build-installer-assets.ps1')
+  if (!existsSync(script)) return
+  console.log('[pack] Refreshing build/icon.ico from electron/assets/icon.png …')
   const r = spawnSync(
-    process.platform === 'win32' ? 'npx.cmd' : 'npx',
-    ['electron-builder', ...builderArgs],
-    { cwd: root, env, stdio: 'inherit', shell: process.platform === 'win32' },
+    'powershell',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+    { cwd: root, stdio: 'inherit' },
   )
-  return r.status ?? 1
+  if ((r.status ?? 1) !== 0) {
+    console.warn('[pack] installer:assets failed — continuing with existing build/icon.ico')
+  }
 }
 
 function main() {
   const { targetIds, builderExtra } = parseArgs(process.argv.slice(2))
+  if (targetIds.some((id) => TARGETS[id]?.platform === 'win')) {
+    ensureWinInstallerAssets()
+  }
   let code = 0
   for (const id of targetIds) {
     const target = TARGETS[id]

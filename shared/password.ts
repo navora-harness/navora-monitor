@@ -14,3 +14,12 @@ export function generateSecurePassword(length = 16): string {
 }
 
 export const REMOTE_USERNAME = 'admin'
+
+/** Allowed remote login name: 1–32 chars, letters/digits/_-@. */
+export function sanitizeRemoteUsername(raw: unknown): string {
+  if (typeof raw !== 'string') return REMOTE_USERNAME
+  const t = raw.trim()
+  if (!t) return REMOTE_USERNAME
+  if (!/^[A-Za-z0-9_@.-]{1,32}$/.test(t)) return REMOTE_USERNAME
+  return t
+}

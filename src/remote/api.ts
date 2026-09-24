@@ -1,4 +1,4 @@
-import type { ChannelConfig, ChannelRuntimeState } from '@shared/types'
+import type { ChannelConfig, ChannelRuntimeState, RecordingSegment } from '@shared/types'
 import { REMOTE_USERNAME } from '@shared/password'
 
 const TOKEN_KEY = 'nm_remote_token'
@@ -61,10 +61,10 @@ async function request<T>(
   return data
 }
 
-export async function login(password: string) {
+export async function login(username: string, password: string) {
   const data = await request<{ ok: true; token: string; username: string }>('/api/login', {
     method: 'POST',
-    json: { username: REMOTE_USERNAME, password },
+    json: { username: username.trim() || REMOTE_USERNAME, password },
   })
   setStoredToken(data.token)
   return data
@@ -79,15 +79,31 @@ export async function logout() {
   setStoredToken(null)
 }
 
+export type RemoteAppMeta = {
+  name: string
+  version: string
+  license: string
+  copyright: string
+  homepage: string
+  licenseNote: string
+}
+
 export type RemoteBootstrap = {
   channels: ChannelConfig[]
   groupOrder: string[]
   states: ChannelRuntimeState[]
   uiTheme: 'light' | 'dark' | 'system'
+  app?: RemoteAppMeta
 }
 
 export function fetchBootstrap() {
   return request<RemoteBootstrap>('/api/bootstrap')
+}
+
+export function fetchRemoteStatus() {
+  return request<
+    { ok: true; username: string; listening: boolean } & Partial<RemoteAppMeta>
+  >('/api/status')
 }
 
 export function fetchStates() {
@@ -101,7 +117,17 @@ export function syncPreviews(channelIds: string[]) {
   })
 }
 
-/** Attach auth token so mpegts.js media requests pass remote auth. */
+export function fetchRecordings(channelId?: string | null) {
+  const q = channelId ? `?channelId=${encodeURIComponent(channelId)}` : ''
+  return request<{ segments: RecordingSegment[] }>(`/api/recordings${q}`)
+}
+
+export function fetchSavedClips(channelId?: string | null) {
+  const q = channelId ? `?channelId=${encodeURIComponent(channelId)}` : ''
+  return request<{ segments: RecordingSegment[] }>(`/api/saved-clips${q}`)
+}
+
+/** Attach auth token so mpegts.js / video media requests pass remote auth. */
 export function withMediaAuth(url: string | null | undefined): string | null {
   if (!url) return null
   const token = getStoredToken()
@@ -114,4 +140,8 @@ export function withMediaAuth(url: string | null | undefined): string | null {
     const sep = url.includes('?') ? '&' : '?'
     return `${url}${sep}token=${encodeURIComponent(token)}`
   }
+}
+
+export function withSegmentMediaAuth(seg: RecordingSegment): RecordingSegment {
+  return { ...seg, url: withMediaAuth(seg.url) ?? seg.url }
 }

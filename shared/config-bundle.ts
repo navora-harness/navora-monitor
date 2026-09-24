@@ -1,5 +1,5 @@
 import type { AppSettings } from './settings'
-import { sanitizeSettings } from './settings'
+import { DEFAULT_SETTINGS, sanitizeSettings } from './settings'
 import { sanitizeUiLayout, type UiLayoutState } from './panel-sizes'
 import type { ChannelConfig } from './types'
 import { sanitizeSchedule } from './schedule'
@@ -45,14 +45,36 @@ export function sanitizeConfigParts(raw: unknown): ConfigBundleParts {
   }
 }
 
-/** Absolute path fields that are usually machine-specific. */
-export const LOCAL_PATH_SETTING_KEYS = [
+/** Absolute path / machine-bound fields — never transfer across machines. */
+export const MACHINE_LOCAL_SETTING_KEYS = [
+  // Storage paths
   'recordingsPath',
   'snapshotsPath',
   'savedClipsPath',
   'recordCachePath',
   'ffmpegPath',
+  // Storage policy (disk / retention / write-cache) — depends on local disk
+  'retentionDays',
+  'diskWarnFreeGb',
+  'diskStopFreeGb',
+  'diskAutoCleanup',
+  'recordCacheEnabled',
+  // Host-only
+  'openAtLogin',
+  'remotePassword',
 ] as const satisfies readonly (keyof AppSettings)[]
+
+/** @deprecated alias — use MACHINE_LOCAL_SETTING_KEYS */
+export const LOCAL_PATH_SETTING_KEYS = MACHINE_LOCAL_SETTING_KEYS
+
+/** Replace machine-local fields with defaults (for export JSON). */
+export function stripMachineLocalSettings(settings: AppSettings): AppSettings {
+  const next: AppSettings = { ...settings }
+  for (const key of MACHINE_LOCAL_SETTING_KEYS) {
+    next[key] = DEFAULT_SETTINGS[key] as never
+  }
+  return sanitizeSettings(next)
+}
 
 export function sanitizeChannelConfig(raw: unknown): ChannelConfig | null {
   if (!raw || typeof raw !== 'object') return null
@@ -114,13 +136,14 @@ export function sanitizeConfigBundle(raw: unknown): ConfigBundle | null {
   }
 }
 
+/** Keep this machine's paths / storage / password when applying an imported bundle. */
 export function mergeSettingsKeepingLocalPaths(
   imported: AppSettings,
   current: AppSettings,
 ): AppSettings {
   const next: AppSettings = { ...imported }
-  for (const key of LOCAL_PATH_SETTING_KEYS) {
-    next[key] = current[key]
+  for (const key of MACHINE_LOCAL_SETTING_KEYS) {
+    next[key] = current[key] as never
   }
   return sanitizeSettings(next)
 }

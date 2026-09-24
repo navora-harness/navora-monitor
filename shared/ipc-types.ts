@@ -99,6 +99,7 @@ export type ConfigBundleParts = {
 
 export type NavoraMonitorApi = {
   getAppInfo: () => Promise<AppInfo>
+  openExternal: (url: string) => Promise<{ ok: boolean }>
   getSettings: () => Promise<AppSettings>
   setSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>
   getDiskSpace: () => Promise<DiskSpaceInfo | null>
@@ -124,6 +125,21 @@ export type NavoraMonitorApi = {
         exportedAt: string
         available: ConfigBundleParts
         channelCount: number
+        channels: Array<{ id: string; name: string; group: string }>
+      }
+    | { ok: false; canceled: true }
+    | { ok: false; error: string }
+  >
+  /** Inspect a config JSON at an absolute path (e.g. after drag-drop). */
+  inspectConfigImport: (filePath: string) => Promise<
+    | {
+        ok: true
+        path: string
+        summary: string
+        exportedAt: string
+        available: ConfigBundleParts
+        channelCount: number
+        channels: Array<{ id: string; name: string; group: string }>
       }
     | { ok: false; canceled: true }
     | { ok: false; error: string }
@@ -132,6 +148,7 @@ export type NavoraMonitorApi = {
     path: string
     parts?: ConfigBundleParts
     keepLocalPaths?: boolean
+    channelIds?: string[]
   }) => Promise<
     | {
         ok: true
@@ -199,8 +216,29 @@ export type NavoraMonitorApi = {
     | { ok: true; copied: number; durationSec: number; message: string; clips: RecordingSegment[] }
     | { ok: false; error: string }
   >
+  exportClipRange: (opts: {
+    channelId: string
+    startMs: number
+    endMs: number
+    /** If true, show Save As dialog; otherwise write under SavedClips */
+    pickPath?: boolean
+  }) => Promise<
+    | {
+        ok: true
+        path: string
+        fileName: string
+        channelId: string
+        startMs: number
+        endMs: number
+        segmentCount: number
+        message: string
+      }
+    | { ok: false; error: string; canceled?: true }
+  >
   deleteSavedClip: (segmentId: string) => Promise<{ ok: true } | { ok: false; error: string }>
   revealSavedClips: (channelId?: string) => Promise<void>
+  /** Reveal a file in the OS file manager (selected). */
+  revealItem: (filePath: string) => Promise<void>
   probeChannel: (id: string) => Promise<ProbeResult>
   scanDevices: (opts: DeviceScanRequest) => Promise<
     | { ok: true; cameras: DiscoveredCamera[]; durationMs: number; scannedHosts: number }
@@ -222,6 +260,8 @@ export type NavoraMonitorApi = {
   windowMinimize: () => Promise<void>
   windowMaximize: () => Promise<void>
   windowClose: () => Promise<void>
+  /** Toggle Chromium DevTools (detached). */
+  toggleDevTools: () => Promise<{ open: boolean }>
   getRemoteStatus: () => Promise<RemoteAccessStatus>
   generateRemotePassword: () => Promise<string>
   ensureRemotePassword: () => Promise<{ password: string; username: string }>

@@ -289,7 +289,7 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
         label: fullscreenIndex.value === cell.index ? '退出全屏' : '全屏播放',
       },
       { id: 'snapshot', label: '截图' },
-      { id: 'saveClip', label: '保存最近片段' },
+      { id: 'saveClip', label: '框选保存片段' },
       { separator: true },
       { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像' },
       { id: previewing ? 'previewStop' : 'previewStart', label: previewing ? '停止预览' : '开始预览' },
@@ -575,7 +575,7 @@ onUnmounted(() => {
         <button
           type="button"
           class="tb-btn save"
-          title="保存最近片段"
+          title="框选保存片段"
           @click="emit('saveClip', activeCell.channel.id)"
         >
           <svg viewBox="0 0 16 16" aria-hidden="true">

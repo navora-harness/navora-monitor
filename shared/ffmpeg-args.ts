@@ -24,7 +24,20 @@ export type ProbeOptions = {
 
 export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
   const segmentTime = Math.max(10, Math.round(opts.segmentTimeSec ?? 300))
-  const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-y']
+  const args: string[] = [
+    '-hide_banner',
+    '-loglevel',
+    'warning',
+    '-y',
+    // CCTV RTSP often has jittery / missing PTS; generate PTS and drop corrupt packets
+    // so segments are less likely to open as "audio clock runs / first video frame stuck".
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-probesize',
+    '2000000',
+    '-analyzeduration',
+    '2000000',
+  ]
 
   if (opts.inputUrl.toLowerCase().startsWith('rtsp://')) {
     args.push('-rtsp_transport', opts.rtspTransport ?? 'tcp')
@@ -35,8 +48,14 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     opts.inputUrl,
     '-c',
     'copy',
+    // Re-insert codec extradata before keyframes when the camera only sent
+    // VPS/SPS/PPS once at stream open (common on H.264/H.265 RTSP).
+    '-bsf:v',
+    'dump_extra=freq=keyframe',
     '-reset_timestamps',
     '1',
+    '-avoid_negative_ts',
+    'make_zero',
     '-metadata',
     `title=${opts.title}`,
     '-map',
@@ -45,8 +64,18 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     'segment',
     '-segment_time',
     String(segmentTime),
+    // Stay on keyframe boundaries when possible (copy still cannot invent IDRs).
+    '-break_non_keyframes',
+    '0',
+    '-strftime',
+    '1',
+    // MPEG-TS remux; seek granularity follows camera GOP.
+    // Prefer cameras with ≤2s keyint for accurate scrubbing.
     '-segment_format',
-    'mp4',
+    'mpegts',
+    // Re-emit PAT/PMT so each finished .ts is more self-describing for players.
+    '-segment_format_options',
+    'mpegts_flags=+resend_headers',
     opts.outputPattern,
   )
 

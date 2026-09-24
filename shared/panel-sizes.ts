@@ -20,7 +20,8 @@ export type UiLayoutState = {
 export const PANEL_LIMITS = {
   explorer: { min: 180, max: 420, default: 240 },
   inspector: { min: 220, max: 480, default: 280 },
-  timeline: { min: 100, max: 360, default: 160 },
+  /** Compact chrome allows ~72px; default keeps a comfortable track. */
+  timeline: { min: 72, max: 320, default: 112 },
 } as const
 
 export const MOSAIC_SLOT_COUNT = 16

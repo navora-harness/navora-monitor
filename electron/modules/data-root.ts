@@ -1,19 +1,40 @@
+import { app } from 'electron'
 import { join, resolve } from 'node:path'
+import { APP_NAME } from '../../shared/app-meta'
 import { ensureDir, getConfigRoot, getDataRoot } from './config-root'
 import { loadSettings } from './settings-store'
 
 export { ensureDir, getConfigRoot, getDataRoot }
 
+/**
+ * Default media library under the OS Videos folder:
+ *   <Videos>/Navora Monitor/{recordings,saved,snapshots}
+ * Falls back to <configRoot>/media if Videos is unavailable.
+ * Config / write-cache stay under getConfigRoot() (faster local disk).
+ */
+export function defaultMediaLibraryRoot(): string {
+  try {
+    const dir = join(app.getPath('videos'), APP_NAME)
+    ensureDir(dir)
+    return dir
+  } catch (err) {
+    console.warn('[data-root] Videos library unavailable, using config media/', err)
+    const fallback = join(getConfigRoot(), 'media')
+    ensureDir(fallback)
+    return fallback
+  }
+}
+
 export function recordingsRoot(): string {
   const s = loadSettings()
-  const dir = s.recordingsPath || join(getConfigRoot(), 'recordings')
+  const dir = s.recordingsPath || join(defaultMediaLibraryRoot(), 'recordings')
   ensureDir(dir)
   return dir
 }
 
 export function snapshotsRoot(): string {
   const s = loadSettings()
-  const dir = s.snapshotsPath || join(getConfigRoot(), 'snapshots')
+  const dir = s.snapshotsPath || join(defaultMediaLibraryRoot(), 'snapshots')
   ensureDir(dir)
   return dir
 }
@@ -61,7 +82,7 @@ export function channelWriteDir(channelId: string): { dir: string; cached: boole
 /** Tesla-style SavedClips — never auto-deleted. */
 export function savedClipsRoot(): string {
   const s = loadSettings()
-  const dir = s.savedClipsPath || join(getConfigRoot(), 'saved')
+  const dir = s.savedClipsPath || join(defaultMediaLibraryRoot(), 'saved')
   ensureDir(dir)
   return dir
 }

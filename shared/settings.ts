@@ -1,15 +1,17 @@
+import { sanitizeRemoteUsername } from './password'
+
 /** Application settings (persisted as settings.json under config root) */
 
 export type AppSettings = {
   version: 1
   /**
    * Absolute directory for video recordings.
-   * Empty string → `<configRoot>/recordings`
+   * Empty string → `<Videos>/Navora Monitor/recordings`
    */
   recordingsPath: string
   /**
    * Absolute directory for snapshots.
-   * Empty string → `<configRoot>/snapshots`
+   * Empty string → `<Videos>/Navora Monitor/snapshots`
    */
   snapshotsPath: string
   /** Default FFmpeg segment length when channel has no override */
@@ -20,6 +22,8 @@ export type AppSettings = {
   closeToTray: boolean
   /** Show main window when the app starts (false → tray only until opened) */
   showMainOnStartup: boolean
+  /** Register OS login item — launch when user signs in (packaged builds only) */
+  openAtLogin: boolean
   /** Optional absolute path to ffmpeg.exe; empty → PATH / env */
   ffmpegPath: string
   /**
@@ -56,7 +60,7 @@ export type AppSettings = {
   recordCachePath: string
   /**
    * Absolute directory for user-saved (protected) clips.
-   * Empty string → `<configRoot>/saved`
+   * Empty string → `<Videos>/Navora Monitor/saved`
    * Never auto-deleted by retention / emergency cleanup.
    */
   savedClipsPath: string
@@ -71,7 +75,9 @@ export type AppSettings = {
   remoteEnabled: boolean
   /** HTTP listen port for remote UI + API */
   remotePort: number
-  /** Password for fixed user `admin` (empty → auto-generate when enabling) */
+  /** Login username for remote access */
+  remoteUsername: string
+  /** Password for remote user (empty → auto-generate when enabling) */
   remotePassword: string
 }
 
@@ -83,6 +89,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultRtspTransport: 'tcp',
   closeToTray: true,
   showMainOnStartup: true,
+  openAtLogin: false,
   ffmpegPath: '',
   retentionDays: 0,
   diskWarnFreeGb: 5,
@@ -95,6 +102,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiTheme: 'system',
   remoteEnabled: false,
   remotePort: 8780,
+  remoteUsername: 'admin',
   remotePassword: '',
 }
 
@@ -119,6 +127,7 @@ export function sanitizeSettings(raw: Partial<AppSettings> | null | undefined): 
     defaultRtspTransport: raw.defaultRtspTransport === 'udp' ? 'udp' : 'tcp',
     closeToTray: raw.closeToTray !== false,
     showMainOnStartup: raw.showMainOnStartup !== false,
+    openAtLogin: raw.openAtLogin === true,
     ffmpegPath: typeof raw.ffmpegPath === 'string' ? raw.ffmpegPath.trim() : '',
     retentionDays: Number.isFinite(retention) && retention >= 0 ? Math.round(retention) : 0,
     diskWarnFreeGb: Number.isFinite(warnGb) && warnGb >= 0 ? Math.round(warnGb * 10) / 10 : base.diskWarnFreeGb,
@@ -137,6 +146,7 @@ export function sanitizeSettings(raw: Partial<AppSettings> | null | undefined): 
       Number.isFinite(remotePort) && remotePort >= 1024 && remotePort <= 65535
         ? Math.round(remotePort)
         : base.remotePort,
+    remoteUsername: sanitizeRemoteUsername(raw.remoteUsername),
     remotePassword: typeof raw.remotePassword === 'string' ? raw.remotePassword : base.remotePassword,
   }
 }

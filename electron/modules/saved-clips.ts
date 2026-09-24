@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { segmentInSaveWindow } from '../../shared/saved-clip'
+import { isRecordingMediaFile, parseSegmentStartMs } from '../../shared/segment-time'
 import type { RecordingSegment } from '../../shared/types'
 import {
   channelCacheDir,
@@ -27,6 +28,23 @@ function stamp(): string {
   const d = new Date()
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+function listMediaInDir(dir: string): Array<{ path: string; fileName: string; sizeBytes: number; mtimeMs: number }> {
+  if (!existsSync(dir)) return []
+  const out: Array<{ path: string; fileName: string; sizeBytes: number; mtimeMs: number }> = []
+  for (const name of readdirSync(dir)) {
+    if (!isRecordingMediaFile(name)) continue
+    const path = join(dir, name)
+    try {
+      const st = statSync(path)
+      if (!st.isFile() || st.size < 64) continue
+      out.push({ path, fileName: name, sizeBytes: st.size, mtimeMs: st.mtimeMs })
+    } catch {
+      /* ignore */
+    }
+  }
+  return out
 }
 
 function listMp4InDir(dir: string): Array<{ path: string; fileName: string; sizeBytes: number; mtimeMs: number }> {
@@ -69,11 +87,13 @@ export function saveRecentClip(channelId: string, durationSec?: number): SaveCli
   const seen = new Set<string>()
 
   for (const dir of sourceDirsForChannel(channelId)) {
-    for (const f of listMp4InDir(dir)) {
+    for (const f of listMediaInDir(dir)) {
       if (seen.has(f.fileName)) continue
+      const parsed = parseSegmentStartMs(f.fileName)
+      const endMs = parsed != null ? parsed + segmentTime * 1000 : f.mtimeMs
       if (
         !segmentInSaveWindow({
-          endMs: f.mtimeMs,
+          endMs,
           segmentTimeSec: segmentTime,
           windowEndMs: now,
           durationSec: dur,
@@ -105,6 +125,8 @@ export function saveRecentClip(channelId: string, durationSec?: number): SaveCli
     try {
       copyFileSync(f.path, destPath)
       const st = statSync(destPath)
+      const startMs = parseSegmentStartMs(f.fileName) ?? st.mtimeMs - segmentTime * 1000
+      const endMs = startMs + segmentTime * 1000
       clips.push({
         id: `saved/${channelId}/${destName}`,
         channelId,
@@ -113,8 +135,8 @@ export function saveRecentClip(channelId: string, durationSec?: number): SaveCli
         url: '', // filled by caller with media server
         sizeBytes: st.size,
         mtimeMs: st.mtimeMs,
-        startMs: st.mtimeMs - segmentTime * 1000,
-        endMs: st.mtimeMs,
+        startMs,
+        endMs,
         protected: true,
         savedAt: Date.now(),
       })
@@ -137,6 +159,16 @@ export function saveRecentClip(channelId: string, durationSec?: number): SaveCli
   }
 }
 
+/** Parse `Export_YYYYMMDD-HHMMSS_YYYYMMDD-HHMMSS.mp4` wall-clock range. */
+function parseExportRange(fileName: string): { startMs: number; endMs: number } | null {
+  const m = /^Export_(\d{8}-\d{6})_(\d{8}-\d{6})\.mp4$/i.exec(fileName)
+  if (!m) return null
+  const startMs = parseSegmentStartMs(`x-${m[1]}.mp4`)
+  const endMs = parseSegmentStartMs(`x-${m[2]}.mp4`)
+  if (startMs == null || endMs == null || endMs <= startMs) return null
+  return { startMs, endMs }
+}
+
 export function listSavedClips(media: MediaServer, channelId?: string): RecordingSegment[] {
   const root = savedClipsRoot()
   if (!existsSync(root)) return []
@@ -151,6 +183,15 @@ export function listSavedClips(media: MediaServer, channelId?: string): Recordin
   for (const id of channels) {
     const dir = join(root, id)
     for (const f of listMp4InDir(dir)) {
+      const exported = parseExportRange(f.fileName)
+      // Saved names: `{stamp}_{original}` — parse time from the original suffix when present
+      const original = f.fileName.includes('_') ? f.fileName.slice(f.fileName.indexOf('_') + 1) : f.fileName
+      const startMs =
+        exported?.startMs ??
+        parseSegmentStartMs(original) ??
+        parseSegmentStartMs(f.fileName) ??
+        f.mtimeMs - segmentTime * 1000
+      const endMs = exported?.endMs ?? startMs + segmentTime * 1000
       out.push({
         id: `saved/${id}/${f.fileName}`,
         channelId: id,
@@ -159,14 +200,14 @@ export function listSavedClips(media: MediaServer, channelId?: string): Recordin
         url: media.savedClipUrl(id, f.fileName),
         sizeBytes: f.sizeBytes,
         mtimeMs: f.mtimeMs,
-        startMs: f.mtimeMs - segmentTime * 1000,
-        endMs: f.mtimeMs,
+        startMs,
+        endMs,
         protected: true,
         savedAt: f.mtimeMs,
       })
     }
   }
-  out.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  out.sort((a, b) => (b.startMs ?? b.mtimeMs) - (a.startMs ?? a.mtimeMs))
   return out
 }
 

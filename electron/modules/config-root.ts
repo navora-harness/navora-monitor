@@ -18,5 +18,13 @@ export function getDataRoot(): string {
 }
 
 export function ensureDir(dir: string): void {
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  } catch (err) {
+    const code =
+      err && typeof err === 'object' && 'code' in err ? String((err as { code: unknown }).code) : ''
+    // Ignore races; rethrow real failures (caller may fall back).
+    if (code === 'EEXIST') return
+    throw err
+  }
 }

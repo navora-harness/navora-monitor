@@ -11,4 +11,19 @@ html.remote-app #app {
 html.remote-app body {
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+html.remote-app {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
+@media (max-width: 768px) {
+  /* Prevent iOS zoom on login fields without blowing up chrome UI */
+  html.remote-app .login input {
+    font-size: 16px;
+  }
 }

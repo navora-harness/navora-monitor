@@ -7,7 +7,10 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { basename, join } from 'node:path'
+import { isRecordingMediaFile } from '../../shared/segment-time'
 import { channelCacheDir, channelRecordDir, isRecordCacheActive, recordCacheRoot } from './data-root'
+import { indexRecordingFile } from './recording-index'
+import { loadSettings } from './settings-store'
 
 type WatchEntry = {
   channelId: string
@@ -18,10 +21,10 @@ type WatchEntry = {
   timer: ReturnType<typeof setInterval> | null
 }
 
-function listMp4(dir: string): string[] {
+function listMedia(dir: string): string[] {
   if (!existsSync(dir)) return []
   return readdirSync(dir)
-    .filter((n) => n.toLowerCase().endsWith('.mp4'))
+    .filter((n) => isRecordingMediaFile(n))
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
 }
 
@@ -56,7 +59,7 @@ export class SegmentFlusher {
   pendingFileCount(): number {
     let n = 0
     for (const w of this.watches.values()) {
-      const files = listMp4(w.cacheDir)
+      const files = listMedia(w.cacheDir)
       n += w.holdNewest ? Math.max(0, files.length - 1) : files.length
     }
     // also count orphan cache files when not watching
@@ -134,7 +137,7 @@ export class SegmentFlusher {
   }
 
   private flushDir(cacheDir: string, destDir: string, holdNewest: boolean) {
-    const files = listMp4(cacheDir)
+    const files = listMedia(cacheDir)
     if (!files.length) return
     const skip = holdNewest ? files[files.length - 1] : null
     for (const name of files) {
@@ -158,8 +161,15 @@ export class SegmentFlusher {
         }
         continue
       }
-      if (moveFile(src, dest)) this.moved += 1
-      else this.failed += 1
+      if (moveFile(src, dest)) {
+        this.moved += 1
+        try {
+          const channelId = basename(destDir)
+          indexRecordingFile(channelId, name, dest, loadSettings().defaultSegmentTimeSec || 300)
+        } catch {
+          /* ignore index errors */
+        }
+      } else this.failed += 1
     }
   }
 }

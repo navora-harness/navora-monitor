@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import type { AppInfo, ChannelConfig, ChannelRuntimeState, RecordingSegment } from '@shared/types'
 import { DEFAULT_GROUP, channelGroup, listGroups, normalizeGroupName } from '@shared/groups'
 import {
@@ -48,10 +48,14 @@ const probeMessage = ref<string | null>(null)
 const probing = ref(false)
 const activeGroup = ref(DEFAULT_GROUP)
 const showSettings = ref(false)
+const settingsInitialCat = ref<'appearance' | 'about'>('appearance')
 const showChannelDialog = ref(false)
 const showGroupsDialog = ref(false)
 const showScanDialog = ref(false)
 const configWizard = ref<'export' | 'import' | null>(null)
+const configImportPath = ref<string | null>(null)
+const configDropActive = ref(false)
+let configDropDepth = 0
 /** False when window hidden/minimized — pause live & playback UI, stop preview ffmpeg. */
 const windowVisible = ref(true)
 let unsubWindowVisibility: (() => void) | null = null
@@ -59,7 +63,19 @@ const channelDraft = ref<ChannelConfig | null>(null)
 const appSettings = ref<AppSettings>({ ...DEFAULT_SETTINGS })
 const viewMode = ref<'live' | 'playback'>('live')
 const playbackSeg = ref<RecordingSegment | null>(null)
+const exportBusy = ref(false)
+const playbackScrubWallMs = ref<number | null>(null)
+const playbackScrubNonce = ref(0)
+const playbackPlayId = ref<string | null>(null)
+const playbackPlayNonce = ref(0)
+const playbackFollowMs = ref<number | null>(null)
 const playbackRate = ref(1)
+const playbackContinuous = ref(true)
+const playbackBusy = ref(false)
+const timelineSource = ref<'loop' | 'saved'>('loop')
+const playbackPlaylist = computed(() =>
+  timelineSource.value === 'saved' ? savedClips.value : segments.value,
+)
 const timelineRef = ref<InstanceType<typeof TimelinePanel> | null>(null)
 
 const layout = reactive<UiLayoutState>(defaultUiLayout())
@@ -79,6 +95,11 @@ const dialogState = computed(() => {
 const recordingCount = computed(
   () => Object.values(states.value).filter((s) => s.recording === 'recording').length,
 )
+/** Live mode + selected channel recording → timeline playhead tracks "now". */
+const timelineFollowLiveEdge = computed(() => {
+  if (viewMode.value !== 'live' || !selectedId.value) return false
+  return states.value[selectedId.value]?.recording === 'recording'
+})
 const groups = computed(() => listGroups(channels.value, groupOrder.value))
 
 watch(groups, (gs) => {
@@ -113,8 +134,8 @@ async function refreshInfo() {
   info.value = await api().getAppInfo()
 }
 
-async function refreshRecordings() {
-  segmentsLoading.value = true
+async function refreshRecordings(opts?: { silent?: boolean }) {
+  if (!opts?.silent) segmentsLoading.value = true
   try {
     const id = selectedId.value ?? undefined
     const [loop, saved] = await Promise.all([
@@ -124,7 +145,7 @@ async function refreshRecordings() {
     segments.value = loop
     savedClips.value = saved
   } finally {
-    segmentsLoading.value = false
+    if (!opts?.silent) segmentsLoading.value = false
   }
 }
 
@@ -237,17 +258,45 @@ function enterPlayback(seg?: RecordingSegment | null) {
 function exitPlayback() {
   viewMode.value = 'live'
   playbackSeg.value = null
+  playbackScrubWallMs.value = null
+  playbackPlayId.value = null
+  playbackFollowMs.value = null
+  playbackBusy.value = false
 }
 
 function onPlaybackPlay(seg: RecordingSegment) {
-  playbackSeg.value = seg
+  if (seg.protected) timelineSource.value = 'saved'
+  else timelineSource.value = 'loop'
+  playbackPlayId.value = seg.id
+  playbackPlayNonce.value += 1
+  playbackFollowMs.value = seg.startMs ?? seg.mtimeMs
   if (viewMode.value !== 'playback') viewMode.value = 'playback'
   if (!layout.showTimeline) setShowTimeline(true)
 }
 
-function onPlaybackEnded() {
-  const next = timelineRef.value?.playNext?.() ?? null
-  if (next) playbackSeg.value = next
+function onTimelineScrub(payload: {
+  atMs: number
+  segment: RecordingSegment | null
+  seekSec: number
+}) {
+  if (playbackBusy.value) return
+  if (viewMode.value !== 'playback') viewMode.value = 'playback'
+  if (!layout.showTimeline) setShowTimeline(true)
+  // Do not write followMs here — avoids fighting the player follow throttle during seek
+  playbackScrubWallMs.value = payload.atMs
+  playbackScrubNonce.value += 1
+}
+
+function onPlaybackFollow(wallMs: number) {
+  playbackFollowMs.value = wallMs
+}
+
+function onPlaybackSegment(seg: RecordingSegment | null) {
+  playbackSeg.value = seg
+}
+
+function onPlaylistEnded() {
+  status.value = '回放列表已播完'
 }
 
 function scheduleSaveLayout() {
@@ -376,11 +425,82 @@ async function onRepairConfig() {
 }
 
 async function onExportConfig() {
+  configImportPath.value = null
   configWizard.value = 'export'
 }
 
-async function onImportConfig() {
+async function onImportConfig(filePath?: string) {
+  configImportPath.value = filePath?.trim() || null
   configWizard.value = 'import'
+}
+
+function closeConfigWizard() {
+  configWizard.value = null
+  configImportPath.value = null
+  configDropActive.value = false
+  configDropDepth = 0
+}
+
+function isExternalFileDrag(e: DragEvent): boolean {
+  const types = e.dataTransfer?.types
+  if (!types) return false
+  const list = Array.from(types)
+  // Ignore in-app channel / slot drags
+  if (list.some((t) => t.startsWith('application/x-navora-'))) return false
+  return list.includes('Files')
+}
+
+function pathFromConfigDrop(e: DragEvent): string | null {
+  const files = e.dataTransfer?.files
+  if (!files?.length) return null
+  for (let i = 0; i < files.length; i++) {
+    const f = files.item(i)
+    if (!f) continue
+    const p = (f as File & { path?: string }).path?.trim() || ''
+    const name = f.name || p
+    if (/\.json$/i.test(name) || /\.json$/i.test(p)) return p || null
+  }
+  return null
+}
+
+function onShellDragEnter(e: DragEvent) {
+  if (!isExternalFileDrag(e)) return
+  e.preventDefault()
+  configDropDepth += 1
+  configDropActive.value = true
+}
+
+function onShellDragOver(e: DragEvent) {
+  if (!isExternalFileDrag(e)) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  configDropActive.value = true
+}
+
+function onShellDragLeave(e: DragEvent) {
+  if (!isExternalFileDrag(e)) return
+  configDropDepth = Math.max(0, configDropDepth - 1)
+  if (configDropDepth === 0) configDropActive.value = false
+}
+
+async function onShellDrop(e: DragEvent) {
+  if (!isExternalFileDrag(e)) return
+  e.preventDefault()
+  configDropDepth = 0
+  configDropActive.value = false
+  const path = pathFromConfigDrop(e)
+  if (!path) {
+    status.value = '请拖入 Navora Monitor 配置 .json 文件'
+    return
+  }
+  showSettings.value = false
+  // Remount dialog so initialPath is inspected even if import wizard was already open
+  if (configWizard.value) {
+    configWizard.value = null
+    configImportPath.value = null
+    await nextTick()
+  }
+  await onImportConfig(path)
 }
 
 async function onConfigWizardDone(message: string) {
@@ -481,10 +601,17 @@ async function copyChannelUrl(id: string) {
 
 async function onContextMenu(
   action: string,
-  payload?: { channelId?: string; group?: string; slotIndex?: number; channelIds?: string[] },
+  payload?: {
+    channelId?: string
+    group?: string
+    slotIndex?: number
+    channelIds?: string[]
+    segmentId?: string
+  },
 ) {
   const id = payload?.channelId
   const group = payload?.group
+  const segmentId = payload?.segmentId
 
   switch (action) {
     case 'props':
@@ -564,9 +691,15 @@ async function onContextMenu(
     case 'probe':
       if (id) await onProbe(id)
       break
-    case 'reveal':
-      await onReveal(id)
+    case 'reveal': {
+      const seg = segmentId
+        ? (segments.value.find((s) => s.id === segmentId) ??
+          savedClips.value.find((s) => s.id === segmentId))
+        : null
+      if (seg?.path) await api().revealItem(seg.path)
+      else await onReveal(id)
       break
+    }
     case 'revealAll':
       await onReveal()
       break
@@ -574,10 +707,13 @@ async function onContextMenu(
       if (id) await api().revealSnapshots(id)
       else await api().revealSnapshots()
       break
-    case 'revealSaved':
-      if (id) await api().revealSavedClips(id)
+    case 'revealSaved': {
+      const seg = segmentId ? savedClips.value.find((s) => s.id === segmentId) : null
+      if (seg?.path) await api().revealItem(seg.path)
+      else if (id) await api().revealSavedClips(id)
       else await api().revealSavedClips()
       break
+    }
     case 'saveClip':
       if (id) await onSaveClip(id)
       break
@@ -608,6 +744,7 @@ async function onContextMenu(
       status.value = '已刷新'
       break
     case 'openSettings':
+      settingsInitialCat.value = 'appearance'
       showSettings.value = true
       break
     default:
@@ -820,13 +957,47 @@ async function onSaveClip(channelId?: string) {
     status.value = '请先选择通道'
     return
   }
-  const res = await api().saveRecentClip(id)
-  if (res.ok) {
-    status.value = res.message
-    await refreshRecordings()
-    await refreshDiskSpace()
-  } else {
-    status.value = res.error
+  if (channelId && channelId !== selectedId.value) selectedId.value = channelId
+  if (!layout.showTimeline) setShowTimeline(true)
+  await refreshRecordings()
+  await nextTick()
+  await nextTick()
+  const panel = timelineRef.value
+  if (!panel?.beginSaveSelection) {
+    status.value = '时间轴未就绪，请再试一次'
+    return
+  }
+  const res = panel.beginSaveSelection()
+  status.value = res.ok
+    ? `已默认选中最近约 ${Math.round((appSettings.value.savedClipDurationSec || 600) / 60)} 分钟，可拖动调整后点「确认保存」`
+    : res.error
+}
+
+async function onExportRange(payload: {
+  channelId: string
+  startMs: number
+  endMs: number
+  pickPath?: boolean
+}) {
+  if (exportBusy.value) return
+  exportBusy.value = true
+  status.value = '正在裁切拼接片段…'
+  try {
+    const res = await api().exportClipRange(payload)
+    if (res.ok) {
+      status.value = res.message
+      timelineRef.value?.clearSelection?.()
+      timelineRef.value?.setSelectMode?.(false)
+      timelineRef.value?.setSource?.('saved')
+      await refreshRecordings()
+      await refreshDiskSpace()
+    } else if (!res.canceled) {
+      status.value = res.error
+    } else {
+      status.value = '已取消导出'
+    }
+  } finally {
+    exportBusy.value = false
   }
 }
 
@@ -892,6 +1063,7 @@ function onGlobalKey(e: KeyboardEvent) {
   }
   if (mod && e.key === ',') {
     e.preventDefault()
+    settingsInitialCat.value = 'appearance'
     showSettings.value = true
     return
   }
@@ -959,7 +1131,7 @@ onMounted(async () => {
   }
   pollTimer = setInterval(() => {
     void refreshStates()
-    if (recordingCount.value > 0) void refreshRecordings()
+    if (recordingCount.value > 0) void refreshRecordings({ silent: true })
   }, 2000)
   diskTimer = setInterval(() => {
     void refreshDiskSpace()
@@ -996,7 +1168,15 @@ watch(selectedId, () => {
 </script>
 
 <template>
-  <div class="shell" @contextmenu.prevent>
+  <div
+    class="shell"
+    :class="{ 'config-drop': configDropActive }"
+    @contextmenu.prevent
+    @dragenter="onShellDragEnter"
+    @dragover="onShellDragOver"
+    @dragleave="onShellDragLeave"
+    @drop="onShellDrop"
+  >
     <ContextMenuHost />
     <TitleBar
       :title="selected?.name ?? '未选择通道'"
@@ -1024,11 +1204,23 @@ watch(selectedId, () => {
       @reveal-saved="() => api().revealSavedClips()"
       @export-config="onExportConfig"
       @import-config="onImportConfig"
-      @open-settings="showSettings = true"
+      @open-settings="
+        () => {
+          settingsInitialCat = 'appearance'
+          showSettings = true
+        }
+      "
+      @open-about="
+        () => {
+          settingsInitialCat = 'about'
+          showSettings = true
+        }
+      "
       @add-channel="startAdd"
       @scan-devices="openScanDialog"
       @manage-groups="showGroupsDialog = true"
       @repair-config="onRepairConfig"
+      @open-dev-tools="() => void api().toggleDevTools()"
       @minimize="() => api().windowMinimize()"
       @maximize="() => api().windowMaximize()"
       @close="() => api().windowClose()"
@@ -1036,6 +1228,8 @@ watch(selectedId, () => {
 
     <SettingsView
       v-if="showSettings"
+      :key="settingsInitialCat"
+      :initial-cat="settingsInitialCat"
       :current-theme="appSettings.uiTheme"
       @close="showSettings = false"
       @saved="onSettingsSaved"
@@ -1068,9 +1262,14 @@ watch(selectedId, () => {
     <ConfigTransferDialog
       v-if="configWizard"
       :mode="configWizard"
-      @close="configWizard = null"
+      :initial-path="configImportPath"
+      @close="closeConfigWizard"
       @done="onConfigWizardDone"
     />
+
+    <div v-if="configDropActive" class="config-drop-banner" aria-hidden="true">
+      松开以导入配置（.json）
+    </div>
 
     <GroupsDialog
       v-if="showGroupsDialog"
@@ -1133,11 +1332,22 @@ watch(selectedId, () => {
         <PlaybackView
           v-if="viewMode === 'playback'"
           :channel-name="selected?.name ?? null"
-          :segment="playbackSeg"
+          :channel-id="selectedId"
+          :source="timelineSource"
+          :playlist="playbackPlaylist"
           :rate="playbackRate"
+          :continuous="playbackContinuous"
+          :scrub-wall-ms="playbackScrubWallMs"
+          :scrub-nonce="playbackScrubNonce"
+          :play-id="playbackPlayId"
+          :play-nonce="playbackPlayNonce"
           :suspended="!windowVisible"
           @exit="exitPlayback"
-          @ended="onPlaybackEnded"
+          @follow="onPlaybackFollow"
+          @segment="onPlaybackSegment"
+          @playlist-ended="onPlaylistEnded"
+          @busy="(on) => (playbackBusy = on)"
+          @update:rate="(r) => (playbackRate = r)"
         />
         <MosaicView
           v-else
@@ -1167,21 +1377,29 @@ watch(selectedId, () => {
           />
           <TimelinePanel
             ref="timelineRef"
-            :height="viewMode === 'playback' ? Math.max(layout.panelSizes.timeline, 200) : layout.panelSizes.timeline"
+            :height="layout.panelSizes.timeline"
             :channel-id="selectedId"
             :channel-name="selected?.name ?? null"
             :segments="segments"
             :saved-clips="savedClips"
             :loading="segmentsLoading"
+            :scrub-locked="viewMode === 'playback' && playbackBusy"
             :saved-clip-minutes="Math.round((appSettings.savedClipDurationSec || 600) / 60)"
             :playing-id="playbackSeg?.id ?? null"
             :active="viewMode === 'playback'"
+            :export-busy="exportBusy"
+            :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
+            :follow-live-edge="timelineFollowLiveEdge"
             @refresh="refreshRecordings"
             @save-clip="() => onSaveClip()"
             @delete-saved="onDeleteSaved"
             @activate="() => enterPlayback()"
             @play="onPlaybackPlay"
+            @scrub="onTimelineScrub"
+            @export-range="onExportRange"
             @update:rate="(r) => (playbackRate = r)"
+            @update:source="(s) => (timelineSource = s)"
+            @update:continuous="(v) => (playbackContinuous = v)"
             @menu="onContextMenu"
           />
         </template>
@@ -1193,6 +1411,7 @@ watch(selectedId, () => {
       :channel-count="channels.length"
       :recording-count="recordingCount"
       :data-root="info?.recordingsPath ?? info?.dataRoot ?? ''"
+      :app-version="info?.version"
       :disk-label="diskSpace ? formatGbLabel(diskSpace.freeBytes) : undefined"
       :disk-used-label="diskSpace ? formatGbLabel(diskSpace.recordingsBytes) : undefined"
       :disk-saved-label="
@@ -1223,6 +1442,33 @@ watch(selectedId, () => {
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  position: relative;
+}
+.shell.config-drop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 9200;
+  pointer-events: none;
+  border: 2px dashed var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-sizing: border-box;
+}
+.config-drop-banner {
+  position: absolute;
+  left: 50%;
+  top: 48%;
+  transform: translate(-50%, -50%);
+  z-index: 9201;
+  pointer-events: none;
+  padding: 12px 18px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 14px;
+  box-shadow: var(--shadow);
 }
 .body {
   flex: 1 1 0;

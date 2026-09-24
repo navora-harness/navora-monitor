@@ -6,6 +6,7 @@ import type { UiLayoutState } from '../shared/panel-sizes'
 
 const api: NavoraMonitorApi = {
   getAppInfo: () => ipcRenderer.invoke('nm:getAppInfo'),
+  openExternal: (url: string) => ipcRenderer.invoke('nm:openExternal', url),
   getSettings: () => ipcRenderer.invoke('nm:getSettings'),
   setSettings: (patch: Partial<AppSettings>) => ipcRenderer.invoke('nm:setSettings', patch),
   getDiskSpace: () => ipcRenderer.invoke('nm:getDiskSpace'),
@@ -24,6 +25,7 @@ const api: NavoraMonitorApi = {
   repairConfig: (activePreviewIds?: string[]) => ipcRenderer.invoke('nm:repairConfig', activePreviewIds),
   exportConfig: (opts) => ipcRenderer.invoke('nm:exportConfig', opts?.parts),
   pickConfigImport: () => ipcRenderer.invoke('nm:pickConfigImport'),
+  inspectConfigImport: (filePath: string) => ipcRenderer.invoke('nm:inspectConfigImport', filePath),
   applyConfigImport: (opts) => ipcRenderer.invoke('nm:applyConfigImport', opts),
   importConfig: async () => {
     const picked = await ipcRenderer.invoke('nm:pickConfigImport')
@@ -65,8 +67,15 @@ const api: NavoraMonitorApi = {
   listSavedClips: (channelId?: string) => ipcRenderer.invoke('nm:listSavedClips', channelId),
   saveRecentClip: (channelId: string, durationSec?: number) =>
     ipcRenderer.invoke('nm:saveRecentClip', channelId, durationSec),
+  exportClipRange: (opts: {
+    channelId: string
+    startMs: number
+    endMs: number
+    pickPath?: boolean
+  }) => ipcRenderer.invoke('nm:exportClipRange', opts),
   deleteSavedClip: (segmentId: string) => ipcRenderer.invoke('nm:deleteSavedClip', segmentId),
   revealSavedClips: (channelId?: string) => ipcRenderer.invoke('nm:revealSavedClips', channelId),
+  revealItem: (filePath: string) => ipcRenderer.invoke('nm:revealItem', filePath),
   probeChannel: (id: string) => ipcRenderer.invoke('nm:probeChannel', id),
   scanDevices: (opts) => ipcRenderer.invoke('nm:scanDevices', opts),
   listScanSubnets: () => ipcRenderer.invoke('nm:listScanSubnets'),
@@ -90,6 +99,7 @@ const api: NavoraMonitorApi = {
   windowMinimize: () => ipcRenderer.invoke('nm:windowMinimize'),
   windowMaximize: () => ipcRenderer.invoke('nm:windowMaximize'),
   windowClose: () => ipcRenderer.invoke('nm:windowClose'),
+  toggleDevTools: () => ipcRenderer.invoke('nm:toggleDevTools'),
   getRemoteStatus: () => ipcRenderer.invoke('nm:getRemoteStatus'),
   generateRemotePassword: () => ipcRenderer.invoke('nm:generateRemotePassword'),
   ensureRemotePassword: () => ipcRenderer.invoke('nm:ensureRemotePassword'),

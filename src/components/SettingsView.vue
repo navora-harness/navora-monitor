@@ -3,12 +3,21 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import type { AppSettings } from '@shared/settings'
 import { DEFAULT_SETTINGS } from '@shared/settings'
 import type { DiskSpaceInfo, RemoteAccessStatus } from '@shared/ipc-types'
-import { REMOTE_USERNAME } from '@shared/password'
 import { bytesToGb, formatDurationLabel, formatGbLabel, gbToBytes } from '@shared/storage-policy'
+import {
+  withStorageLeaf,
+  applyStorageBundle,
+  storagePickerStartDir,
+  findStorageNestConflict,
+  stripKnownStorageLeaf,
+} from '@shared/storage-path'
 import { applyUiTheme, type UiTheme } from '../theme'
+
+type CatId = 'appearance' | 'paths' | 'storage' | 'recording' | 'capture' | 'remote' | 'about'
 
 const props = defineProps<{
   currentTheme?: 'light' | 'dark' | 'system'
+  initialCat?: CatId
 }>()
 
 const emit = defineEmits<{
@@ -17,8 +26,6 @@ const emit = defineEmits<{
   exportConfig: []
   importConfig: []
 }>()
-
-type CatId = 'appearance' | 'paths' | 'storage' | 'recording' | 'capture' | 'remote' | 'about'
 
 const cats: { id: CatId; label: string }[] = [
   { id: 'appearance', label: '外观' },
@@ -30,7 +37,7 @@ const cats: { id: CatId; label: string }[] = [
   { id: 'about', label: '关于' },
 ]
 
-const cat = ref<CatId>('appearance')
+const cat = ref<CatId>(props.initialCat ?? 'appearance')
 const draft = reactive<AppSettings>({ ...DEFAULT_SETTINGS })
 const status = ref('')
 const saving = ref(false)
@@ -47,6 +54,14 @@ const resolved = reactive({
   saved: '',
   configRoot: '',
 })
+const appMeta = reactive({
+  name: 'Navora Monitor',
+  version: '',
+  license: 'MIT',
+  copyright: '',
+  homepage: '',
+  licenseNote: '',
+})
 
 function api() {
   return window.navoraMonitor
@@ -60,8 +75,19 @@ async function refresh() {
   resolved.recordings = info.recordingsPath
   resolved.snapshots = info.snapshotsPath
   resolved.saved = info.savedClipsPath
+  appMeta.name = info.name
+  appMeta.version = info.version
+  appMeta.license = info.license
+  appMeta.copyright = info.copyright
+  appMeta.homepage = info.homepage
+  appMeta.licenseNote = info.licenseNote
   disk.value = await api().getDiskSpace()
   remoteStatus.value = await api().getRemoteStatus()
+}
+
+async function openHomepage() {
+  if (!appMeta.homepage) return
+  await api().openExternal(appMeta.homepage)
 }
 
 watch(
@@ -128,18 +154,44 @@ const viz = computed(() => {
 })
 
 async function pickRecordings() {
-  const dir = await api().pickDirectory(draft.recordingsPath || resolved.recordings || undefined)
-  if (dir) draft.recordingsPath = dir
+  const dir = await api().pickDirectory(
+    storagePickerStartDir(draft.recordingsPath, resolved.recordings) || undefined,
+  )
+  if (dir) draft.recordingsPath = withStorageLeaf(stripKnownStorageLeaf(dir), 'recordings')
 }
 
 async function pickSnapshots() {
-  const dir = await api().pickDirectory(draft.snapshotsPath || resolved.snapshots || undefined)
-  if (dir) draft.snapshotsPath = dir
+  const dir = await api().pickDirectory(
+    storagePickerStartDir(draft.snapshotsPath, resolved.snapshots) || undefined,
+  )
+  if (dir) draft.snapshotsPath = withStorageLeaf(stripKnownStorageLeaf(dir), 'snapshots')
 }
 
 async function pickSaved() {
-  const dir = await api().pickDirectory(draft.savedClipsPath || resolved.saved || undefined)
-  if (dir) draft.savedClipsPath = dir
+  const dir = await api().pickDirectory(
+    storagePickerStartDir(draft.savedClipsPath, resolved.saved) || undefined,
+  )
+  if (dir) draft.savedClipsPath = withStorageLeaf(stripKnownStorageLeaf(dir), 'saved')
+}
+
+/** One pick → fill recordings / saved / snapshots as siblings under the same parent. */
+async function pickAllStoragePaths() {
+  const start = storagePickerStartDir(
+    draft.recordingsPath,
+    resolved.recordings,
+    draft.savedClipsPath,
+    draft.snapshotsPath,
+  )
+  const dir = await api().pickDirectory(start)
+  if (!dir) return
+  const bundle = applyStorageBundle(dir)
+  draft.recordingsPath = bundle.recordingsPath
+  draft.savedClipsPath = bundle.savedClipsPath
+  draft.snapshotsPath = bundle.snapshotsPath
+  const nest = findStorageNestConflict(bundle)
+  status.value = nest
+    ? `已填入路径（注意：${nest}）`
+    : `已填入 ${bundle.recordingsPath} 等三个目录，请保存`
 }
 
 async function pickFfmpeg() {
@@ -151,6 +203,15 @@ async function save() {
   saving.value = true
   status.value = ''
   try {
+    const nest = findStorageNestConflict({
+      recordingsPath: draft.recordingsPath || resolved.recordings,
+      savedClipsPath: draft.savedClipsPath || resolved.saved,
+      snapshotsPath: draft.snapshotsPath || resolved.snapshots,
+    })
+    if (nest) {
+      status.value = `无法保存：${nest}`
+      return
+    }
     if (draft.remoteEnabled && !draft.remotePassword.trim()) {
       draft.remotePassword = await api().generateRemotePassword()
     }
@@ -320,17 +381,31 @@ onUnmounted(() => {
                 <input v-model="draft.closeToTray" type="checkbox" />
                 <span>关闭窗口时最小化到托盘</span>
               </label>
+              <p class="hint">关闭主窗口后应用继续在托盘运行，可从托盘菜单恢复或退出。</p>
+              <label class="check block">
+                <input v-model="draft.openAtLogin" type="checkbox" />
+                <span>开机自动启动</span>
+              </label>
+              <p class="hint">
+                注册到系统「登录时启动」列表（仅安装版生效；便携版 / 开发模式保存后不会写入注册表）。若同时关闭「启动时显示主界面」，开机将静默驻留托盘。
+              </p>
             </section>
 
             <section v-show="cat === 'paths'">
-              <h3>存储路径</h3>
+              <div class="section-title-row">
+                <h3>存储路径</h3>
+                <button type="button" class="primary-lite" @click="pickAllStoragePaths">一键配置</button>
+              </div>
+              <p class="hint">
+                一键配置：选择父目录后自动填入三个并列子路径（如 D:\ → recordings / saved / snapshots）。默认空路径落在「视频/Navora Monitor/」下。若误选已有子文件夹会回退到父目录再生成，避免互相嵌套。
+              </p>
               <div class="field">
                 <div class="field-head">
                   <span class="label">循环录像目录</span>
                   <span class="resolved" :title="resolved.recordings">{{ resolved.recordings }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.recordingsPath" spellcheck="false" placeholder="默认 recordings" />
+                  <input v-model="draft.recordingsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/recordings" />
                   <button type="button" @click="pickRecordings">浏览</button>
                   <button type="button" class="ghost" @click="draft.recordingsPath = ''">默认</button>
                 </div>
@@ -341,7 +416,7 @@ onUnmounted(() => {
                   <span class="resolved" :title="resolved.saved">{{ resolved.saved }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.savedClipsPath" spellcheck="false" placeholder="默认 saved" />
+                  <input v-model="draft.savedClipsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/saved" />
                   <button type="button" @click="pickSaved">浏览</button>
                   <button type="button" class="ghost" @click="draft.savedClipsPath = ''">默认</button>
                 </div>
@@ -352,7 +427,7 @@ onUnmounted(() => {
                   <span class="resolved" :title="resolved.snapshots">{{ resolved.snapshots }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.snapshotsPath" spellcheck="false" placeholder="默认 snapshots" />
+                  <input v-model="draft.snapshotsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/snapshots" />
                   <button type="button" @click="pickSnapshots">浏览</button>
                   <button type="button" class="ghost" @click="draft.snapshotsPath = ''">默认</button>
                 </div>
@@ -486,7 +561,7 @@ onUnmounted(() => {
                   <input v-model.number="draft.savedClipDurationSec" type="number" min="30" max="3600" step="30" />
                 </label>
               </div>
-              <p class="hint">Ctrl+S /「保存片段」会把最近这段循环录像复制到受保护目录。</p>
+              <p class="hint">Ctrl+S /「保存片段」会打开时间轴，默认选中最近这段时长，确认后自动裁切拼接并写入受保护目录。</p>
               <label class="check block">
                 <input v-model="draft.recordCacheEnabled" type="checkbox" />
                 <span>启用本地录像缓存（慢速归档盘时先写本地再刷盘）</span>
@@ -533,9 +608,15 @@ onUnmounted(() => {
                 </label>
                 <label>
                   <span>账户</span>
-                  <input :value="REMOTE_USERNAME" readonly />
+                  <input
+                    v-model="draft.remoteUsername"
+                    spellcheck="false"
+                    autocomplete="username"
+                    placeholder="admin"
+                  />
                 </label>
               </div>
+              <p class="hint">账户名支持字母、数字与 _ @ . -，最长 32 位；留空保存时恢复为 admin。</p>
               <div class="field">
                 <span class="label">密码</span>
                 <div class="path-row">
@@ -579,11 +660,41 @@ onUnmounted(() => {
 
             <section v-show="cat === 'about'" class="meta">
               <h3>关于</h3>
-              <p class="label">配置目录</p>
+              <div class="about-brand">
+                <img src="/icon.png" width="40" height="40" alt="" />
+                <div>
+                  <p class="about-name">{{ appMeta.name }}</p>
+                  <p class="about-ver">版本 {{ appMeta.version || '—' }}</p>
+                </div>
+              </div>
+              <dl class="about-dl">
+                <div>
+                  <dt>开源协议</dt>
+                  <dd>{{ appMeta.license }} License</dd>
+                </div>
+                <div>
+                  <dt>版权</dt>
+                  <dd>{{ appMeta.copyright || '—' }}</dd>
+                </div>
+              </dl>
+              <p class="hint">{{ appMeta.licenseNote }}</p>
+              <div class="path-row">
+                <button
+                  type="button"
+                  class="linkish"
+                  :disabled="!appMeta.homepage"
+                  @click="openHomepage"
+                >
+                  打开项目主页
+                </button>
+              </div>
+
+              <h3 class="sub">配置目录</h3>
+              <p class="label">本机数据根目录</p>
               <p class="resolved block" :title="resolved.configRoot">{{ resolved.configRoot }}</p>
               <h3 class="sub">配置备份</h3>
               <p class="hint">
-                导出包含通道、分组、布局与应用设置的 JSON。导入时可选择保留本机录像目录与 FFmpeg 路径。
+                导出通道、分组、布局与可移植应用设置。存储路径、磁盘告警/保留策略、FFmpeg 路径等本机项不会写入文件，导入时也不会覆盖。
               </p>
               <div class="path-row">
                 <button type="button" @click="emit('exportConfig')">导出配置…</button>
@@ -720,6 +831,32 @@ section h3 {
   font-size: 13px;
   font-weight: 700;
 }
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.section-title-row h3 {
+  flex: 1;
+  min-width: 0;
+}
+.section-title-row .primary-lite {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.section-title-row .primary-lite:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--accent));
+}
 .field {
   display: flex;
   flex-direction: column;
@@ -763,6 +900,55 @@ section h3 {
 }
 .meta h3.sub {
   margin-top: 18px;
+}
+.about-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0 14px;
+}
+.about-brand img {
+  border-radius: 8px;
+}
+.about-name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+}
+.about-ver {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.about-dl {
+  margin: 0 0 10px;
+  display: grid;
+  gap: 8px;
+}
+.about-dl > div {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.about-dl dt {
+  margin: 0;
+  color: var(--muted);
+}
+.about-dl dd {
+  margin: 0;
+  color: var(--text);
+}
+button.linkish {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--accent);
+}
+button.linkish:hover:not(:disabled) {
+  background: var(--accent-soft);
 }
 .hint.path {
   font-family: ui-monospace, Consolas, monospace;

@@ -8,11 +8,12 @@ import { createReadStream, existsSync, statSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { extname, join, normalize, relative, resolve, sep } from 'node:path'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import type { ChannelConfig, ChannelRuntimeState } from '../../shared/types'
+import type { ChannelConfig, ChannelRuntimeState, RecordingSegment } from '../../shared/types'
 import { REMOTE_USERNAME } from '../../shared/password'
 import type { MediaServer } from './media-server'
 import type { PreviewManager } from './preview-manager'
 import { loadSettings } from './settings-store'
+import { resolveMediaFile, parseMediaUrl } from './media-protocol'
 
 export type RemoteAccessStatus = {
   enabled: boolean
@@ -30,8 +31,18 @@ type RemoteDeps = {
   getGroupOrder: () => string[]
   mergeState: (channelId: string) => ChannelRuntimeState
   allStates: () => ChannelRuntimeState[]
+  listRecordings: (channelId?: string) => RecordingSegment[]
+  listSavedClips: (channelId?: string) => RecordingSegment[]
   getStaticRoot: () => string
   getViteDevUrl: () => string | null
+  getAppMeta: () => {
+    name: string
+    version: string
+    license: string
+    copyright: string
+    homepage: string
+    licenseNote: string
+  }
 }
 
 type Session = {
@@ -140,6 +151,32 @@ function rewritePreviewUrl(url: string | null | undefined): string | null {
   return url
 }
 
+/** Local media URLs → remote-auth `/media/...` paths (token attached client-side). */
+function rewriteMediaFileUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  const parsed = parseMediaUrl(url)
+  if (parsed) {
+    return `/media/${parsed.kind}/${encodeURIComponent(parsed.channelId)}/${encodeURIComponent(parsed.fileName)}`
+  }
+  try {
+    const u = new URL(url)
+    if (u.pathname.startsWith('/recordings/') || u.pathname.startsWith('/saved/')) {
+      return `/media${u.pathname}`
+    }
+  } catch {
+    /* ignore */
+  }
+  return url
+}
+
+function mapSegmentsForRemote(segments: RecordingSegment[]): RecordingSegment[] {
+  return segments.map((s) => ({
+    ...s,
+    path: '',
+    url: rewriteMediaFileUrl(s.url) ?? '',
+  }))
+}
+
 function mapStatesForRemote(states: ChannelRuntimeState[]): ChannelRuntimeState[] {
   return states.map((s) => ({
     ...s,
@@ -166,7 +203,7 @@ export class RemoteServer {
       listening: !!(this.server && this.port),
       port: this.port || s.remotePort,
       urls: this.port ? listRemoteAccessUrls(this.port) : listRemoteAccessUrls(s.remotePort),
-      username: REMOTE_USERNAME,
+      username: loadSettings().remoteUsername || REMOTE_USERNAME,
       error: this.error,
     }
   }
@@ -309,10 +346,18 @@ export class RemoteServer {
     }
 
     if (path === '/api/status' && req.method === 'GET') {
+      const meta = this.deps.getAppMeta()
+      const settings = loadSettings()
       sendJson(res, 200, {
         ok: true,
-        username: REMOTE_USERNAME,
+        username: settings.remoteUsername || REMOTE_USERNAME,
         listening: true,
+        name: meta.name,
+        version: meta.version,
+        license: meta.license,
+        copyright: meta.copyright,
+        homepage: meta.homepage,
+        licenseNote: meta.licenseNote,
       })
       return
     }
@@ -331,6 +376,7 @@ export class RemoteServer {
 
       if (path === '/api/bootstrap' && req.method === 'GET') {
         const settings = loadSettings()
+        const meta = this.deps.getAppMeta()
         sendJson(res, 200, {
           channels: this.deps.loadChannels().map((c) => ({
             id: c.id,
@@ -342,6 +388,7 @@ export class RemoteServer {
           groupOrder: this.deps.getGroupOrder(),
           states: mapStatesForRemote(this.deps.allStates()),
           uiTheme: settings.uiTheme,
+          app: meta,
         })
         return
       }
@@ -378,8 +425,67 @@ export class RemoteServer {
         return
       }
 
-      // /media/preview/:id/live.ts
+      if (path === '/api/recordings' && req.method === 'GET') {
+        const q = new URL(req.url ?? '/', 'http://local').searchParams
+        const channelId = q.get('channelId') || undefined
+        const segs = this.deps.listRecordings(channelId || undefined)
+        sendJson(res, 200, { segments: mapSegmentsForRemote(segs) })
+        return
+      }
+
+      if (path === '/api/saved-clips' && req.method === 'GET') {
+        const q = new URL(req.url ?? '/', 'http://local').searchParams
+        const channelId = q.get('channelId') || undefined
+        const segs = this.deps.listSavedClips(channelId || undefined)
+        sendJson(res, 200, { segments: mapSegmentsForRemote(segs) })
+        return
+      }
+
       const mediaParts = path.split('/').filter(Boolean)
+      const mediaUrl = new URL(req.url ?? '/', 'http://local')
+
+      // /media/vod/:channelId/start/:startMs/end/:endMs/index.m3u8
+      if (
+        mediaParts[0] === 'media' &&
+        mediaParts[1] === 'vod' &&
+        mediaParts[2] &&
+        mediaParts[3] === 'start' &&
+        mediaParts[5] === 'end' &&
+        mediaParts[7] === 'index.m3u8' &&
+        mediaParts[4] &&
+        mediaParts[6]
+      ) {
+        const channelId = decodeURIComponent(mediaParts[2])
+        const startMs = Number(mediaParts[4])
+        const endMs = Number(mediaParts[6])
+        const source = mediaUrl.searchParams.get('source') === 'saved' ? 'saved' : 'loop'
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+          res.writeHead(400)
+          res.end('bad range')
+          return
+        }
+        const kind = source === 'saved' ? 'saved' : 'recordings'
+        const playlist = this.deps.media.buildVodPlaylist({
+          channelId,
+          startMs,
+          endMs,
+          source,
+          mediaPrefix: `/media/${kind}/${encodeURIComponent(channelId)}`,
+        })
+        if (!playlist) {
+          res.writeHead(404)
+          res.end('no recordings in range')
+          return
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Cache-Control': 'no-cache',
+        })
+        res.end(playlist.body)
+        return
+      }
+
+      // /media/preview/:id/live.ts
       if (
         mediaParts[0] === 'media' &&
         mediaParts[1] === 'preview' &&
@@ -388,6 +494,34 @@ export class RemoteServer {
       ) {
         const channelId = decodeURIComponent(mediaParts[2])
         this.deps.media.subscribeLiveStream(channelId, req, res)
+        return
+      }
+
+      // /media/recordings/:channelId/:fileName
+      if (mediaParts[0] === 'media' && mediaParts[1] === 'recordings' && mediaParts[2] && mediaParts[3]) {
+        const channelId = decodeURIComponent(mediaParts[2])
+        const fileName = decodeURIComponent(mediaParts.slice(3).join('/'))
+        const file = resolveMediaFile('recordings', channelId, fileName)
+        if (!file) {
+          res.writeHead(404)
+          res.end('not found')
+          return
+        }
+        this.deps.media.serveFile(file, req, res)
+        return
+      }
+
+      // /media/saved/:channelId/:fileName
+      if (mediaParts[0] === 'media' && mediaParts[1] === 'saved' && mediaParts[2] && mediaParts[3]) {
+        const channelId = decodeURIComponent(mediaParts[2])
+        const fileName = decodeURIComponent(mediaParts.slice(3).join('/'))
+        const file = resolveMediaFile('saved', channelId, fileName)
+        if (!file) {
+          res.writeHead(404)
+          res.end('not found')
+          return
+        }
+        this.deps.media.serveFile(file, req, res)
         return
       }
 
@@ -411,7 +545,8 @@ export class RemoteServer {
       return
     }
     const settings = loadSettings()
-    const okUser = safeEqualStr(username, REMOTE_USERNAME)
+    const expectedUser = settings.remoteUsername || REMOTE_USERNAME
+    const okUser = safeEqualStr(username, expectedUser)
     const expected = settings.remotePassword || ''
     const okPass = expected.length > 0 && safeEqualStr(password, expected)
     if (!okUser || !okPass) {
@@ -426,7 +561,7 @@ export class RemoteServer {
       'Set-Cookie': `nm_remote_token=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`,
       'Access-Control-Allow-Origin': '*',
     })
-    res.end(JSON.stringify({ ok: true, token, username: REMOTE_USERNAME }))
+    res.end(JSON.stringify({ ok: true, token, username: expectedUser }))
   }
 
   private async serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string) {

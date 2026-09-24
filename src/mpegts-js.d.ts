@@ -23,8 +23,13 @@ declare module 'mpegts.js' {
 
   const mpegts: {
     createPlayer: (mediaDataSource: MediaDataSource, config?: Config) => Player
-    getFeatureList: () => { mseLivePlayback: boolean }
-    Events: { ERROR: string }
+    getFeatureList: () => { mseLivePlayback: boolean; msePlayback?: boolean }
+    Events: {
+      ERROR: string
+      LOADING_COMPLETE: string
+      MEDIA_INFO: string
+      METADATA_ARRIVED?: string
+    }
     isSupported: () => boolean
   }
 

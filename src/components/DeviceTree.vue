@@ -11,6 +11,8 @@ const props = defineProps<{
   selectedId: string | null
   activeGroup: string
   groupOrder?: string[]
+  /** Remote browser — hide host-only actions */
+  remoteMode?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -120,6 +122,10 @@ function groupRecordingCount(channels: ChannelConfig[]): number {
   return channels.filter((c) => stateOf(c.id)?.recording === 'recording').length
 }
 
+function groupMeta(channels: ChannelConfig[]): { total: number; recording: number } {
+  return { total: channels.length, recording: groupRecordingCount(channels) }
+}
+
 function isGroupLocked(name: string): boolean {
   const bucket = buckets.value.find((b) => b.name === name)
   return !(bucket?.channels.length)
@@ -143,6 +149,12 @@ function onGroupHeaderClick(name: string) {
   emit('update:activeGroup', name)
   if (isGroupLocked(name)) return
   toggleCollapse(name)
+}
+
+function onGroupHeaderDblClick(name: string) {
+  suppressGroupClick.value = true
+  emit('update:activeGroup', name)
+  emit('menu', 'displayGroup', { group: name })
 }
 
 function setChecked(ids: string[]) {
@@ -452,6 +464,33 @@ function onChannelCtx(e: MouseEvent, ch: ChannelConfig) {
     emit('select', ch.id)
   }
 
+  if (props.remoteMode) {
+    if (batch.length > 1) {
+      const items: CtxMenuItem[] = [
+        { id: 'batchInfo', label: `已选 ${batch.length} 台设备`, disabled: true },
+        { separator: true },
+        { id: 'displayChannels', label: '展示到宫格' },
+      ]
+      openContextMenu(e, items, (id) => {
+        if (id === 'displayChannels') emit('menu', 'displayChannels', { channelIds: batch })
+      })
+      return
+    }
+    emit('select', ch.id)
+    const items: CtxMenuItem[] = [
+      { id: 'toPreview', label: '放到预览宫格' },
+      { id: 'copyUrl', label: '复制主码流 URL' },
+    ]
+    openContextMenu(e, items, (id) => {
+      if (id === 'toPreview') {
+        emit('select', ch.id)
+        return
+      }
+      emit('menu', id, { channelId: ch.id })
+    })
+    return
+  }
+
   if (batch.length > 1) {
     const groupItems: CtxMenuItem[] = buckets.value.map((b) => ({
       id: `move:${b.name}`,
@@ -535,6 +574,34 @@ function onChannelCtx(e: MouseEvent, ch: ChannelConfig) {
 
 function onGroupCtx(e: MouseEvent, group: string) {
   emit('update:activeGroup', group)
+  if (props.remoteMode) {
+    const items: CtxMenuItem[] = [
+      { id: 'displayGroup', label: '展示到宫格' },
+      { id: 'selectGroup', label: '全选本组' },
+      {
+        id: 'toggleCollapse',
+        label: isCollapsed(group) ? '展开分组' : '折叠分组',
+        disabled: isGroupLocked(group),
+      },
+    ]
+    openContextMenu(e, items, (id) => {
+      if (id === 'toggleCollapse') {
+        toggleCollapse(group)
+        return
+      }
+      if (id === 'selectGroup') {
+        const ids = buckets.value.find((b) => b.name === group)?.channels.map((c) => c.id) ?? []
+        setChecked(ids)
+        if (ids[0]) emit('select', ids[0])
+        return
+      }
+      if (id === 'displayGroup') {
+        emit('menu', 'displayGroup', { group })
+        return
+      }
+    })
+    return
+  }
   const items: CtxMenuItem[] = [
     { id: 'startGroup', label: '开始本组录像' },
     { id: 'stopGroup', label: '停止本组录像' },
@@ -570,6 +637,11 @@ function onGroupCtx(e: MouseEvent, group: string) {
 }
 
 function onTreeBlankCtx(e: MouseEvent) {
+  if (props.remoteMode) {
+    const items: CtxMenuItem[] = [{ id: 'refresh', label: '刷新列表' }]
+    openContextMenu(e, items, (id) => emit('menu', id, {}))
+    return
+  }
   const items: CtxMenuItem[] = [
     { id: 'add', label: '添加设备' },
     { id: 'scanDevices', label: '一键扫描' },
@@ -609,7 +681,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 </script>
 
 <template>
-  <aside class="tree" @contextmenu="onTreeBlankCtx">
+  <aside class="tree" :class="{ remote: remoteMode }" @contextmenu="onTreeBlankCtx">
     <div class="head" :class="{ searching: searchOpen }">
       <div class="head-main">
         <div class="head-title">
@@ -628,7 +700,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
         </div>
       </div>
       <div class="head-actions">
-        <div class="add-wrap" :class="{ open: addMenuOpen }">
+        <div v-if="!remoteMode" class="add-wrap" :class="{ open: addMenuOpen }">
           <button
             type="button"
             class="add-btn"
@@ -655,6 +727,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           </div>
         </div>
         <button
+          v-if="!remoteMode"
           type="button"
           class="icon-btn"
           title="分组管理"
@@ -689,14 +762,35 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
       </div>
     </div>
 
-    <div v-if="hasBatch" class="batch-bar">
+    <div v-if="hasBatch && !remoteMode" class="batch-bar">
       <span class="batch-count">已选 {{ checkedIds.length }}</span>
-      <button type="button" title="批量开始录像" @click="batchBarAction('start')">录</button>
-      <button type="button" title="批量停止录像" @click="batchBarAction('stop')">停</button>
-      <button type="button" title="启用" @click="batchBarAction('enable')">启</button>
-      <button type="button" title="停用" @click="batchBarAction('disable')">禁</button>
-      <button type="button" class="danger" title="删除" @click="batchBarAction('remove')">删</button>
-      <button type="button" class="ghost" title="清除选择" @click="batchBarAction('clear')">×</button>
+      <button type="button" class="icon-action rec" title="批量开始录像" @click="batchBarAction('start')">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5" fill="currentColor" /></svg>
+      </button>
+      <button type="button" class="icon-action" title="批量停止录像" @click="batchBarAction('stop')">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.2" fill="currentColor" /></svg>
+      </button>
+      <button type="button" class="icon-action" title="启用" @click="batchBarAction('enable')">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3.5 8.2 6.6 11.2 12.5 4.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      <button type="button" class="icon-action" title="停用" @click="batchBarAction('disable')">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="5.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <path d="M4.5 11.5 11.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+        </svg>
+      </button>
+      <button type="button" class="icon-action danger" title="删除" @click="batchBarAction('remove')">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3.5 4.5h9M6 4.5V3.4h4V4.5M5.2 4.5l.6 8.1h4.4l.6-8.1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      <button type="button" class="icon-action ghost" title="清除选择" @click="batchBarAction('clear')">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M4.5 4.5 11.5 11.5M11.5 4.5 4.5 11.5" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" />
+        </svg>
+      </button>
     </div>
 
     <div
@@ -725,9 +819,14 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           class="group-head"
           draggable="true"
           :title="
-            isGroupLocked(bucket.name) ? '空分组（已折叠，不可展开）' : '单击展开/折叠，拖动调整顺序'
+            isGroupLocked(bucket.name)
+              ? '空分组（已折叠，不可展开）'
+              : remoteMode
+                ? '单击展开/折叠，双击展示到宫格'
+                : '单击展开/折叠，拖动调整顺序'
           "
           @click="onGroupHeaderClick(bucket.name)"
+          @dblclick.stop="onGroupHeaderDblClick(bucket.name)"
           @contextmenu.stop="onGroupCtx($event, bucket.name)"
           @dragstart="onGroupDragStart($event, bucket.name)"
           @dragend="onDragEnd"
@@ -750,10 +849,19 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           <div class="gmeta">
             <div class="gname">{{ bucket.name }}</div>
           </div>
-          <span class="gbadge">
-            {{ bucket.channels.length }}
-            <template v-if="groupRecordingCount(bucket.channels)">
-              · 录{{ groupRecordingCount(bucket.channels) }}
+          <span v-if="isCollapsed(bucket.name)" class="gbadges">
+            <template v-for="meta in [groupMeta(bucket.channels)]" :key="`${bucket.name}-meta`">
+              <span
+                v-if="meta.recording"
+                class="grec"
+                :title="`录像中 ${meta.recording}`"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <circle cx="8" cy="8" r="5" fill="currentColor" />
+                </svg>
+                <span v-if="meta.recording > 1" class="grec-n">{{ meta.recording }}</span>
+              </span>
+              <span class="gcount">{{ meta.total }}</span>
             </template>
           </span>
         </div>
@@ -786,7 +894,27 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
             <div class="drop-line" :class="{ on: isChannelDropBefore(bucket.name, ch.id) }" />
             <div class="row">
               <span class="grip channel-grip" aria-hidden="true">⋮⋮</span>
-              <span class="dot" :class="stateOf(ch.id)?.recording ?? 'idle'" />
+              <span
+                class="status"
+                :class="stateOf(ch.id)?.recording ?? 'idle'"
+                :title="
+                  stateOf(ch.id)?.recording === 'recording'
+                    ? '录像中'
+                    : stateOf(ch.id)?.recording === 'error'
+                      ? '录像异常'
+                      : '未录像'
+                "
+                aria-hidden="true"
+              >
+                <svg v-if="stateOf(ch.id)?.recording === 'recording'" viewBox="0 0 16 16">
+                  <circle cx="8" cy="8" r="5" fill="currentColor" />
+                </svg>
+                <svg v-else-if="stateOf(ch.id)?.recording === 'error'" viewBox="0 0 16 16">
+                  <circle cx="8" cy="8" r="5.2" fill="none" stroke="currentColor" stroke-width="1.5" />
+                  <path d="M8 4.8v4.2M8 11.2h.01" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                </svg>
+                <i v-else class="idle-dot" />
+              </span>
               <div class="meta">
                 <div class="name-row">
                   <input
@@ -810,7 +938,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
                     :title="hasBatch ? '点击修改名称' : ch.name"
                     @click="onNameClick($event, ch)"
                   >{{ ch.name }}</span>
-                  <span v-if="stateOf(ch.id)?.preview === 'live'" class="pill live">LIVE</span>
+                  <span v-if="stateOf(ch.id)?.preview === 'live'" class="pill live" title="预览中">LIVE</span>
                 </div>
                 <div class="id">{{ ch.id }}</div>
               </div>
@@ -1032,29 +1160,43 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
   margin-right: 2px;
   white-space: nowrap;
 }
-.batch-bar button {
+.batch-bar button.icon-action {
   min-width: 30px;
+  width: 30px;
   height: 30px;
-  padding: 0 8px;
+  padding: 0;
+  display: grid;
+  place-items: center;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--input-bg);
   color: var(--text);
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
   line-height: 1;
 }
-.batch-bar button.danger {
+.batch-bar button.icon-action svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+.batch-bar button.icon-action.rec {
+  color: var(--rec);
+  border-color: color-mix(in srgb, var(--rec) 35%, var(--border));
+  background: color-mix(in srgb, var(--rec) 10%, var(--input-bg));
+}
+.batch-bar button.icon-action.danger {
   color: var(--danger);
   border-color: transparent;
   background: var(--danger-soft);
 }
-.batch-bar button.ghost {
+.batch-bar button.icon-action.ghost {
   border-color: transparent;
   background: transparent;
   color: var(--muted);
-  font-size: 16px;
+}
+.batch-bar button.icon-action:hover {
+  border-color: var(--border-strong);
+  background: var(--hover);
 }
 .list {
   flex: 1;
@@ -1093,7 +1235,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 .group-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   padding: 8px 10px;
   cursor: pointer;
   border: 1px solid var(--border);
@@ -1163,6 +1305,52 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
   padding: 2px 7px;
   line-height: 1.3;
 }
+.gbadges {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gcount {
+  min-width: 1.4em;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  line-height: 1.3;
+}
+.group.active .gcount {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+.grec {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 6px 0 5px;
+  border-radius: 999px;
+  color: var(--rec);
+  background: color-mix(in srgb, var(--rec) 14%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--rec) 35%, var(--border));
+}
+.grec svg {
+  width: 10px;
+  height: 10px;
+  display: block;
+  flex-shrink: 0;
+}
+.grec-n {
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
 .group.active .gbadge {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
@@ -1214,19 +1402,32 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
   gap: 8px;
   padding: 7px 8px 7px 4px;
 }
-.dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--scrollbar-thumb);
+.status {
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--scrollbar-thumb);
 }
-.dot.recording {
-  background: var(--rec);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rec) 22%, transparent);
+.status svg {
+  width: 12px;
+  height: 12px;
+  display: block;
 }
-.dot.error {
-  background: var(--danger);
+.status .idle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.7;
+}
+.status.recording {
+  color: var(--rec);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--rec) 45%, transparent));
+}
+.status.error {
+  color: var(--danger);
 }
 .meta {
   min-width: 0;
@@ -1309,5 +1510,23 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
   font-size: 12px;
   color: var(--muted);
   line-height: 1.55;
+}
+
+/* Remote drawer / touch-friendly rows */
+.tree.remote .row {
+  padding: 10px 10px 10px 6px;
+  min-height: 44px;
+}
+.tree.remote .group-head {
+  min-height: 44px;
+  padding: 10px 10px;
+}
+.tree.remote .name {
+  font-size: 14px;
+}
+.tree.remote .icon-btn,
+.tree.remote .add-btn {
+  width: 36px;
+  height: 36px;
 }
 </style>

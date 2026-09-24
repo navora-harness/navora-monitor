@@ -49,10 +49,10 @@ export class ScheduleRunner {
 
       if (want && !recording) {
         if (!canStart) continue
-        this.recorders.start(ch)
+        this.recorders.start(ch, { remember: false })
         this.scheduledIds.add(ch.id)
       } else if (!want && recording && this.scheduledIds.has(ch.id)) {
-        this.recorders.stop(ch.id)
+        this.recorders.stop(ch.id, { forget: false })
         this.scheduledIds.delete(ch.id)
       } else if (!want) {
         this.scheduledIds.delete(ch.id)

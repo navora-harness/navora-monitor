@@ -1,12 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createReadStream, existsSync, statSync } from 'node:fs'
 import { extname, join, normalize, relative, resolve, sep } from 'node:path'
-import { recordingsRoot, savedClipsRoot } from './data-root'
+import { decodeMediaParts, localRecordingUrl, localSavedClipUrl, parseMediaUrl, resolveMediaFile } from './media-protocol'
+import { getChannelVodPlaylist, vodUrlLocal, type VodSource } from './vod-playlist'
 
 const MIME: Record<string, string> = {
   '.mp4': 'video/mp4',
   '.m3u8': 'application/vnd.apple.mpegurl',
   '.ts': 'video/mp2t',
+  '.mkv': 'video/x-matroska',
   '.m4s': 'video/iso.segment',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -35,13 +37,16 @@ type LiveChannel = {
 const PREAMBLE_MAX = 512 * 1024
 
 /**
- * Localhost-only server: recordings files + live MPEG-TS preview streams.
+ * Localhost HTTP for live preview + remote file proxy.
+ * Desktop playback prefers navora:// (see media-protocol).
  */
 export class MediaServer {
   private server: Server | null = null
   private port = 0
   private previewRoot = ''
   private live = new Map<string, LiveChannel>()
+  /** Prefer HTTP when listening — mpegts.js Range works more reliably than custom schemes. */
+  useCustomProtocol = false
 
   get baseUrl(): string | null {
     return this.port ? `http://127.0.0.1:${this.port}` : null
@@ -92,13 +97,60 @@ export class MediaServer {
   }
 
   recordingUrl(channelId: string, fileName: string): string {
-    const base = this.baseUrl ?? ''
+    const base = this.baseUrl
+    // HTTP first: mpegts.js + Range are rock solid on localhost
+    if (base && !this.useCustomProtocol) {
+      return `${base}/recordings/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
+    }
+    if (this.useCustomProtocol) return localRecordingUrl(channelId, fileName)
+    if (!base) {
+      console.warn('[media] recordingUrl before HTTP listen — falling back to navora://')
+      return localRecordingUrl(channelId, fileName)
+    }
     return `${base}/recordings/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
   }
 
   savedClipUrl(channelId: string, fileName: string): string {
-    const base = this.baseUrl ?? ''
+    const base = this.baseUrl
+    if (base && !this.useCustomProtocol) {
+      return `${base}/saved/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
+    }
+    if (this.useCustomProtocol) return localSavedClipUrl(channelId, fileName)
+    if (!base) return localSavedClipUrl(channelId, fileName)
     return `${base}/saved/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
+  }
+
+  /** Wall-clock window HLS VOD playlist URL (desktop localhost). */
+  vodPlaylistUrl(
+    channelId: string,
+    startMs: number,
+    endMs: number,
+    source: VodSource = 'loop',
+  ): string | null {
+    const base = this.baseUrl
+    if (!base) return null
+    return vodUrlLocal(base, channelId, startMs, endMs, source)
+  }
+
+  /** Generate VOD m3u8 body for local or remote prefix. */
+  buildVodPlaylist(opts: {
+    channelId: string
+    startMs: number
+    endMs: number
+    source?: VodSource
+    /** Default `/recordings/<id>` (local) or `/media/recordings/<id>` (remote). */
+    mediaPrefix?: string
+  }) {
+    const kind = opts.source === 'saved' ? 'saved' : 'recordings'
+    const mediaPrefix =
+      opts.mediaPrefix ?? `/${kind}/${encodeURIComponent(opts.channelId)}`
+    return getChannelVodPlaylist({
+      channelId: opts.channelId,
+      startMs: opts.startMs,
+      endMs: opts.endMs,
+      source: opts.source,
+      mediaPrefix,
+    })
   }
 
   /** Live low-latency MPEG-TS endpoint for mpegts.js */
@@ -154,44 +206,83 @@ export class MediaServer {
 
   private handle(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const parts = url.pathname.split('/').filter(Boolean)
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
         'Access-Control-Allow-Headers': '*',
       })
       res.end()
       return
     }
 
-    if (parts[0] === 'recordings') {
-      const file = safeJoin(recordingsRoot(), parts.slice(1))
-      if (!file || !existsSync(file) || statSync(file).isDirectory()) {
+    const parsed = (() => {
+      try {
+        return parseMediaUrl(url.href)
+      } catch {
+        return null
+      }
+    })()
+
+    if (parsed) {
+      const file = resolveMediaFile(parsed.kind, parsed.channelId, parsed.fileName)
+      if (!file) {
+        console.warn(`[media] 404 ${parsed.kind}/${parsed.channelId}/${parsed.fileName}`)
         res.writeHead(404)
         res.end('not found')
         return
       }
-      this.sendFile(file, res)
+      this.sendFile(file, req, res)
       return
     }
 
-    if (parts[0] === 'saved') {
-      const file = safeJoin(savedClipsRoot(), parts.slice(1))
-      if (!file || !existsSync(file) || statSync(file).isDirectory()) {
-        res.writeHead(404)
-        res.end('not found')
+    const parts = decodeMediaParts(url.pathname.split('/').filter(Boolean))
+
+    // /vod/:channelId/start/:startMs/end/:endMs/index.m3u8
+    if (
+      parts[0] === 'vod' &&
+      parts[1] &&
+      parts[2] === 'start' &&
+      parts[4] === 'end' &&
+      parts[6] === 'index.m3u8' &&
+      parts[3] &&
+      parts[5]
+    ) {
+      const channelId = parts[1]
+      const startMs = Number(parts[3])
+      const endMs = Number(parts[5])
+      const source = (url.searchParams.get('source') === 'saved' ? 'saved' : 'loop') as VodSource
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        res.writeHead(400)
+        res.end('bad range')
         return
       }
-      this.sendFile(file, res)
+      const kind = source === 'saved' ? 'saved' : 'recordings'
+      const playlist = this.buildVodPlaylist({
+        channelId,
+        startMs,
+        endMs,
+        source,
+        mediaPrefix: `/${kind}/${encodeURIComponent(channelId)}`,
+      })
+      if (!playlist) {
+        res.writeHead(404, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' })
+        res.end('no recordings in range')
+        return
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      })
+      res.end(playlist.body)
       return
     }
 
     // /preview/<id>/live.ts
     if (parts[0] === 'preview' && parts[2] === 'live.ts' && parts[1]) {
-      const channelId = decodeURIComponent(parts[1])
-      this.subscribeLiveStream(channelId, req, res)
+      this.subscribeLiveStream(parts[1], req, res)
       return
     }
 
@@ -203,7 +294,7 @@ export class MediaServer {
         res.end('not found')
         return
       }
-      this.sendFile(file, res, { noCache: true })
+      this.sendFile(file, req, res, { noCache: true })
       return
     }
 
@@ -232,26 +323,75 @@ export class MediaServer {
     res.on('close', cleanup)
   }
 
+  /** Serve a file with Range support (also used by remote proxy). */
+  serveFile(file: string, req: IncomingMessage, res: ServerResponse, opts?: { noCache?: boolean }) {
+    if (!file || !existsSync(file) || statSync(file).isDirectory()) {
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    this.sendFile(file, req, res, opts)
+  }
+
   private sendFile(
     file: string,
+    req: IncomingMessage,
     res: ServerResponse,
     opts?: { noCache?: boolean },
   ) {
     const st = statSync(file)
-    const headers: Record<string, string | number> = {
-      'Content-Type': contentType(file),
-      'Content-Length': st.size,
+    const total = st.size
+    const type = contentType(file)
+    const cacheHeaders: Record<string, string> = opts?.noCache
+      ? { 'Cache-Control': 'no-store, no-cache, must-revalidate' }
+      : { 'Cache-Control': 'public, max-age=60' }
+
+    const rangeHeader = req.headers.range
+    if (rangeHeader) {
+      const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader)
+      if (!m) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${total}`,
+          'Access-Control-Allow-Origin': '*',
+        })
+        res.end()
+        return
+      }
+      let start = m[1] ? Number(m[1]) : 0
+      let end = m[2] ? Number(m[2]) : total - 1
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= total) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${total}`,
+          'Access-Control-Allow-Origin': '*',
+        })
+        res.end()
+        return
+      }
+      end = Math.min(end, total - 1)
+      const chunk = end - start + 1
+      res.writeHead(206, {
+        'Content-Type': type,
+        'Content-Length': chunk,
+        'Content-Range': `bytes ${start}-${end}/${total}`,
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+        ...cacheHeaders,
+      })
+      createReadStream(file, { start, end }).pipe(res)
+      return
+    }
+
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Content-Length': total,
+      'Accept-Ranges': 'bytes',
       'Access-Control-Allow-Origin': '*',
-    }
-    if (opts?.noCache) {
-      headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-    } else {
-      headers['Cache-Control'] = 'public, max-age=60'
-    }
-    res.writeHead(200, headers)
+      ...cacheHeaders,
+    })
     createReadStream(file).pipe(res)
   }
 }
+
 
 export function previewDirFor(channelId: string, previewRoot: string): string {
   return join(previewRoot, channelId)

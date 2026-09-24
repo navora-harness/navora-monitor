@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { buildMpegtsPreviewArgs, buildProbeArgs, buildSegmentRecordArgs, sanitizeFileStem } from './ffmpeg-args'
 
 describe('buildSegmentRecordArgs', () => {
-  it('matches remux + segment pattern', () => {
+  it('matches remux + strftime segment pattern', () => {
     const args = buildSegmentRecordArgs({
       inputUrl: 'rtsp://user:pass@192.168.1.10:554/stream',
-      outputPattern: 'rec-%03d.mp4',
+      outputPattern: 'rec-%Y%m%d-%H%M%S.ts',
       title: 'Cafe East',
       segmentTimeSec: 300,
     })
@@ -18,9 +18,15 @@ describe('buildSegmentRecordArgs', () => {
     expect(args).toContain('segment')
     expect(args).toContain('-segment_time')
     expect(args).toContain('300')
+    expect(args).toContain('-strftime')
+    expect(args).toContain('1')
     expect(args).toContain('-segment_format')
-    expect(args).toContain('mp4')
-    expect(args.at(-1)).toBe('rec-%03d.mp4')
+    expect(args).toContain('mpegts')
+    expect(args).toContain('+genpts+discardcorrupt')
+    expect(args).toContain('dump_extra=freq=keyframe')
+    expect(args).toContain('mpegts_flags=+resend_headers')
+    expect(args).toContain('-avoid_negative_ts')
+    expect(args.at(-1)).toBe('rec-%Y%m%d-%H%M%S.ts')
     expect(args).toContain('title=Cafe East')
   })
 })

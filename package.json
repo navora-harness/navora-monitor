@@ -1,7 +1,7 @@
 {
   "name": "navora-monitor",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.3",
+  "private": false,
   "license": "MIT",
   "author": "Navora",
   "description": "Navora Monitor — LAN CCTV preview, recording, and playback (FFmpeg)",
@@ -35,9 +35,11 @@
     "dist:linux-arm": "npm run build && node scripts/pack.mjs linux-arm64",
     "dist:all": "npm run build && node scripts/pack.mjs --all",
     "dist:portable": "npm run build && node scripts/pack.mjs win-x64 portable",
-    "dist:nsis": "npm run build && node scripts/pack.mjs win-x64 nsis"
+    "dist:nsis": "npm run build && node scripts/pack.mjs win-x64 nsis",
+    "installer:assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer-assets.ps1"
   },
   "dependencies": {
+    "hls.js": "^1.7.3",
     "mpegts.js": "^1.8.2",
     "vue": "^3.5.13"
   },

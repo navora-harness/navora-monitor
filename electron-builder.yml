@@ -1,10 +1,11 @@
 # electron-builder — Navora Monitor
 # https://www.electron.build/configuration
 #
-# FFmpeg binaries are injected per-target by scripts/pack.mjs via -c.extraResources.
+# FFmpeg binaries are injected per-target by scripts/pack.mjs via config override.
 
 appId: com.navora.monitor
 productName: Navora Monitor
+executableName: NavoraMonitor
 copyright: Copyright © Navora
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 
@@ -17,6 +18,7 @@ files:
   - dist/**/*
   - dist-electron/**/*
   - package.json
+  - LICENSE
   - '!**/*.map'
   - '!**/node_modules/**'
 
@@ -27,18 +29,14 @@ electronDownload:
   mirror: https://npmmirror.com/mirrors/electron/
 
 win:
-  icon: electron/assets/icon.png
+  # Paths relative to buildResources (build/)
+  icon: icon.ico
   target:
-    - target: nsis
-      arch:
-        - x64
-        - arm64
-    - target: portable
-      arch:
-        - x64
-        - arm64
-  # Avoid signing prompts on local builds
-  signAndEditExecutable: false
+    - nsis
+    - portable
+  # Must stay true so rcedit embeds icon.ico + version metadata into the .exe.
+  # Signing is skipped when CSC_IDENTITY_AUTO_DISCOVERY=false (set in pack.mjs).
+  signAndEditExecutable: true
 
 nsis:
   oneClick: false
@@ -48,10 +46,21 @@ nsis:
   shortcutName: Navora Monitor
   uninstallDisplayName: Navora Monitor
   artifactName: ${productName}-${version}-${arch}-setup.${ext}
-  language: '2052'
+  # SimpChinese — welcome/finish copy from build/installer.nsh
+  installerLanguages:
+    - zh_CN
+  language: 2052
   differentialPackage: false
+  installerIcon: icon.ico
+  uninstallerIcon: icon.ico
+  installerHeaderIcon: icon.ico
+  installerHeader: installerHeader.bmp
+  installerSidebar: installerSidebar.bmp
+  uninstallerSidebar: installerSidebar.bmp
+  include: installer.nsh
+  # Do NOT list .exe here. electron-builder excludes these globs from the app 7z and
+  # only re-adds matches under resources/ — that drops the root main executable.
   preCompressedFileExtensions:
-    - .exe
     - .mp4
     - .mkv
 
@@ -70,14 +79,8 @@ linux:
     Comment: LAN CCTV monitor
     Categories: AudioVideo;Video;Recorder;
   target:
-    - target: AppImage
-      arch:
-        - x64
-        - arm64
-    - target: tar.gz
-      arch:
-        - x64
-        - arm64
+    - AppImage
+    - tar.gz
 
 # Keep release folder small in CI logs
 compression: normal

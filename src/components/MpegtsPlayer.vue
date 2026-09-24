@@ -19,6 +19,8 @@ const props = defineProps<{
   volume?: number
   mirrored?: boolean
   paused?: boolean
+  /** Live low-latency vs VOD (recording playback). Default true. */
+  isLive?: boolean
 }>()
 
 defineExpose({
@@ -85,29 +87,39 @@ function attach(src: string | null) {
     return
   }
 
+  const live = props.isLive !== false
   player = mpegts.createPlayer(
     {
       type: 'mpegts',
-      isLive: true,
+      isLive: live,
       url: src,
       hasAudio: true,
       hasVideo: true,
     },
-    {
-      enableStashBuffer: false,
-      stashInitialSize: 128,
-      liveBufferLatencyChasing: true,
-      liveBufferLatencyMaxLatency: 1.5,
-      liveBufferLatencyMinRemain: 0.3,
-      lazyLoad: false,
-      deferLoadAfterSourceOpen: false,
-    },
+    live
+      ? {
+          enableStashBuffer: false,
+          stashInitialSize: 128,
+          liveBufferLatencyChasing: true,
+          liveBufferLatencyMaxLatency: 1.5,
+          liveBufferLatencyMinRemain: 0.3,
+          lazyLoad: false,
+          deferLoadAfterSourceOpen: false,
+        }
+      : {
+          enableStashBuffer: true,
+          stashInitialSize: 384,
+          lazyLoad: false,
+          deferLoadAfterSourceOpen: false,
+          seekType: 'range',
+        },
   ) as LivePlayer
   player.attachMediaElement(v)
   player.load()
   if (!props.paused) void player.play().catch(() => undefined)
 
   player.on(mpegts.Events.ERROR, () => {
+    if (!live) return
     const url = props.src
     setTimeout(() => {
       if (props.src === url) attach(url)
