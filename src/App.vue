@@ -258,6 +258,8 @@ function enterPlayback(seg?: RecordingSegment | null) {
   viewMode.value = 'playback'
   if (!layout.showTimeline) setShowTimeline(true)
   if (seg) playbackSeg.value = seg
+  // Free RTSP / HEVC decoder while PlaybackView owns the stage.
+  void api().syncPreviews([])
   void refreshRecordings()
 }
 
@@ -268,6 +270,7 @@ function exitPlayback() {
   playbackPlayId.value = null
   playbackFollowMs.value = null
   playbackBusy.value = false
+  scheduleSyncPreviews()
 }
 
 function onPlaybackPlay(seg: RecordingSegment) {
@@ -428,6 +431,32 @@ async function onRepairConfig() {
   await refreshStates()
   await refreshInfo()
   status.value = res.messages.join(' · ')
+}
+
+const repairingTimestamps = ref(false)
+
+async function onRepairRecordingTimestamps() {
+  if (repairingTimestamps.value) return
+  const ok = window.confirm(
+    '修复已有录像时间轴？\n\n' +
+      '• 扫描循环录像与已保存片段中的 .ts\n' +
+      '• 仅处理音视频时间轴不一致的文件（流复制，不重编码）\n' +
+      '• 正在写入的文件会跳过\n' +
+      '• 录像量大时可能需要几分钟\n\n' +
+      '新录制的分段会在归档时自动归一化。',
+  )
+  if (!ok) return
+  repairingTimestamps.value = true
+  status.value = '正在修复已有录像时间轴…'
+  try {
+    const res = await api().repairRecordingTimestamps()
+    status.value = res.message
+    await refreshRecordings()
+  } catch (e) {
+    status.value = e instanceof Error ? e.message : '修复失败'
+  } finally {
+    repairingTimestamps.value = false
+  }
 }
 
 async function onExportConfig() {
@@ -740,6 +769,9 @@ async function onContextMenu(
       break
     case 'repairConfig':
       await onRepairConfig()
+      break
+    case 'repairRecordingTimestamps':
+      await onRepairRecordingTimestamps()
       break
     case 'repairChannel':
       if (id) await onRepairChannel(id)
@@ -1167,6 +1199,15 @@ watch(
   () => scheduleSaveLayout(),
 )
 
+watch(viewMode, (mode, prev) => {
+  if (mode === prev) return
+  if (mode === 'playback') {
+    void api().syncPreviews([])
+  } else if (mode === 'live') {
+    scheduleSyncPreviews()
+  }
+})
+
 watch(selectedId, () => {
   void refreshRecordings()
   if (viewMode.value === 'playback') playbackSeg.value = null
@@ -1226,6 +1267,7 @@ watch(selectedId, () => {
       @scan-devices="openScanDialog"
       @manage-groups="showGroupsDialog = true"
       @repair-config="onRepairConfig"
+      @repair-recording-timestamps="onRepairRecordingTimestamps"
       @open-dev-tools="() => void api().toggleDevTools()"
       @minimize="() => api().windowMinimize()"
       @maximize="() => api().windowMaximize()"
@@ -1348,6 +1390,7 @@ watch(selectedId, () => {
           :play-id="playbackPlayId"
           :play-nonce="playbackPlayNonce"
           :suspended="!windowVisible"
+          :media-base-url="info?.mediaBaseUrl ?? null"
           @exit="exitPlayback"
           @follow="onPlaybackFollow"
           @segment="onPlaybackSegment"

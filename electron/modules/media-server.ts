@@ -3,6 +3,9 @@ import { createReadStream, existsSync, statSync } from 'node:fs'
 import { extname, join, normalize, relative, resolve, sep } from 'node:path'
 import { decodeMediaParts, localRecordingUrl, localSavedClipUrl, parseMediaUrl, resolveMediaFile } from './media-protocol'
 import { getChannelVodPlaylist, vodUrlLocal, type VodSource } from './vod-playlist'
+import { serveTsRemuxAsMp4 } from './ffmpeg/fmp4-playback-stream'
+import { probeFfmpeg, resolveFfmpegPath } from './ffmpeg/resolve'
+import { loadSettings } from './settings-store'
 
 const MIME: Record<string, string> = {
   '.mp4': 'video/mp4',
@@ -37,16 +40,15 @@ type LiveChannel = {
 const PREAMBLE_MAX = 512 * 1024
 
 /**
- * Localhost HTTP for live preview + remote file proxy.
- * Desktop playback prefers navora:// (see media-protocol).
+ * Localhost HTTP for live preview + recording / saved-clip Range downloads.
+ * Desktop playback always uses http://127.0.0.1 (mpegts.js needs Range).
+ * navora:// is only a last-resort fallback before the HTTP server is listening.
  */
 export class MediaServer {
   private server: Server | null = null
   private port = 0
   private previewRoot = ''
   private live = new Map<string, LiveChannel>()
-  /** Prefer HTTP when listening — mpegts.js Range works more reliably than custom schemes. */
-  useCustomProtocol = false
 
   get baseUrl(): string | null {
     return this.port ? `http://127.0.0.1:${this.port}` : null
@@ -98,26 +100,20 @@ export class MediaServer {
 
   recordingUrl(channelId: string, fileName: string): string {
     const base = this.baseUrl
-    // HTTP first: mpegts.js + Range are rock solid on localhost
-    if (base && !this.useCustomProtocol) {
+    if (base) {
       return `${base}/recordings/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
     }
-    if (this.useCustomProtocol) return localRecordingUrl(channelId, fileName)
-    if (!base) {
-      console.warn('[media] recordingUrl before HTTP listen — falling back to navora://')
-      return localRecordingUrl(channelId, fileName)
-    }
-    return `${base}/recordings/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
+    console.warn('[media] recordingUrl before HTTP listen — temporary navora:// fallback')
+    return localRecordingUrl(channelId, fileName)
   }
 
   savedClipUrl(channelId: string, fileName: string): string {
     const base = this.baseUrl
-    if (base && !this.useCustomProtocol) {
+    if (base) {
       return `${base}/saved/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
     }
-    if (this.useCustomProtocol) return localSavedClipUrl(channelId, fileName)
-    if (!base) return localSavedClipUrl(channelId, fileName)
-    return `${base}/saved/${encodeURIComponent(channelId)}/${encodeURIComponent(fileName)}`
+    console.warn('[media] savedClipUrl before HTTP listen — temporary navora:// fallback')
+    return localSavedClipUrl(channelId, fileName)
   }
 
   /** Wall-clock window HLS VOD playlist URL (desktop localhost). */
@@ -239,6 +235,16 @@ export class MediaServer {
 
     const parts = decodeMediaParts(url.pathname.split('/').filter(Boolean))
 
+    // /remux/recordings|saved/:channelId/:fileName.ts?t=offsetSec
+    // FFmpeg -c copy → temp faststart MP4 → Range for native <video> (Chromium cannot open fMP4 pipes).
+    if (parts[0] === 'remux' && (parts[1] === 'recordings' || parts[1] === 'saved') && parts[2] && parts[3]) {
+      const kind = parts[1] as 'recordings' | 'saved'
+      const channelId = parts[2]
+      const fileName = parts.slice(3).join('/')
+      void this.serveFmp4Remux(kind, channelId, fileName, req, res, url)
+      return
+    }
+
     // /vod/:channelId/start/:startMs/end/:endMs/index.m3u8
     if (
       parts[0] === 'vod' &&
@@ -331,6 +337,53 @@ export class MediaServer {
       return
     }
     this.sendFile(file, req, res, opts)
+  }
+
+  /**
+   * Remux a finished .ts to a temp faststart MP4 and Range-serve it.
+   * Query `t` = start offset seconds (FFmpeg -ss before -i).
+   * Temp files live under OS tempdir — not in the recordings tree.
+   */
+  private async serveFmp4Remux(
+    kind: 'recordings' | 'saved',
+    channelId: string,
+    fileName: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ) {
+    if (!fileName.toLowerCase().endsWith('.ts')) {
+      res.writeHead(400, { 'Access-Control-Allow-Origin': '*' })
+      res.end('expected .ts')
+      return
+    }
+    const file = resolveMediaFile(kind, channelId, fileName)
+    if (!file) {
+      console.warn(`[media] remux 404 ${kind}/${channelId}/${fileName}`)
+      res.writeHead(404, { 'Access-Control-Allow-Origin': '*' })
+      res.end('not found')
+      return
+    }
+
+    const ffmpeg = resolveFfmpegPath(loadSettings().ffmpegPath || null)
+    if (!ffmpeg || !probeFfmpeg(ffmpeg)) {
+      res.writeHead(503, { 'Access-Control-Allow-Origin': '*' })
+      res.end('ffmpeg unavailable')
+      return
+    }
+
+    const tRaw = url.searchParams.get('t')
+    const startSec = tRaw != null && tRaw !== '' ? Number(tRaw) : 0
+    const start = Number.isFinite(startSec) && startSec > 0 ? startSec : 0
+
+    await serveTsRemuxAsMp4({
+      ffmpeg,
+      srcPath: file,
+      startSec: start,
+      req,
+      res,
+      sendFile: (f, r, s, o) => this.sendFile(f, r, s, o),
+    })
   }
 
   private sendFile(

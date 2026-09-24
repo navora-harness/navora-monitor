@@ -21,12 +21,14 @@ import { deleteAllRecordingFiles, deleteOldestSegments, sumRecordingBytes } from
 import { sumSavedClipBytes } from './saved-clips'
 import type { RecorderManager } from './recorder-manager'
 
-function sumDirMp4Bytes(dir: string): number {
+function sumDirMediaBytes(dir: string): number {
   if (!existsSync(dir)) return 0
   let total = 0
   try {
     for (const name of readdirSync(dir)) {
-      if (!name.toLowerCase().endsWith('.mp4')) continue
+      const lower = name.toLowerCase()
+      // Loop recording writes MPEG-TS (.ts); keep .mp4 for any legacy segments.
+      if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) continue
       try {
         total += statSync(join(dir, name)).size
       } catch {
@@ -47,7 +49,7 @@ function measureActiveWriteRate(recorders: RecorderManager): number {
     if (!Number.isFinite(started)) continue
     const elapsedSec = Math.max(0, (now - started) / 1000)
     samples.push({
-      bytesWritten: sumDirMp4Bytes(s.outputDir),
+      bytesWritten: sumDirMediaBytes(s.outputDir),
       elapsedSec,
     })
   }

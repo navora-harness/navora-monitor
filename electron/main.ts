@@ -5,14 +5,16 @@ import * as channelStore from './modules/channel-store'
 import { channelRecordDir, channelSavedDir, ensureDir, getDataRoot, isRecordCacheActive, recordCacheRoot, recordingsRoot, savedClipsRoot, snapshotsRoot } from './modules/data-root'
 import * as layoutStore from './modules/layout-store'
 import { MediaServer } from './modules/media-server'
+import { exportClipRange } from './modules/export-clip'
+import { remuxTsForPlayback } from './modules/ffmpeg/remux-playback'
 import {
   registerMediaProtocolHandler,
   registerMediaSchemePrivileged,
+  resolveMediaFile,
 } from './modules/media-protocol'
 import { getPreviewRoot, PreviewManager } from './modules/preview-manager'
 import { listRecordingSegments } from './modules/recording-index'
 import { deleteSavedClip, listSavedClips, saveRecentClip } from './modules/saved-clips'
-import { exportClipRange } from './modules/export-clip'
 import { formatExportStamp } from '../shared/export-clip'
 import { RecorderManager } from './modules/recorder-manager'
 import { probeChannel } from './modules/ffmpeg/probe'
@@ -23,6 +25,7 @@ import { createAppTray, type TrayController } from './modules/tray'
 import { loadSettings, saveSettings } from './modules/settings-store'
 import { applyOpenAtLogin } from './modules/login-item'
 import { repairConfiguration } from './modules/repair-config'
+import { repairRecordingTimestamps } from './modules/repair-recording-timestamps'
 import { exportConfigToFile, pickConfigImportFile, inspectConfigImportFile, applyConfigImport } from './modules/config-transfer'
 import { cancelDeviceScan, runDeviceScan, listScanSubnets } from './modules/device-scan'
 import { StorageGuard } from './modules/storage-guard'
@@ -54,6 +57,10 @@ if (!gotLock) {
 let mainWindow: BrowserWindow | null = null
 let tray: TrayController | null = null
 let isQuitting = false
+/** Serialize destroy/recreate so rapid tray / close clicks cannot double-create. */
+let windowOp: 'idle' | 'dismissing' | 'creating' = 'idle'
+/** If user asks to show while dismiss is in flight, reopen after destroy finishes. */
+let pendingShowAfterDismiss = false
 let retentionTimer: ReturnType<typeof setInterval> | null = null
 const media = new MediaServer()
 const recorders = new RecorderManager()
@@ -108,7 +115,16 @@ function allStates(): ChannelRuntimeState[] {
 }
 
 function showMainWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+  if (isQuitting) return
+  if (windowOp === 'dismissing') {
+    pendingShowAfterDismiss = true
+    return
+  }
+  if (windowOp === 'creating') return
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow({ showImmediately: true })
+  }
   const win = mainWindow
   if (!win || win.isDestroyed()) return
   if (win.isMinimized()) win.restore()
@@ -116,42 +132,82 @@ function showMainWindow() {
   win.focus()
 }
 
-function hideMainWindow() {
+/**
+ * Close UI to tray: destroy the BrowserWindow so Chromium memory is released.
+ * Recording / schedule / remote keep running in the main process.
+ */
+function dismissMainWindowToTray() {
+  if (isQuitting) return
+  if (windowOp === 'dismissing' || windowOp === 'creating') return
   if (!mainWindow || mainWindow.isDestroyed()) return
-  mainWindow.hide()
+
+  windowOp = 'dismissing'
+  pendingShowAfterDismiss = false
+  try {
+    previews.stopAll()
+  } catch {
+    /* ignore */
+  }
+  const win = mainWindow
+  // destroy() closes without re-entering the preventDefault close-to-tray path
+  try {
+    win.destroy()
+  } catch {
+    mainWindow = null
+    windowOp = 'idle'
+  }
 }
 
-function createWindow() {
+function createWindow(opts?: { showImmediately?: boolean }) {
+  if (isQuitting) return
+  if (windowOp === 'dismissing') {
+    if (opts?.showImmediately) pendingShowAfterDismiss = true
+    return
+  }
+  if (windowOp === 'creating') return
   if (mainWindow && !mainWindow.isDestroyed()) return
 
+  windowOp = 'creating'
   ensureDir(getDataRoot())
   ensureDir(recordingsRoot())
   ensureDir(snapshotsRoot())
   media.setPreviewRoot(getPreviewRoot())
 
   const settings = loadSettings()
+  const showImmediately = opts?.showImmediately === true || settings.showMainOnStartup
   const appIcon = loadAppIcon()
   const darkUi =
     settings.uiTheme === 'dark' ||
     (settings.uiTheme === 'system' && nativeTheme.shouldUseDarkColors)
-  mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1100,
-    minHeight: 700,
-    title: 'Navora Monitor',
-    show: false,
-    backgroundColor: darkUi ? '#141920' : '#f3f3f3',
-    frame: false,
-    titleBarStyle: 'hidden',
-    ...(appIcon ? { icon: appIcon } : {}),
-    webPreferences: {
-      preload: join(__dirname, 'preload.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-    },
-  })
+
+  let win: BrowserWindow
+  try {
+    win = new BrowserWindow({
+      width: 1440,
+      height: 900,
+      minWidth: 1100,
+      minHeight: 700,
+      title: 'Navora Monitor',
+      show: false,
+      backgroundColor: darkUi ? '#141920' : '#f3f3f3',
+      frame: false,
+      titleBarStyle: 'hidden',
+      ...(appIcon ? { icon: appIcon } : {}),
+      webPreferences: {
+        preload: join(__dirname, 'preload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+      },
+    })
+  } catch (err) {
+    windowOp = 'idle'
+    console.error('[window] create failed', err)
+    return
+  }
+
+  mainWindow = win
+  windowOp = 'idle'
 
   Menu.setApplicationMenu(null)
 
@@ -163,46 +219,47 @@ function createWindow() {
 
   const devUrl = process.env.VITE_DEV_SERVER_URL
   if (devUrl) {
-    void mainWindow.loadURL(devUrl)
+    void win.loadURL(devUrl)
     if (process.env.NAVORA_MONITOR_OPEN_DEVTOOLS === '1') {
-      mainWindow.webContents.openDevTools({ mode: 'detach' })
+      win.webContents.openDevTools({ mode: 'detach' })
     }
   } else {
-    void mainWindow.loadFile(join(__dirname, '../dist/index.html'))
+    void win.loadFile(join(__dirname, '../dist/index.html'))
   }
 
-  mainWindow.once('ready-to-show', () => {
-    if (settings.showMainOnStartup) mainWindow?.show()
+  win.once('ready-to-show', () => {
+    if (mainWindow !== win || win.isDestroyed()) return
+    if (showImmediately) win.show()
     notifyVisibility()
   })
 
-  mainWindow.on('show', notifyVisibility)
-  mainWindow.on('hide', notifyVisibility)
-  mainWindow.on('minimize', notifyVisibility)
-  mainWindow.on('restore', notifyVisibility)
-  mainWindow.on('focus', notifyVisibility)
+  win.on('show', notifyVisibility)
+  win.on('hide', notifyVisibility)
+  win.on('minimize', notifyVisibility)
+  win.on('restore', notifyVisibility)
+  win.on('focus', notifyVisibility)
 
-  mainWindow.webContents.on('before-input-event', (event, input) => {
+  win.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return
     const key = input.key.toLowerCase()
     const toggle =
       key === 'f12' || (key === 'i' && input.control && input.shift && !input.alt && !input.meta)
     if (!toggle) return
     event.preventDefault()
-    const wc = mainWindow?.webContents
-    if (!wc || wc.isDestroyed()) return
+    const wc = win.webContents
+    if (wc.isDestroyed()) return
     if (wc.isDevToolsOpened()) wc.closeDevTools()
     else wc.openDevTools({ mode: 'detach' })
   })
-  mainWindow.on('blur', () => {
+  win.on('blur', () => {
     /* keep playing while focused elsewhere but still visible */
   })
 
-  mainWindow.on('close', (e) => {
+  win.on('close', (e) => {
     if (isQuitting) return
     if (loadSettings().closeToTray) {
       e.preventDefault()
-      hideMainWindow()
+      dismissMainWindowToTray()
       return
     }
     // Closing the window quits the app — confirm while recording.
@@ -212,8 +269,13 @@ function createWindow() {
     }
   })
 
-  mainWindow.on('closed', () => {
-    mainWindow = null
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null
+    windowOp = 'idle'
+    if (pendingShowAfterDismiss) {
+      pendingShowAfterDismiss = false
+      showMainWindow()
+    }
   })
 }
 
@@ -352,6 +414,11 @@ function registerIpc() {
       activePreviewIds,
     })
   })
+
+  ipcMain.handle(
+    'nm:repairRecordingTimestamps',
+    (_e, opts?: { channelId?: string; force?: boolean }) => repairRecordingTimestamps(opts),
+  )
 
   ipcMain.handle('nm:exportConfig', (_e, parts?: Partial<import('../shared/config-bundle').ConfigBundleParts>) =>
     exportConfigToFile(mainWindow, parts),
@@ -575,6 +642,49 @@ function registerIpc() {
     return listSavedClips(media, channelId)
   })
 
+  /**
+   * Remux a local .ts recording to MP4 for native &lt;video&gt; playback.
+   * Avoids Chromium MSE + HEVC first-frame freeze with mpegts.js.
+   */
+  ipcMain.handle(
+    'nm:preparePlaybackMedia',
+    async (
+      _e,
+      opts: { channelId: string; fileName: string; kind?: 'recordings' | 'saved' },
+    ) => {
+      const channelId = typeof opts?.channelId === 'string' ? opts.channelId.trim() : ''
+      const fileName = typeof opts?.fileName === 'string' ? opts.fileName.trim() : ''
+      const kind = opts?.kind === 'saved' ? 'saved' : 'recordings'
+      if (!channelId || !fileName) return { ok: false as const, error: '参数无效' }
+      if (!fileName.toLowerCase().endsWith('.ts')) {
+        // Already progressive — return existing URL
+        const url =
+          kind === 'saved' ? media.savedClipUrl(channelId, fileName) : media.recordingUrl(channelId, fileName)
+        return { ok: true as const, url, fileName, cached: true as const }
+      }
+      const src = resolveMediaFile(kind, channelId, fileName)
+      if (!src) return { ok: false as const, error: '找不到录像文件' }
+      const remuxed = await remuxTsForPlayback(src)
+      if (!remuxed.ok) {
+        console.warn('[playback] remux failed', fileName, remuxed.error)
+        return remuxed
+      }
+      console.info(
+        `[playback] remux ok cached=${remuxed.cached} ${fileName} → ${remuxed.fileName}`,
+      )
+      const url =
+        kind === 'saved'
+          ? media.savedClipUrl(channelId, remuxed.fileName)
+          : media.recordingUrl(channelId, remuxed.fileName)
+      return {
+        ok: true as const,
+        url,
+        fileName: remuxed.fileName,
+        cached: remuxed.cached,
+      }
+    },
+  )
+
   ipcMain.handle('nm:saveRecentClip', (_e, channelId: string, durationSec?: number) => {
     const ch = channelStore.loadChannels().find((c) => c.id === channelId)
     if (!ch) return { ok: false as const, error: '通道不存在' }
@@ -722,7 +832,7 @@ function registerIpc() {
     else mainWindow.maximize()
   })
   ipcMain.handle('nm:windowClose', () => {
-    if (loadSettings().closeToTray) hideMainWindow()
+    if (loadSettings().closeToTray) dismissMainWindowToTray()
     else void requestQuit()
   })
   ipcMain.handle('nm:toggleDevTools', () => {
@@ -755,8 +865,9 @@ app.whenReady().then(async () => {
   tray = createAppTray({
     getMainWindow: () => mainWindow,
     ensureMainWindow: () => {
-      if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow({ showImmediately: true })
     },
+    dismissToTray: () => dismissMainWindowToTray(),
     onQuit: () => void requestQuit(),
     initialIconVisible: true,
   })
@@ -815,9 +926,9 @@ app.on('before-quit', () => {
 
 app.on('window-all-closed', () => {
   if (process.platform === 'darwin') return
-  // Keep running only while close-to-tray leaves a hidden window.
-  // If the window was actually destroyed, quit (tray icon alone is not enough).
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    if (!isQuitting) quitApp()
-  }
+  if (isQuitting) return
+  // Close-to-tray destroys the BrowserWindow on purpose; keep main process
+  // (FFmpeg recorders, schedule, remote) alive with the tray icon.
+  if (loadSettings().closeToTray) return
+  quitApp()
 })

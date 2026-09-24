@@ -12,16 +12,28 @@ export type TrayController = {
   setIconVisible: (visible: boolean) => void
 }
 
+const CLICK_DEBOUNCE_MS = 280
+
 export function createAppTray(opts: {
   getMainWindow: () => BrowserWindow | null
   ensureMainWindow: () => void
   onQuit: () => void
+  /** Destroy / hide main window while staying in tray. */
+  dismissToTray?: () => void
   /** Create tray glyph immediately. Default true. */
   initialIconVisible?: boolean
 }): TrayController {
   let tray: Tray | null = null
+  let clickTimer: ReturnType<typeof setTimeout> | null = null
+
+  const clearClickTimer = () => {
+    if (!clickTimer) return
+    clearTimeout(clickTimer)
+    clickTimer = null
+  }
 
   const showMain = () => {
+    clearClickTimer()
     opts.ensureMainWindow()
     const win = opts.getMainWindow()
     if (!win || win.isDestroyed()) return
@@ -31,6 +43,11 @@ export function createAppTray(opts: {
   }
 
   const hideToTray = () => {
+    clearClickTimer()
+    if (opts.dismissToTray) {
+      opts.dismissToTray()
+      return
+    }
     const win = opts.getMainWindow()
     if (win && !win.isDestroyed()) win.hide()
   }
@@ -40,17 +57,26 @@ export function createAppTray(opts: {
     t.setContextMenu(
       Menu.buildFromTemplate([
         { label: '显示 Navora Monitor', click: () => showMain() },
-        { label: '隐藏到托盘', click: () => hideToTray() },
+        { label: '关闭窗口到托盘', click: () => hideToTray() },
         { type: 'separator' },
         { label: '退出', click: () => opts.onQuit() },
       ]),
     )
-    t.on('double-click', () => showMain())
+    // Windows fires click then double-click; delay single-click toggle and
+    // cancel it on double-click so rapid clicks don't destroy+recreate thrash.
+    t.on('double-click', () => {
+      clearClickTimer()
+      showMain()
+    })
     t.on('click', () => {
       if (process.platform === 'darwin') return
-      const win = opts.getMainWindow()
-      if (win && !win.isDestroyed() && win.isVisible() && !win.isMinimized()) hideToTray()
-      else showMain()
+      clearClickTimer()
+      clickTimer = setTimeout(() => {
+        clickTimer = null
+        const win = opts.getMainWindow()
+        if (win && !win.isDestroyed() && win.isVisible() && !win.isMinimized()) hideToTray()
+        else showMain()
+      }, CLICK_DEBOUNCE_MS)
     })
   }
 
@@ -61,6 +87,7 @@ export function createAppTray(opts: {
       bindTray(tray)
       return
     }
+    clearClickTimer()
     if (!tray) return
     try {
       tray.destroy()

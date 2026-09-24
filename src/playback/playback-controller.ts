@@ -1,6 +1,6 @@
 /**
  * Windowed HLS VOD playback controller — wall-clock scrub / follow SSOT.
- * Fragile / truncated TS fragments fall back to single-file mpegts.js.
+ * Finished .ts segments play via mpegts.js over localhost HTTP Range.
  */
 
 import type { RecordingSegment } from '@shared/types'
@@ -23,7 +23,9 @@ import {
   segmentSpanSec,
   toTimedClip,
   wallToClip,
+  isMpegTsPath,
 } from './wall-time'
+import { forceHttpMediaUrl } from '@shared/media-http-url'
 
 export type PlaybackControllerEvents = {
   follow: (wallMs: number) => void
@@ -35,6 +37,8 @@ export type PlaybackControllerEvents = {
   playlistEnded: () => void
   /** True while playhead sits on a segment still being written. */
   liveRecording: (on: boolean) => void
+  /** Short status for UI / debug (e.g. remux progress). */
+  status: (message: string) => void
 }
 
 const HALF_WINDOW_MS = 20 * 60_000
@@ -60,6 +64,7 @@ export class PlaybackController {
   private channelId: string | null = null
   private source: VodSource = 'loop'
   private sampleMediaUrl: string | null = null
+  private mediaBaseUrl: string | null = null
   private authToken: string | null = null
 
   private windowStartMs = 0
@@ -83,10 +88,29 @@ export class PlaybackController {
   private loadToken = 0
   private streamSegId: string | null = null
   private liveRecording = false
+  /** Actual media loaded into StreamEngine (may be remuxed .play.mp4). */
+  private streamPlayFile: string | null = null
+  private streamPlayUrl: string | null = null
+  private streamViaRemux = false
 
   /** Current engine: mpegts Range stream vs HLS VOD window. */
   get playMode(): PlayMode {
     return this.mode
+  }
+
+  /** True when stream mode is serving FFmpeg fMP4 remux (or legacy disk remux). */
+  get viaRemux(): boolean {
+    return this.mode === 'stream' && this.streamViaRemux
+  }
+
+  /** File name currently fed to the media element (after remux if any). */
+  get playFileName(): string | null {
+    return this.mode === 'stream' ? this.streamPlayFile : this.current?.fileName ?? null
+  }
+
+  /** URL currently fed to the media element (after remux if any). */
+  get playUrl(): string | null {
+    return this.mode === 'stream' ? this.streamPlayUrl : null
   }
 
   on<K extends keyof PlaybackControllerEvents>(event: K, fn: PlaybackControllerEvents[K]) {
@@ -213,6 +237,8 @@ export class PlaybackController {
     channelId: string | null
     source?: VodSource
     sampleMediaUrl?: string | null
+    /** http://127.0.0.1:port — rewrite navora:// media to HTTP Range */
+    mediaBaseUrl?: string | null
     authToken?: string | null
   }) {
     const nextId = opts.channelId
@@ -221,6 +247,7 @@ export class PlaybackController {
     this.channelId = nextId
     this.source = nextSource
     if (opts.sampleMediaUrl != null) this.sampleMediaUrl = opts.sampleMediaUrl
+    if (opts.mediaBaseUrl !== undefined) this.mediaBaseUrl = opts.mediaBaseUrl
     if (opts.authToken !== undefined) {
       this.authToken = opts.authToken
       this.vod.setAuthToken(opts.authToken)
@@ -351,6 +378,9 @@ export class PlaybackController {
     this.windowLoaded = false
     this.current = null
     this.streamSegId = null
+    this.streamPlayFile = null
+    this.streamPlayUrl = null
+    this.streamViaRemux = false
     this.useMode('vod')
     this.setLiveRecording(false)
     this.vod.unload()
@@ -491,7 +521,6 @@ export class PlaybackController {
 
     this.wantPlay = true
     this.holdFollowPin(wallMs)
-    this.syncCurrentSegment(mediaWall)
 
     if (targetSeg && isSegmentWriting(targetSeg)) {
       await this.showLiveRecording(targetSeg, wallMs)
@@ -503,6 +532,7 @@ export class PlaybackController {
     // Prefer single-file mpegts.js. HLS VOD treats each multi‑MB .ts as one
     // fragment — it eagerly downloads many files into MSE and often never
     // reaches a playable state. Continuous play chains via stream `ended`.
+    // Switch to stream before any segment emit so UI/debug never flashes [vod]→[stream].
     if (targetSeg) {
       await this.enterStreamMode(targetSeg, offsetSec)
       if (this.pendingScrubMs != null) return
@@ -510,6 +540,7 @@ export class PlaybackController {
       return
     }
 
+    this.syncCurrentSegment(mediaWall)
     await this.enterVodMode(mediaWall)
     if (this.pendingScrubMs != null) return
     this.settleFollowToMedia(wallMs)
@@ -571,9 +602,10 @@ export class PlaybackController {
       this.mode === 'stream' && this.streamSegId === seg.id && this.stream.hasSession
     this.useMode('stream')
     this.windowLoaded = false
+    const segChanged = this.current?.id !== seg.id
     this.current = seg
     this.streamSegId = seg.id
-    this.emit('segment', seg)
+    if (segChanged || !sameFile) this.emit('segment', seg)
 
     if (sameFile) {
       await this.stream.seek(offset)
@@ -588,13 +620,25 @@ export class PlaybackController {
       this.emit('error', '录像地址无效')
       return
     }
+
+    // Prefer localhost HTTP Range for mpegts.js (navora:// is Range-hostile).
+    url = forceHttpMediaUrl(url, this.mediaBaseUrl || this.sampleMediaUrl)
+
+    const playFileName = seg.fileName
+    const transport = isMpegTsPath(seg.fileName) || isMpegTsPath(url) ? 'mpegts' : 'native'
+
+    this.streamPlayFile = playFileName
+    this.streamViaRemux = false
+
     url = withVodAuth(url, this.authToken)
+    this.streamPlayUrl = url
 
     await this.stream.load({
       url,
-      fileName: seg.fileName,
+      fileName: playFileName,
       wallSpanSec: segmentSpanSec(seg),
       startOffsetSec: offset,
+      transport,
     })
     if (token !== this.loadToken || this.mode !== 'stream') return
 

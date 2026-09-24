@@ -29,6 +29,8 @@ export const SEGMENT_STRFTIME_SUFFIX = '%Y%m%d-%H%M%S.ts'
 
 export function isRecordingMediaFile(name: string): boolean {
   const lower = name.toLowerCase()
+  // Sidecar VOD remux cache (see remux-playback.ts) — not a recording segment
+  if (lower.endsWith('.play.mp4') || lower.endsWith('.play.mp4.meta')) return false
   return lower.endsWith('.ts') || lower.endsWith('.mp4') || lower.endsWith('.mkv')
 }
 

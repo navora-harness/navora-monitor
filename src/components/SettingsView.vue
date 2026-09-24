@@ -379,9 +379,9 @@ onUnmounted(() => {
               <p class="hint">关闭后启动仅驻留托盘，双击托盘图标可打开主窗口。</p>
               <label class="check block">
                 <input v-model="draft.closeToTray" type="checkbox" />
-                <span>关闭窗口时最小化到托盘</span>
+                <span>关闭窗口时销毁界面并驻留托盘</span>
               </label>
-              <p class="hint">关闭主窗口后应用继续在托盘运行，可从托盘菜单恢复或退出。</p>
+              <p class="hint">关闭主窗口会释放界面内存；录像与远程服务仍在主进程继续，可从托盘恢复窗口或退出。</p>
               <label class="check block">
                 <input v-model="draft.openAtLogin" type="checkbox" />
                 <span>开机自动启动</span>
@@ -595,7 +595,8 @@ onUnmounted(() => {
             <section v-show="cat === 'remote'">
               <h3>远程访问</h3>
               <p class="hint">
-                在局域网内用浏览器查看实时预览。桌面端布局接近本机；手机端可纵向滚动查看多路画面。
+                在局域网内用浏览器登录后，可查看实时预览与录像回放（时间轴拖动、mpegts 流式播放）。
+                桌面端布局接近本机；手机端可纵向滚动查看多路画面。保存片段 / 导出请在主机操作。
               </p>
               <label class="check block">
                 <input v-model="draft.remoteEnabled" type="checkbox" />

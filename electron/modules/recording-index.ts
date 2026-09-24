@@ -2,6 +2,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RecordingSegment } from '../../shared/types'
 import { isRecordingMediaFile, parseSegmentStartMs } from '../../shared/segment-time'
+import { isSegmentWriting } from '../../shared/segment-writing'
 import {
   estimateSegmentBounds,
   isCachedRangePlausible,
@@ -16,7 +17,7 @@ import {
 import type { MediaServer } from './media-server'
 import { resolveFfmpegPath } from './ffmpeg/resolve'
 import { probeDurationMs } from './ffmpeg/probe-duration'
-import { finalizeSegmentMp4 } from './ffmpeg/finalize-segment'
+import { finalizeSegmentMp4, finalizeSegmentTs } from './ffmpeg/finalize-segment'
 import {
   loadSegmentIndex,
   saveSegmentIndex,
@@ -143,9 +144,14 @@ export function listRecordingSegments(
         alive.add(name)
 
         const prev = index.get(name)
-        const isMp4 = name.toLowerCase().endsWith('.mp4')
-        if (!prev && isMp4) {
-          finalizeSegmentMp4(path, ffmpegPath)
+        const lower = name.toLowerCase()
+        const isMp4 = lower.endsWith('.mp4')
+        const isTs = lower.endsWith('.ts')
+        // First sight of a finished segment: normalize container timestamps.
+        // Skip files still being written (active FFmpeg segment).
+        if (!prev && !isSegmentWriting({ mtimeMs: st.mtimeMs })) {
+          if (isMp4) finalizeSegmentMp4(path, ffmpegPath)
+          else if (isTs) finalizeSegmentTs(path, ffmpegPath)
           try {
             st = statSync(path)
           } catch {
@@ -231,8 +237,10 @@ export function indexRecordingFile(
 ): void {
   if (!existsSync(filePath)) return
   const ffmpegPath = resolveFfmpegPath()
-  if (opts?.finalize !== false && fileName.toLowerCase().endsWith('.mp4')) {
-    finalizeSegmentMp4(filePath, ffmpegPath)
+  if (opts?.finalize !== false) {
+    const lower = fileName.toLowerCase()
+    if (lower.endsWith('.mp4')) finalizeSegmentMp4(filePath, ffmpegPath)
+    else if (lower.endsWith('.ts')) finalizeSegmentTs(filePath, ffmpegPath)
   }
   let st
   try {

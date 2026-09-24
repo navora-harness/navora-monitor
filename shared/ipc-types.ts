@@ -112,6 +112,22 @@ export type NavoraMonitorApi = {
     messages: string[]
     channelCount: number
   }>
+  /**
+   * Normalize A/V timestamps on existing finished .ts recordings (stream copy).
+   * Skips files still being written; only remuxes when PTS skew is detected (unless force).
+   */
+  repairRecordingTimestamps: (opts?: {
+    channelId?: string
+    force?: boolean
+  }) => Promise<{
+    ok: true
+    scanned: number
+    needed: number
+    repaired: number
+    skipped: number
+    failed: number
+    message: string
+  }>
   exportConfig: (opts?: { parts?: ConfigBundleParts }) => Promise<
     | { ok: true; path: string; channelCount: number; parts?: ConfigBundleParts }
     | { ok: false; canceled: true }
@@ -209,6 +225,14 @@ export type NavoraMonitorApi = {
   syncPreviews: (ids: string[]) => Promise<ChannelRuntimeState[]>
   listRecordings: (channelId?: string) => Promise<RecordingSegment[]>
   listSavedClips: (channelId?: string) => Promise<RecordingSegment[]>
+  preparePlaybackMedia: (opts: {
+    channelId: string
+    fileName: string
+    kind?: 'recordings' | 'saved'
+  }) => Promise<
+    | { ok: true; url: string; fileName: string; cached: boolean }
+    | { ok: false; error: string }
+  >
   saveRecentClip: (
     channelId: string,
     durationSec?: number,

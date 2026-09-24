@@ -10,7 +10,10 @@
  */
 
 import mpegts from 'mpegts.js'
+import { withRemuxStartSec } from '@shared/remux-playback-url'
 import { MediaTimeBase, isMpegTsPath, effectiveDurationSec } from './wall-time'
+
+export type StreamTransport = 'auto' | 'fmp4-remux' | 'mpegts' | 'native'
 
 export type StreamEngineEvents = {
   ready: () => void
@@ -91,6 +94,14 @@ export class StreamEngine {
   private url = ''
   private fileName = ''
   private usingMpegts = false
+  /** VOD via FFmpeg fMP4 HTTP pipe — native <video>, no mpegts.js / MSE. */
+  private usingFmp4Remux = false
+  /** Segment-relative offset where the current fMP4 remux stream begins (after -ss). */
+  private streamOriginSec = 0
+  /** Object URL from remux blob (revoked on unload). */
+  private remuxObjectUrl: string | null = null
+  /** Last painted frame as poster while MSE rebuilds (scrub / reload). */
+  private freezePoster: string | null = null
   private readyWait: {
     cancel: () => void
     promise: Promise<boolean>
@@ -109,11 +120,25 @@ export class StreamEngine {
   private lastFrameAt = 0
   private frameWatchHandle: number | null = null
   private frameFrozenRecoverAt = 0
+  /**
+   * After StallJumper / syncPcrOrigin lands on buffered.start (PCR), keep the MSE
+   * session. Hard destroy/recreate fighting that seek causes the infinite flash loop.
+   */
+  private pcrOriginReady = false
+  private pcrReadyAt = 0
+  /** Soft (seek-only) recoveries this session — cheap, preferred over MSE rebuild. */
+  private softRecoverCount = 0
+  /** Hard MSE reload recoveries this session — strictly capped. */
+  private hardReloadCount = 0
+  private recoverInFlight = false
+  private static readonly MAX_SOFT_RECOVERIES = 4
+  private static readonly MAX_HARD_RELOADS = 2
   private lastLoadOpts: {
     url: string
     fileName: string
     wallSpanSec: number
     startOffsetSec?: number
+    transport?: StreamTransport
   } | null = null
 
   on<K extends keyof StreamEngineEvents>(event: K, fn: StreamEngineEvents[K]) {
@@ -134,12 +159,18 @@ export class StreamEngine {
     if (this.usingMpegts) {
       return !!this.player && v.readyState >= HTMLMediaElement.HAVE_METADATA
     }
-    return !!(v.currentSrc || v.src) && v.readyState >= HTMLMediaElement.HAVE_METADATA
+    return !!(v.currentSrc || v.src) && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
   }
 
   /** True when we can rebuild/seek the current file without a fresh URL handoff. */
   get hasSession(): boolean {
     return !!this.lastLoadOpts
+  }
+
+  get transport(): StreamTransport {
+    if (this.usingFmp4Remux) return 'fmp4-remux'
+    if (this.usingMpegts) return 'mpegts'
+    return 'native'
   }
 
   attach(video: HTMLVideoElement) {
@@ -166,7 +197,10 @@ export class StreamEngine {
   get relativeSec(): number {
     if (this.pinnedRel != null) return this.pinnedRel
     const v = this.video
-    if (!v || !Number.isFinite(v.currentTime)) return 0
+    if (!v || !Number.isFinite(v.currentTime)) return this.streamOriginSec
+    if (this.usingFmp4Remux) {
+      return this.streamOriginSec + Math.max(0, v.currentTime)
+    }
     return this.timeBase.relativeSec(v.currentTime)
   }
 
@@ -178,18 +212,32 @@ export class StreamEngine {
     return this.seeking
   }
 
-  /** Load a media URL for streaming (Range for .ts via mpegts.js). */
-  async load(opts: { url: string; fileName: string; wallSpanSec: number; startOffsetSec?: number }) {
+  /**
+   * Load media for streaming.
+   * - fmp4-remux: HTTP fragmented MP4 from FFmpeg pipe → native video (VOD)
+   * - mpegts: mpegts.js + MSE (legacy VOD / not used when remux available)
+   * - native / auto: progressive file or auto-detect
+   */
+  async load(opts: {
+    url: string
+    fileName: string
+    wallSpanSec: number
+    startOffsetSec?: number
+    transport?: StreamTransport
+  }) {
     const v = this.video
     if (!v) return
     const gen = ++this.loadGen
     const seekTok = ++this.seekGen
     this.muteTime = true
     this.lastLoadOpts = { ...opts }
+    // Keep last frame when switching segments / reloading (scrub already uses freeze in reloadMpegtsAt).
+    if (this.usingMpegts || this.hasSource) this.captureFreezeFrame()
     this.destroyPlayer({ clearVideo: true })
     this.timeBase.reset()
     this.seeking = false
-    this.pinnedRel = opts.startOffsetSec != null && opts.startOffsetSec > 0.05 ? opts.startOffsetSec : 0
+    const offset = Math.max(0, opts.startOffsetSec ?? 0)
+    this.pinnedRel = offset > 0.05 ? offset : 0
     this.mediaDurationSec = null
     this.wallSpanSec = Math.max(0.5, opts.wallSpanSec)
     this.url = opts.url
@@ -197,6 +245,7 @@ export class StreamEngine {
     this.lastAbsMedia = 0
     this.lastAbsMediaAt = 0
     this.lastFrameAt = 0
+    this.resetRecoveryState()
 
     if (!opts.url) {
       this.muteTime = false
@@ -204,16 +253,54 @@ export class StreamEngine {
       return
     }
 
-    const useTs = isMpegTsPath(opts.fileName) || isMpegTsPath(opts.url)
-    this.usingMpegts = useTs
+    const transport = opts.transport ?? 'auto'
+    const useFmp4 = transport === 'fmp4-remux'
+    // auto + .ts → mpegts (legacy). VOD should pass transport: 'fmp4-remux'.
+    const useMpegts =
+      !useFmp4 &&
+      (transport === 'mpegts' ||
+        (transport === 'auto' && (isMpegTsPath(opts.fileName) || isMpegTsPath(opts.url))))
+
+    this.usingFmp4Remux = useFmp4
+    this.usingMpegts = useMpegts
+    this.streamOriginSec = useFmp4 ? offset : 0
     this.emit('buffering', true)
 
-    if (useTs) {
+    if (useFmp4) {
+      // FFmpeg remux → temp faststart MP4 → fetch blob → native demux (no mpegts.js).
+      this.timeBase.reset()
+      const ok = await this.loadFmp4Remux(opts.url, gen)
+      if (gen !== this.loadGen) return
+      if (!ok) {
+        this.pinnedRel = null
+        this.emit('buffering', false)
+        this.muteTime = false
+        return
+      }
+      this.syncMediaDuration()
+      this.pinnedRel = offset
+      this.emit('time', offset)
+      this.emit('ready')
+      if (this.unpinTimer) clearTimeout(this.unpinTimer)
+      this.unpinTimer = setTimeout(() => {
+        this.unpinTimer = null
+        if (gen !== this.loadGen) return
+        this.pinnedRel = null
+      }, 1200)
+      this.muteTime = false
+      this.emit('buffering', false)
+      window.setTimeout(() => {
+        if (gen === this.loadGen) this.clearFreezeFrame()
+      }, 120)
+      return
+    }
+
+    if (useMpegts) {
       const ready = await this.loadMpegts(opts.url, gen)
       if (gen !== this.loadGen) return
       if (!ready) {
-        // Drop the zombie player so late demux/MSE events cannot fight the next scrub.
         this.destroyPlayer({ clearVideo: true })
+        this.pinnedRel = null
         this.emit('buffering', false)
         this.emit('error', 'MPEG-TS 加载超时，请重试')
         this.muteTime = false
@@ -226,12 +313,11 @@ export class StreamEngine {
 
     this.syncMediaDuration()
 
-    // CCTV TS: media timeline often starts at PCR ≈ tens of thousands of seconds.
-    // Wait for that origin (or mpegts StartupStallJumper) before any Range seek.
-    if (useTs) {
+    if (useMpegts) {
       const ok = await this.syncPcrOrigin(gen, seekTok)
       if (gen !== this.loadGen) return
       if (!ok) {
+        this.pinnedRel = null
         this.emit('buffering', false)
         this.emit('error', 'MPEG-TS 时间基准未就绪')
         this.muteTime = false
@@ -239,13 +325,12 @@ export class StreamEngine {
       }
     }
 
-    const offset = opts.startOffsetSec ?? 0
     let landed = 0
     if (offset > 0.25) {
       this.seeking = true
       this.pinnedRel = offset
       this.emit('time', offset)
-      if (useTs) {
+      if (useMpegts) {
         landed = await this.rangeSeekTo(offset, gen, seekTok)
       } else {
         await this.seekNative(offset)
@@ -258,7 +343,6 @@ export class StreamEngine {
     this.pinnedRel = landed
     this.emit('time', landed)
     this.emit('ready')
-    // Keep pin until play advances; unpin after settle
     if (this.unpinTimer) clearTimeout(this.unpinTimer)
     this.unpinTimer = setTimeout(() => {
       this.unpinTimer = null
@@ -268,6 +352,9 @@ export class StreamEngine {
 
     this.muteTime = false
     this.emit('buffering', false)
+    window.setTimeout(() => {
+      if (gen === this.loadGen) this.clearFreezeFrame()
+    }, 120)
   }
 
   async seek(relativeSec: number) {
@@ -275,6 +362,18 @@ export class StreamEngine {
     if (!v) return
     const dur = this.durationSec
     const t = Math.min(dur > 0 ? dur : relativeSec, Math.max(0, relativeSec))
+
+    // fMP4 remux: stop current FFmpeg pipe (abort src) and open a new stream at t.
+    if (this.usingFmp4Remux && this.lastLoadOpts) {
+      const url = withRemuxStartSec(this.lastLoadOpts.url, t)
+      await this.load({
+        ...this.lastLoadOpts,
+        url,
+        startOffsetSec: t,
+        transport: 'fmp4-remux',
+      })
+      return
+    }
 
     // CCTV MPEG-TS: in-place currentTime seek → MediaMSEError. Fresh Range load.
     if (this.usingMpegts && this.lastLoadOpts) {
@@ -351,10 +450,11 @@ export class StreamEngine {
 
   /**
    * Destroy + recreate mpegts player, then Range-seek once on the fresh session.
+   * @param opts.isRecovery — keep hard-reload budget; do not treat as a fresh scrub.
    */
-  private async reloadMpegtsAt(offsetSec: number) {
-    const opts = this.lastLoadOpts
-    if (!opts || !this.video) return
+  private async reloadMpegtsAt(offsetSec: number, opts?: { isRecovery?: boolean }) {
+    const loadOpts = this.lastLoadOpts
+    if (!loadOpts || !this.video) return
     const gen = ++this.loadGen
     const seekTok = ++this.seekGen
     const target = Math.max(0, offsetSec)
@@ -365,21 +465,31 @@ export class StreamEngine {
     this.emit('buffering', true)
     this.emit('time', target)
 
-    this.destroyPlayer({ clearVideo: true })
+    // Keep last frame on screen while MSE session is torn down (avoids black flash).
+    this.captureFreezeFrame()
+    this.destroyPlayer({ clearVideo: false })
     this.usingMpegts = true
-    this.url = opts.url
-    this.fileName = opts.fileName
-    this.wallSpanSec = opts.wallSpanSec
-    this.lastLoadOpts = { ...opts, startOffsetSec: target }
+    this.url = loadOpts.url
+    this.fileName = loadOpts.fileName
+    this.wallSpanSec = loadOpts.wallSpanSec
+    this.lastLoadOpts = { ...loadOpts, startOffsetSec: target }
     this.lastAbsMedia = 0
     this.lastAbsMediaAt = 0
     this.lastFrameAt = 0
+    if (opts?.isRecovery) {
+      this.pcrOriginReady = false
+      this.pcrReadyAt = 0
+    } else {
+      this.resetRecoveryState()
+    }
 
-    const ready = await this.loadMpegts(opts.url, gen)
+    const ready = await this.loadMpegts(loadOpts.url, gen)
     if (gen !== this.loadGen || seekTok !== this.seekGen) return
     if (!ready) {
       this.destroyPlayer({ clearVideo: true })
+      this.clearFreezeFrame()
       this.seeking = false
+      this.pinnedRel = null
       this.muteTime = false
       this.emit('buffering', false)
       this.emit('error', 'MPEG-TS 定位失败，请重试')
@@ -389,7 +499,9 @@ export class StreamEngine {
     const ok = await this.syncPcrOrigin(gen, seekTok)
     if (gen !== this.loadGen || seekTok !== this.seekGen) return
     if (!ok) {
+      this.clearFreezeFrame()
       this.seeking = false
+      this.pinnedRel = null
       this.muteTime = false
       this.emit('buffering', false)
       this.emit('error', 'MPEG-TS 时间基准未就绪')
@@ -406,6 +518,10 @@ export class StreamEngine {
     this.emit('time', landed)
     this.emit('ready')
     this.emit('buffering', false)
+    // Drop poster after the new session has presented a frame (or shortly after).
+    window.setTimeout(() => {
+      if (gen === this.loadGen) this.clearFreezeFrame()
+    }, 120)
     if (this.unpinTimer) clearTimeout(this.unpinTimer)
     this.unpinTimer = setTimeout(() => {
       this.unpinTimer = null
@@ -414,12 +530,60 @@ export class StreamEngine {
     }, 1200)
   }
 
+  /** Snapshot current video frame onto &lt;video poster&gt; so scrub reload is not a black flash. */
+  private captureFreezeFrame() {
+    const v = this.video
+    if (!v || v.videoWidth < 2 || v.videoHeight < 2) return
+    if (v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+    try {
+      const c = document.createElement('canvas')
+      c.width = v.videoWidth
+      c.height = v.videoHeight
+      const ctx = c.getContext('2d')
+      if (!ctx) return
+      ctx.drawImage(v, 0, 0)
+      const url = c.toDataURL('image/jpeg', 0.82)
+      this.freezePoster = url
+      v.poster = url
+    } catch {
+      /* canvas tainted / zero-size — ignore */
+    }
+  }
+
+  private clearFreezeFrame() {
+    const v = this.video
+    if (this.freezePoster && v) {
+      try {
+        v.removeAttribute('poster')
+      } catch {
+        /* ignore */
+      }
+    }
+    this.freezePoster = null
+  }
+
+  private resetRecoveryState() {
+    this.pcrOriginReady = false
+    this.pcrReadyAt = 0
+    this.softRecoverCount = 0
+    this.hardReloadCount = 0
+    this.recoverInFlight = false
+    this.stallRecoverAt = 0
+    this.frameFrozenRecoverAt = 0
+  }
+
+  private markPcrOriginReady() {
+    this.pcrOriginReady = true
+    this.pcrReadyAt = performance.now()
+  }
+
   /**
    * Align MediaTimeBase to CCTV PCR / buffered start before seeking.
    *
    * mpegts StartupStallJumper logs "stuck at 0, seek to <buffered.start>" when
    * the file timeline does not begin at 0. If we Range-seek before that, we aim
    * at wall-offset seconds on a 0-origin clock and freeze on the next scrub.
+   * Once locked, keep this MSE session — do not destroy/recreate in a loop.
    */
   private async syncPcrOrigin(gen: number, seekTok: number): Promise<boolean> {
     const v = this.video
@@ -440,6 +604,7 @@ export class StreamEngine {
         }
         this.timeBase.reset()
         this.timeBase.calibrateFromSeeked(bufStart, 0)
+        this.markPcrOriginReady()
         return true
       }
 
@@ -447,6 +612,7 @@ export class StreamEngine {
       if (Number.isFinite(ct) && ct > 30) {
         this.timeBase.reset()
         this.timeBase.calibrateFromSeeked(ct, 0)
+        this.markPcrOriginReady()
         return true
       }
 
@@ -457,6 +623,7 @@ export class StreamEngine {
     if (Number.isFinite(v.currentTime)) {
       this.timeBase.reset()
       this.timeBase.calibrateFromSeeked(v.currentTime, 0)
+      this.markPcrOriginReady()
       return true
     }
     return false
@@ -556,21 +723,22 @@ export class StreamEngine {
 
     // If playhead is still at 0 while PCR buffer starts far ahead, nudge before play
     // (same condition mpegts StartupStallJumper fixes asynchronously).
+    // Always prefer bufStart here — a wrongly locked near-0 origin seeks to ~0 and
+    // freezes the first decoded frame while audio clock keeps running.
     if (this.usingMpegts) {
       const bufStart = this.firstBufferedStart(v)
       if (bufStart != null && bufStart > 1 && v.currentTime < bufStart - 0.15) {
         try {
-          v.currentTime = this.timeBase.isLocked
-            ? this.timeBase.absoluteSec(this.pinnedRel ?? 0)
-            : bufStart
+          v.currentTime = bufStart
         } catch {
-          try {
-            v.currentTime = bufStart
-          } catch {
-            /* ignore */
-          }
+          /* ignore */
         }
         await sleep(80)
+        if (!this.timeBase.isLocked) {
+          this.timeBase.reset()
+          this.timeBase.calibrateFromSeeked(bufStart, 0)
+        }
+        this.markPcrOriginReady()
       }
     }
 
@@ -622,26 +790,30 @@ export class StreamEngine {
     }
 
     // currentTime can advance from audio alone — require real painted frames.
-    const framesOk = await this.waitForVideoFrames(2, 1400)
-    if (!framesOk && this.lastLoadOpts) {
-      const offset = this.pinnedRel ?? this.relativeSec
-      await this.load({ ...this.lastLoadOpts, startOffsetSec: offset > 0.05 ? offset : 0 })
-      try {
-        await tryPlay()
-      } catch {
-        this.emit('buffering', false)
-        return false
-      }
-      if (v.paused) {
-        this.emit('buffering', false)
-        return false
-      }
-      await this.waitForVideoFrames(2, 1400)
+    // Prefer soft seek-to-buffer over destroy/recreate (HEVC often needs a nudge,
+    // not a full MSE rebuild which flashes and fights StallJumper).
+    let framesOk = await this.waitForVideoFrames(2, 1600)
+    if (!framesOk) {
+      framesOk = await this.softRecoverToBufferedStart()
+    }
+    if (!framesOk && this.canHardReload()) {
+      framesOk = await this.hardRecoverOnce()
     }
 
     this.lastAbsMedia = v.currentTime
     this.lastAbsMediaAt = performance.now()
-    this.armFrameWatch()
+    // Only seed frame clock when we actually saw frames — seeding on failure
+    // started the freeze timer while HEVC was still warming up → reload loop.
+    if (framesOk) {
+      this.lastFrameAt = performance.now()
+      this.armFrameWatch()
+    } else if (this.lastFrameAt <= 0) {
+      // Grace: arm watch without starting freeze countdown yet.
+      this.lastFrameAt = performance.now() + 2500
+      this.armFrameWatch()
+    } else {
+      this.armFrameWatch()
+    }
     this.emit('buffering', false)
     return !v.paused
   }
@@ -676,12 +848,67 @@ export class StreamEngine {
     this.muteTime = true
     this.cancelFrameWatch()
     this.destroyPlayer({ clearVideo: true })
+    this.revokeRemuxObjectUrl()
+    this.clearFreezeFrame()
     this.timeBase.reset()
     this.url = ''
     this.fileName = ''
     this.lastLoadOpts = null
+    this.pinnedRel = null
+    this.usingMpegts = false
+    this.usingFmp4Remux = false
+    this.streamOriginSec = 0
+    this.resetRecoveryState()
     this.muteTime = false
     this.emit('buffering', false)
+  }
+
+  private revokeRemuxObjectUrl() {
+    if (!this.remuxObjectUrl) return
+    try {
+      URL.revokeObjectURL(this.remuxObjectUrl)
+    } catch {
+      /* ignore */
+    }
+    this.remuxObjectUrl = null
+  }
+
+  /**
+   * Fetch remux endpoint (waits for FFmpeg). On 502, surface FFmpeg stderr to UI.
+   * Play via blob: so Chromium uses a complete faststart MP4, not a mid-flight pipe.
+   */
+  private async loadFmp4Remux(url: string, gen: number): Promise<boolean> {
+    this.revokeRemuxObjectUrl()
+    let res: Response
+    try {
+      res = await fetch(url)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      this.emit('error', `转封装请求失败: ${msg}`)
+      return false
+    }
+    if (gen !== this.loadGen) return false
+    if (!res.ok) {
+      const text = (await res.text().catch(() => '')).trim().slice(0, 360)
+      this.emit('error', `转封装失败 (${res.status}): ${text || res.statusText || '未知错误'}`)
+      return false
+    }
+    let blob: Blob
+    try {
+      blob = await res.blob()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      this.emit('error', `转封装读取失败: ${msg}`)
+      return false
+    }
+    if (gen !== this.loadGen) return false
+    if (blob.size < 1024) {
+      this.emit('error', '转封装产物过小')
+      return false
+    }
+    this.remuxObjectUrl = URL.createObjectURL(blob)
+    await this.loadNative(this.remuxObjectUrl, gen)
+    return gen === this.loadGen
   }
 
   /** @returns true when media has usable data */
@@ -728,14 +955,19 @@ export class StreamEngine {
       if (gen !== this.loadGen) return
       const detail = formatMpegtsErrArgs(args)
       if (isMpegtsMseError(args)) {
-        if (this.mseRecovering) {
+        if (this.mseRecovering || this.recoverInFlight) {
+          this.emit('buffering', false)
+          return
+        }
+        if (!this.canHardReload()) {
+          this.emit('error', `MPEG-TS 流式回放失败：${detail.slice(0, 160) || 'MSE 错误'}`)
           this.emit('buffering', false)
           return
         }
         this.mseRecovering = true
-        // Rebuild once at pinned/requested offset — do not soft-jump on the broken session.
-        const offset = this.pinnedRel ?? this.lastLoadOpts?.startOffsetSec ?? 0
-        void this.reloadMpegtsAt(Math.max(0, offset))
+        this.hardReloadCount += 1
+        const offset = this.recoveryOffsetSec(this.video?.currentTime ?? 0)
+        void this.reloadMpegtsAt(Math.max(0, offset), { isRecovery: true })
           .catch(() => {})
           .finally(() => {
             this.mseRecovering = false
@@ -763,7 +995,8 @@ export class StreamEngine {
     } catch {
       /* ignore */
     }
-    await this.waitForReady(v, gen, 5000)
+    // fMP4 remux / temp faststart may wait on FFmpeg before first byte
+    await this.waitForReady(v, gen, this.usingFmp4Remux ? 60000 : 5000)
   }
 
   /**
@@ -914,49 +1147,207 @@ export class StreamEngine {
     const v = this.video
     if (!v) return
     const d = v.duration
+    // fMP4 remux streams often report Infinity / NaN — keep wallSpanSec as SSOT.
+    if (this.usingFmp4Remux) return
     if (Number.isFinite(d) && d > 0.5 && d < 48 * 3600) this.mediaDurationSec = d
   }
 
   private onTimeUpdate = () => {
-    if (!this.active || this.muteTime || this.seeking || this.pinnedRel != null) return
+    // Pin only suppresses UI time emits — never gate stall/freeze recovery here.
+    // pinnedRel is often 0 after load; gating on it left audio running on a frozen frame.
+    if (!this.active || this.muteTime || this.seeking || this.recoverInFlight) return
     const v = this.video
     if (!v) return
     this.syncMediaDuration()
     const abs = v.currentTime
     const now = performance.now()
+
+    // Grace after PCR lock / StallJumper — decoder may still be painting first HEVC frames.
+    const pcrGrace = this.pcrOriginReady && this.pcrReadyAt > 0 && now - this.pcrReadyAt < 3500
+
     if (Number.isFinite(abs) && Math.abs(abs - this.lastAbsMedia) > 0.04) {
       this.lastAbsMedia = abs
       this.lastAbsMediaAt = now
     } else if (
+      !pcrGrace &&
       !v.paused &&
       this.hasSource &&
       this.usingMpegts &&
       this.lastAbsMediaAt > 0 &&
-      now - this.lastAbsMediaAt > 2000 &&
-      now - this.stallRecoverAt > 6000
+      now - this.lastAbsMediaAt > 2500 &&
+      now - this.stallRecoverAt > 8000
     ) {
       this.stallRecoverAt = now
-      const rel = this.timeBase.relativeSec(abs)
-      void this.reloadMpegtsAt(rel).then(() => this.play())
+      void this.recoverPlayback('stall')
       return
     }
 
     // Clock/progress advancing but no painted frames (frozen first frame).
     if (
+      !pcrGrace &&
       !v.paused &&
       this.usingMpegts &&
       this.hasSource &&
       this.lastFrameAt > 0 &&
-      now - this.lastFrameAt > 1800 &&
-      now - this.frameFrozenRecoverAt > 5000
+      now > this.lastFrameAt &&
+      now - this.lastFrameAt > 2200 &&
+      now - this.frameFrozenRecoverAt > 8000
     ) {
       this.frameFrozenRecoverAt = now
-      const rel = this.timeBase.relativeSec(abs)
-      void this.reloadMpegtsAt(rel).then(() => this.play())
+      void this.recoverPlayback('freeze')
       return
     }
 
+    if (this.pinnedRel != null) return
+    if (this.usingFmp4Remux) {
+      this.emit('time', this.streamOriginSec + Math.max(0, abs))
+      return
+    }
     this.emit('time', this.timeBase.relativeSec(abs))
+  }
+
+  /**
+   * Soft first (seek to buffered.start / nudge), hard reload only if budget remains.
+   * Never fights StallJumper by destroying MSE right after PCR sync.
+   */
+  private async recoverPlayback(_reason: 'stall' | 'freeze'): Promise<void> {
+    if (this.recoverInFlight || this.seeking || this.muteTime) return
+    if (!this.usingMpegts || !this.video) return
+    this.recoverInFlight = true
+    try {
+      const softOk = await this.softRecoverToBufferedStart()
+      if (softOk) return
+      if (!this.canHardReload()) return
+      await this.hardRecoverOnce()
+    } finally {
+      this.recoverInFlight = false
+    }
+  }
+
+  private canHardReload(): boolean {
+    return !!this.lastLoadOpts && this.hardReloadCount < StreamEngine.MAX_HARD_RELOADS
+  }
+
+  /**
+   * Seek playhead onto the PCR buffer once and wait for frames — no MSE teardown.
+   */
+  private async softRecoverToBufferedStart(): Promise<boolean> {
+    const v = this.video
+    if (!v || !this.usingMpegts) return false
+    if (this.softRecoverCount >= StreamEngine.MAX_SOFT_RECOVERIES) return false
+    this.softRecoverCount += 1
+
+    const gen = this.loadGen
+    const seekTok = this.seekGen
+    const bufStart = this.firstBufferedStart(v)
+    const ct = v.currentTime
+
+    if (bufStart != null && bufStart > 1) {
+      // Stuck at 0 (or behind buffer) — same as StallJumper; do NOT reload.
+      if (!Number.isFinite(ct) || ct < bufStart - 0.15) {
+        await this.waitCurrentTimeSeek(bufStart, gen, seekTok)
+        if (gen !== this.loadGen) return false
+        if (!this.timeBase.isLocked) {
+          this.timeBase.reset()
+          this.timeBase.calibrateFromSeeked(bufStart, 0)
+        }
+        this.markPcrOriginReady()
+      } else if (this.timeBase.isLocked) {
+        // Already on PCR timeline but video frozen — micro-nudge to kick decoder.
+        try {
+          v.currentTime = ct + 0.08
+        } catch {
+          /* ignore */
+        }
+        await sleep(120)
+      }
+    } else if (Number.isFinite(ct) && ct > 30 && !this.timeBase.isLocked) {
+      this.timeBase.reset()
+      this.timeBase.calibrateFromSeeked(ct, 0)
+      this.markPcrOriginReady()
+    }
+
+    if (gen !== this.loadGen) return false
+
+    try {
+      if (v.paused) {
+        if (this.player) await Promise.resolve(this.player.play()).catch(() => {})
+        else await v.play().catch(() => {})
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const framesOk = await this.waitForVideoFrames(2, 1800)
+    if (framesOk) {
+      this.lastFrameAt = performance.now()
+      this.lastAbsMedia = v.currentTime
+      this.lastAbsMediaAt = performance.now()
+      this.armFrameWatch()
+    }
+    return framesOk
+  }
+
+  /** One capped MSE rebuild — last resort after soft recover failed. */
+  private async hardRecoverOnce(): Promise<boolean> {
+    if (!this.canHardReload() || !this.lastLoadOpts) return false
+    const v = this.video
+    if (!v) return false
+    this.hardReloadCount += 1
+    const offset = this.recoveryOffsetSec(v.currentTime)
+    await this.reloadMpegtsAt(offset, { isRecovery: true })
+    if (!this.video) return false
+    try {
+      if (this.player) {
+        await Promise.resolve(this.player.play()).catch(() => {})
+      } else {
+        await this.video.play().catch(() => {})
+      }
+    } catch {
+      return false
+    }
+    if (this.video.paused) return false
+    const framesOk = await this.waitForVideoFrames(2, 1600)
+    if (framesOk) {
+      this.lastFrameAt = performance.now()
+      this.lastAbsMedia = this.video.currentTime
+      this.lastAbsMediaAt = performance.now()
+      this.armFrameWatch()
+    }
+    return framesOk
+  }
+
+  /** Prefer media-relative time; never reload at 0 when PCR playhead is already ahead. */
+  private recoveryOffsetSec(absMediaSec: number): number {
+    const dur = this.durationSec
+    const fromMedia = this.timeBase.relativeSec(absMediaSec)
+    const clamp = (sec: number) => {
+      if (!Number.isFinite(sec) || sec < 0) return 0
+      if (dur > 0) return Math.min(dur, sec)
+      return sec
+    }
+
+    // Absolute PCR clock with unlocked/wrong pin → use media, not pin 0.
+    if (Number.isFinite(absMediaSec) && absMediaSec > 30) {
+      if (this.timeBase.isLocked || this.pcrOriginReady) {
+        return clamp(fromMedia)
+      }
+      // Origin not locked yet — hard reload at segment start (0), not abs PCR as offset.
+      return 0
+    }
+
+    if (this.pinnedRel != null && this.pinnedRel >= 0) {
+      // Sticky pin-at-0 while audio advanced: trust media, not the stale pin.
+      if (Number.isFinite(fromMedia) && fromMedia > this.pinnedRel + 2) {
+        return clamp(fromMedia)
+      }
+      // pinnedRel === 0 with PCR-synced session: stay at current relative (usually 0).
+      if (this.pcrOriginReady && this.pinnedRel < 0.5) {
+        return clamp(Math.max(fromMedia, 0))
+      }
+      return clamp(this.pinnedRel)
+    }
+    return clamp(fromMedia)
   }
 
   private onPlaying = () => {
@@ -993,6 +1384,10 @@ export class StreamEngine {
     }
     const loop = () => {
       this.lastFrameAt = performance.now()
+      // Real frames after scrub — release UI pin so follow can catch up.
+      if (this.pinnedRel != null && this.unpinTimer == null) {
+        this.pinnedRel = null
+      }
       if (!this.active || !this.video || this.video.paused || !this.player) {
         this.frameWatchHandle = null
         return

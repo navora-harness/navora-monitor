@@ -23,6 +23,7 @@ const api: NavoraMonitorApi = {
     return () => ipcRenderer.removeListener('nm:storageChanged', listener)
   },
   repairConfig: (activePreviewIds?: string[]) => ipcRenderer.invoke('nm:repairConfig', activePreviewIds),
+  repairRecordingTimestamps: (opts) => ipcRenderer.invoke('nm:repairRecordingTimestamps', opts),
   exportConfig: (opts) => ipcRenderer.invoke('nm:exportConfig', opts?.parts),
   pickConfigImport: () => ipcRenderer.invoke('nm:pickConfigImport'),
   inspectConfigImport: (filePath: string) => ipcRenderer.invoke('nm:inspectConfigImport', filePath),
@@ -65,6 +66,7 @@ const api: NavoraMonitorApi = {
   syncPreviews: (ids: string[]) => ipcRenderer.invoke('nm:syncPreviews', ids),
   listRecordings: (channelId?: string) => ipcRenderer.invoke('nm:listRecordings', channelId),
   listSavedClips: (channelId?: string) => ipcRenderer.invoke('nm:listSavedClips', channelId),
+  preparePlaybackMedia: (opts) => ipcRenderer.invoke('nm:preparePlaybackMedia', opts),
   saveRecentClip: (channelId: string, durationSec?: number) =>
     ipcRenderer.invoke('nm:saveRecentClip', channelId, durationSec),
   exportClipRange: (opts: {

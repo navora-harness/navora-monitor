@@ -33,10 +33,11 @@ const emit = defineEmits<{
 
 const enlargedIndex = ref<number | null>(null)
 const playerRefs = ref<Record<number, InstanceType<typeof MpegtsPlayer> | null>>({})
-const cellEls = ref<Record<number, HTMLElement | null>>({})
+const mosaicShellRef = ref<HTMLElement | null>(null)
 const dragFromIndex = ref<number | null>(null)
 const dropTargetIndex = ref<number | null>(null)
-const fullscreenIndex = ref<number | null>(null)
+/** Whole mosaic area in OS fullscreen (multi-channel grid preserved). */
+const isFullscreen = ref(false)
 
 /** Per-channel local view prefs (default muted). */
 const mutedMap = reactive<Record<string, boolean>>({})
@@ -105,10 +106,6 @@ function isPaused(id: string) {
 
 function setPlayerRef(index: number, el: unknown) {
   playerRefs.value[index] = (el as InstanceType<typeof MpegtsPlayer> | null) ?? null
-}
-
-function setCellEl(index: number, el: unknown) {
-  cellEls.value[index] = (el as HTMLElement | null) ?? null
 }
 
 function onCellDragStart(e: DragEvent, index: number, channel: ChannelConfig | null) {
@@ -244,8 +241,12 @@ function toggleLocalPause(id: string) {
   pausedMap[id] = !isPaused(id)
 }
 
-async function toggleFullscreen(index: number) {
-  const el = cellEls.value[index]
+/**
+ * OS fullscreen for the whole mosaic shell — keeps multi-channel grid.
+ * (One-channel exclusive view is "enlarge", not fullscreen.)
+ */
+async function toggleFullscreen() {
+  const el = mosaicShellRef.value
   if (!el) return
   try {
     if (document.fullscreenElement === el) {
@@ -261,12 +262,7 @@ async function toggleFullscreen(index: number) {
 
 function onFullscreenChange() {
   const fs = document.fullscreenElement
-  if (!fs) {
-    fullscreenIndex.value = null
-    return
-  }
-  const hit = Object.entries(cellEls.value).find(([, node]) => node === fs)
-  fullscreenIndex.value = hit ? Number(hit[0]) : null
+  isFullscreen.value = !!fs && fs === mosaicShellRef.value
 }
 
 function togglePreview() {
@@ -283,10 +279,10 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
     const previewing = cell.state?.preview === 'live' || cell.state?.preview === 'starting'
     const items: CtxMenuItem[] = [
       { id: 'props', label: '属性…' },
-      { id: 'enlarge', label: enlargedIndex.value === cell.index ? '还原画面' : '放大画面' },
+      { id: 'enlarge', label: enlargedIndex.value === cell.index ? '还原画面' : '放大画面（一路独占）' },
       {
         id: 'fullscreen',
-        label: fullscreenIndex.value === cell.index ? '退出全屏' : '全屏播放',
+        label: isFullscreen.value ? '退出全屏' : '全屏播放（多路宫格）',
       },
       { id: 'snapshot', label: '截图' },
       { id: 'saveClip', label: '框选保存片段' },
@@ -305,7 +301,7 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
         return
       }
       if (id === 'fullscreen') {
-        void toggleFullscreen(cell.index)
+        void toggleFullscreen()
         return
       }
       if (id === 'snapshot') {
@@ -331,12 +327,20 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
       label: '将选中通道放到此格',
       disabled: !props.selectedId,
     },
+    {
+      id: 'fullscreen',
+      label: isFullscreen.value ? '退出全屏' : '全屏播放（多路宫格）',
+    },
     { separator: true },
     { id: 'repairConfig', label: '修复配置' },
   ]
   openContextMenu(e, items, (id) => {
     if (id === 'assignSelected' && props.selectedId) {
       emit('assign', cell.index, props.selectedId)
+      return
+    }
+    if (id === 'fullscreen') {
+      void toggleFullscreen()
       return
     }
     emit('menu', id, { slotIndex: cell.index })
@@ -363,7 +367,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="mosaic-shell" :class="{ remote: remoteMode, scroll: layoutMode === 'scroll' }">
+  <div
+    ref="mosaicShellRef"
+    class="mosaic-shell"
+    :class="{ remote: remoteMode, scroll: layoutMode === 'scroll', fs: isFullscreen }"
+  >
     <div
       class="mosaic"
       :style="{ '--cols': gridCols }"
@@ -372,14 +380,12 @@ onUnmounted(() => {
       <div
         v-for="cell in visibleCells"
         :key="cell.index"
-        :ref="(el) => setCellEl(cell.index, el)"
         class="cell"
         :class="{
           active: cell.channel && selectedId === cell.channel.id,
           empty: !cell.channel,
           dragging: dragFromIndex === cell.index,
           droptarget: dropTargetIndex === cell.index && dragFromIndex !== cell.index,
-          fs: fullscreenIndex === cell.index,
         }"
         :draggable="!!cell.channel && enlargedIndex == null"
         @click="cell.channel && emit('select', cell.channel.id)"
@@ -410,7 +416,7 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="osd-btn"
-                :title="enlargedIndex === cell.index ? '还原宫格（Esc）' : '放大到宫格'"
+                :title="enlargedIndex === cell.index ? '还原宫格（Esc）' : '放大（一路独占）'"
                 @click.stop="onDblClick(cell.index, cell.channel)"
               >
                 <svg v-if="enlargedIndex === cell.index" viewBox="0 0 16 16" aria-hidden="true">
@@ -458,7 +464,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="toolbar" :class="{ disabled: !activeCell?.channel }">
+    <div class="toolbar">
       <template v-if="activeCell?.channel">
         <span
           class="tb-meta"
@@ -469,7 +475,6 @@ onUnmounted(() => {
           <span class="tb-name">{{ activeCell.channel.name }}</span>
         </span>
         <button
-          v-if="!remoteMode"
           type="button"
           class="tb-btn mode"
           title="进入回放模式"
@@ -592,11 +597,11 @@ onUnmounted(() => {
         <button
           type="button"
           class="tb-btn"
-          :class="{ on: fullscreenIndex === activeCell.index }"
-          :title="fullscreenIndex === activeCell.index ? '退出全屏（Esc）' : '全屏播放'"
-          @click="toggleFullscreen(activeCell.index)"
+          :class="{ on: isFullscreen }"
+          :title="isFullscreen ? '退出全屏（Esc）' : '全屏播放（多路宫格）'"
+          @click="toggleFullscreen"
         >
-          <svg v-if="fullscreenIndex === activeCell.index" viewBox="0 0 16 16" aria-hidden="true">
+          <svg v-if="isFullscreen" viewBox="0 0 16 16" aria-hidden="true">
             <path
               d="M5.5 3.5H3.5v2M10.5 3.5h2v2M5.5 12.5H3.5v-2M10.5 12.5h2v-2"
               fill="none"
@@ -616,7 +621,35 @@ onUnmounted(() => {
           </svg>
         </button>
       </template>
-      <span v-else class="tb-empty">选择一个画面以使用底部控制</span>
+      <template v-else>
+        <span class="tb-empty">选择一个画面以使用底部控制</span>
+        <button
+          type="button"
+          class="tb-btn end"
+          :class="{ on: isFullscreen }"
+          :title="isFullscreen ? '退出全屏（Esc）' : '全屏播放（多路宫格）'"
+          @click="toggleFullscreen"
+        >
+          <svg v-if="isFullscreen" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M5.5 3.5H3.5v2M10.5 3.5h2v2M5.5 12.5H3.5v-2M10.5 12.5h2v-2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.35"
+              stroke-linecap="round"
+            />
+          </svg>
+          <svg v-else viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M2.5 5.5V2.5h3M10.5 2.5h3v3M2.5 10.5v3h3M13.5 10.5v3h-3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.35"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </template>
     </div>
   </div>
 </template>
@@ -629,6 +662,16 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   background: #1a2332;
+}
+.mosaic-shell:fullscreen,
+.mosaic-shell:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  background: #0a0e14;
+}
+.mosaic-shell:fullscreen .mosaic,
+.mosaic-shell:-webkit-full-screen .mosaic {
+  flex: 1 1 0;
 }
 .mosaic {
   flex: 1 1 0;
@@ -754,7 +797,6 @@ onUnmounted(() => {
   transition: opacity 0.15s ease;
 }
 .cell:hover .osd-actions,
-.cell.fs:hover .osd-actions,
 .osd-actions:focus-within {
   opacity: 1;
 }
@@ -836,8 +878,10 @@ onUnmounted(() => {
   background: #121820;
   color: #e8edf2;
 }
-.toolbar.disabled {
-  opacity: 0.72;
+.tb-empty {
+  flex: 1;
+  font-size: 12px;
+  color: #8b98a8;
 }
 .tb-meta {
   display: inline-flex;
@@ -870,10 +914,6 @@ onUnmounted(() => {
   white-space: nowrap;
   color: #e8edf2;
 }
-.tb-empty {
-  font-size: 12px;
-  color: #8b98a8;
-}
 .tb-sep {
   width: 1px;
   height: 18px;
@@ -891,6 +931,9 @@ onUnmounted(() => {
   background: rgb(255 255 255 / 6%);
   color: #e8edf2;
   cursor: pointer;
+}
+.tb-btn.end {
+  margin-left: auto;
 }
 .tb-btn svg {
   width: 14px;

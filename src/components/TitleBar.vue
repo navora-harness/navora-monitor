@@ -41,6 +41,7 @@ const emit = defineEmits<{
   scanDevices: []
   manageGroups: []
   repairConfig: []
+  repairRecordingTimestamps: []
   openDevTools: []
   minimize: []
   maximize: []
@@ -190,6 +191,8 @@ const menus = computed<MenuDef[]>(() => {
       },
       { separator: true, label: '' },
       { id: 'clearLoopRecordings', label: '清空循环录像…', danger: true },
+      { separator: true, label: '' },
+      { id: 'repairRecordingTimestamps', label: '修复已有录像时间轴…' },
     ],
   },
   {
@@ -197,6 +200,7 @@ const menus = computed<MenuDef[]>(() => {
     label: '工具',
     items: [
       { id: 'repairConfig', label: '修复配置' },
+      { id: 'repairRecordingTimestamps', label: '修复已有录像时间轴…' },
       {
         id: 'ffmpeg',
         label: props.ffmpegOk ? 'FFmpeg 就绪' : '未检测到 FFmpeg',
@@ -286,6 +290,9 @@ function pick(item: MenuItem) {
       break
     case 'repairConfig':
       emit('repairConfig')
+      break
+    case 'repairRecordingTimestamps':
+      emit('repairRecordingTimestamps')
       break
     case 'openDevTools':
       emit('openDevTools')

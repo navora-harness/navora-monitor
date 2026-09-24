@@ -8,7 +8,7 @@ export type RecordingFile = {
   mtimeMs: number
 }
 
-/** List all MP4 segments under recordings root (oldest first). */
+/** List loop recording segments under root (oldest first). */
 export function listRecordingFiles(root = recordingsRoot()): RecordingFile[] {
   if (!existsSync(root)) return []
   const files: RecordingFile[] = []
@@ -16,7 +16,8 @@ export function listRecordingFiles(root = recordingsRoot()): RecordingFile[] {
     if (!name.isDirectory()) continue
     const dir = join(root, name.name)
     for (const file of readdirSync(dir)) {
-      if (!file.toLowerCase().endsWith('.mp4')) continue
+      const lower = file.toLowerCase()
+      if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) continue
       const path = join(dir, file)
       try {
         const st = statSync(path)

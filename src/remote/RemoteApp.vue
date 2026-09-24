@@ -87,6 +87,19 @@ const playbackPlaylist = computed(() =>
   timelineSource.value === 'saved' ? savedClips.value : segments.value,
 )
 const timelineRef = ref<InstanceType<typeof TimelinePanel> | null>(null)
+/** Reactive media auth for PlaybackView (must not call getStoredToken() only once in template). */
+const mediaAuthToken = computed(() => (authed.value ? getStoredToken() : null))
+const mediaBaseUrl = computed(() =>
+  typeof location !== 'undefined' ? location.origin : null,
+)
+/** Taller scrub chrome on phone; scales with viewport, leaves most space for video. */
+const mobileTimelineHeight = computed(() => {
+  if (typeof window === 'undefined') return 196
+  const vh = window.innerHeight || 700
+  // Two-row head + tappable track; extra room for iOS home-indicator padding.
+  const base = Math.min(220, Math.max(168, vh * 0.27))
+  return Math.round(base + 28)
+})
 
 const layout = reactive<UiLayoutState>(sanitizeUiLayout(defaultRemoteLayout()))
 let layoutTimer: ReturnType<typeof setTimeout> | null = null
@@ -553,6 +566,10 @@ function startPolling() {
   stopPolling()
   pollTimer = setInterval(() => {
     void refreshPreviews()
+    // Keep timeline fresh while browsing recordings or while host is recording
+    if (viewMode.value === 'playback' || recordingCount.value > 0) {
+      void refreshRecordings({ silent: true })
+    }
   }, 2500)
 }
 
@@ -734,7 +751,8 @@ onUnmounted(() => {
           :scrub-nonce="playbackScrubNonce"
           :play-id="playbackPlayId"
           :play-nonce="playbackPlayNonce"
-          :auth-token="getStoredToken()"
+          :auth-token="mediaAuthToken"
+          :media-base-url="mediaBaseUrl"
           @exit="exitPlayback"
           @follow="onPlaybackFollow"
           @segment="onPlaybackSegment"
@@ -772,7 +790,7 @@ onUnmounted(() => {
           />
           <TimelinePanel
             ref="timelineRef"
-            :height="mobile ? Math.max(layout.panelSizes.timeline, 120) : layout.panelSizes.timeline"
+            :height="mobile ? mobileTimelineHeight : layout.panelSizes.timeline"
             :channel-id="selectedId"
             :channel-name="selected?.name ?? null"
             :segments="segments"
@@ -784,6 +802,7 @@ onUnmounted(() => {
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
             :follow-live-edge="timelineFollowLiveEdge"
             remote-mode
+            :mobile="mobile"
             @refresh="refreshRecordings"
             @activate="enterPlayback"
             @play="onPlaybackPlay"
@@ -1007,6 +1026,13 @@ onUnmounted(() => {
 
 .shell.mobile .center {
   background: #0c1118;
+  /* Give timeline room above the home indicator on iOS Safari */
+  padding-bottom: 0;
+}
+
+.shell.mobile .center :deep(.timeline.mobile) {
+  border-top-color: color-mix(in srgb, var(--border) 80%, #000);
+  box-shadow: 0 -8px 24px rgb(0 0 0 / 28%);
 }
 
 @media (max-width: 768px) {

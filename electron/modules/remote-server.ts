@@ -154,14 +154,22 @@ function rewritePreviewUrl(url: string | null | undefined): string | null {
 /** Local media URLs → remote-auth `/media/...` paths (token attached client-side). */
 function rewriteMediaFileUrl(url: string | null | undefined): string | null {
   if (!url) return null
+  // Already a remote-relative media path
+  if (url.startsWith('/media/recordings/') || url.startsWith('/media/saved/')) {
+    return url.split('?')[0] ?? url
+  }
   const parsed = parseMediaUrl(url)
   if (parsed) {
     return `/media/${parsed.kind}/${encodeURIComponent(parsed.channelId)}/${encodeURIComponent(parsed.fileName)}`
   }
   try {
-    const u = new URL(url)
-    if (u.pathname.startsWith('/recordings/') || u.pathname.startsWith('/saved/')) {
-      return `/media${u.pathname}`
+    const u = new URL(url, 'http://127.0.0.1')
+    const path = u.pathname
+    if (path.startsWith('/recordings/') || path.startsWith('/saved/')) {
+      return `/media${path}`
+    }
+    if (path.startsWith('/media/recordings/') || path.startsWith('/media/saved/')) {
+      return path
     }
   } catch {
     /* ignore */

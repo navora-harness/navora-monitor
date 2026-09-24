@@ -51,7 +51,8 @@ function listMp4InDir(dir: string): Array<{ path: string; fileName: string; size
   if (!existsSync(dir)) return []
   const out: Array<{ path: string; fileName: string; sizeBytes: number; mtimeMs: number }> = []
   for (const name of readdirSync(dir)) {
-    if (!name.toLowerCase().endsWith('.mp4')) continue
+    const lower = name.toLowerCase()
+    if (!lower.endsWith('.mp4') || lower.endsWith('.play.mp4')) continue
     const path = join(dir, name)
     try {
       const st = statSync(path)

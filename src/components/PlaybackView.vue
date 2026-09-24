@@ -24,6 +24,8 @@ const props = withDefaults(
     suspended?: boolean
     /** Remote auth token for HLS segment fetches */
     authToken?: string | null
+    /** Local media HTTP origin, e.g. http://127.0.0.1:19200 */
+    mediaBaseUrl?: string | null
   }>(),
   {
     channelId: null,
@@ -35,6 +37,7 @@ const props = withDefaults(
     playNonce: 0,
     suspended: false,
     authToken: null,
+    mediaBaseUrl: null,
   },
 )
 
@@ -69,6 +72,10 @@ const segment = ref<RecordingSegment | null>(null)
 const wallNowMs = ref<number | null>(null)
 const liveRecording = ref(false)
 const playMode = ref<'vod' | 'stream'>('vod')
+const viaRemux = ref(false)
+const statusHint = ref('')
+const playMediaName = ref('')
+const playMediaUrl = ref('')
 
 const controller = new PlaybackController()
 let hideTimer: ReturnType<typeof setTimeout> | null = null
@@ -146,13 +153,21 @@ const isTs = computed(() => {
 
 const engineLabel = computed(() => {
   if (playMode.value === 'stream') {
-    return isTs.value ? 'mpegts Range' : 'progressive stream'
+    return isTs.value ? 'mpegts HTTP Range' : 'progressive HTTP'
   }
   return isTs.value ? 'HLS VOD' : 'HLS / progressive'
 })
 
+const bufferingHint = computed(() => {
+  if (statusHint.value) return statusHint.value
+  return '加载中…'
+})
+
 function syncPlayMode() {
   playMode.value = controller.playMode
+  viaRemux.value = controller.viaRemux
+  playMediaName.value = controller.playFileName || playMediaName.value
+  playMediaUrl.value = controller.playUrl || playMediaUrl.value
 }
 
 const effectiveDuration = computed(() => durationSec.value)
@@ -208,12 +223,18 @@ function bindController() {
     segment.value = seg
     emit('segment', seg)
     syncPlayMode()
+    if (!seg) {
+      statusHint.value = ''
+      playMediaName.value = ''
+      playMediaUrl.value = ''
+    }
     loadPhase.value = seg ? 'ready' : 'idle'
     if (!seg) {
       wallNowMs.value = null
       liveRecording.value = false
     }
-    pushDebug(seg ? `segment ${seg.fileName} [${controller.playMode}]` : 'segment cleared')
+    const remux = controller.viaRemux ? ' remux' : ''
+    pushDebug(seg ? `segment ${seg.fileName} [${controller.playMode}${remux}]` : 'segment cleared')
   })
   controller.on('playing', (on) => {
     playing.value = on
@@ -222,6 +243,9 @@ function bindController() {
       buffering.value = false
       clearBufferingWatch()
       if (segment.value) loadPhase.value = 'playing'
+      if (statusHint.value.startsWith('转封装') || statusHint.value.includes('fMP4') || statusHint.value.includes('缓存')) {
+        statusHint.value = ''
+      }
     }
     emit('busy', buffering.value)
   })
@@ -273,6 +297,11 @@ function bindController() {
       loadPhase.value = 'recording'
       pushDebug('live recording — unplayable until finalize')
     }
+  })
+  controller.on('status', (message) => {
+    statusHint.value = message
+    syncPlayMode()
+    pushDebug(message)
   })
 }
 
@@ -402,6 +431,7 @@ watch(
       channelId: props.channelId,
       source: props.source,
       sampleMediaUrl: list.find((s) => s.url)?.url ?? null,
+      mediaBaseUrl: props.mediaBaseUrl,
       authToken: props.authToken,
     })
   },
@@ -409,12 +439,13 @@ watch(
 )
 
 watch(
-  () => [props.channelId, props.source, props.authToken] as const,
+  () => [props.channelId, props.source, props.authToken, props.mediaBaseUrl] as const,
   () => {
     controller.setChannelContext({
       channelId: props.channelId,
       source: props.source,
       sampleMediaUrl: props.playlist.find((s) => s.url)?.url ?? null,
+      mediaBaseUrl: props.mediaBaseUrl,
       authToken: props.authToken,
     })
   },
@@ -560,8 +591,16 @@ onBeforeUnmount(() => {
             <dd>{{ segment?.fileName || '—' }}</dd>
           </div>
           <div>
-            <dt>URL</dt>
+            <dt>播放介质</dt>
+            <dd>{{ playMediaName || segment?.fileName || '—' }}</dd>
+          </div>
+          <div>
+            <dt>源 URL</dt>
             <dd class="mono">{{ segment?.url || '—' }}</dd>
+          </div>
+          <div>
+            <dt>实际播放 URL</dt>
+            <dd class="mono">{{ playMediaUrl || '—' }}</dd>
           </div>
           <div>
             <dt>路径</dt>
@@ -601,7 +640,7 @@ onBeforeUnmount(() => {
             :class="{ loading: buffering && !liveRecording }"
             :title="
               buffering && !liveRecording
-                ? '加载中…'
+                ? bufferingHint
                 : playing
                   ? '暂停 (Space)'
                   : '播放 (Space)'

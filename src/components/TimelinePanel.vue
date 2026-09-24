@@ -34,6 +34,8 @@ const props = defineProps<{
   followLiveEdge?: boolean
   /** Remote browser — hide host-only save/export actions */
   remoteMode?: boolean
+  /** Phone / narrow viewport — denser chrome, larger touch targets */
+  mobile?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -859,6 +861,7 @@ function onPanelCtx(e: MouseEvent) {
     items.push(
       { id: 'reveal', label: source.value === 'saved' ? '打开已保存目录' : '打开录像目录' },
       { separator: true },
+      { id: 'repairRecordingTimestamps', label: '修复已有录像时间轴…' },
       { id: 'repairConfig', label: '修复配置' },
     )
   }
@@ -1164,14 +1167,19 @@ onUnmounted(() => {
 <template>
   <section
     class="timeline"
-    :class="{ active, armed: !active && activeList.length > 0, compact: height <= 96 }"
+    :class="{
+      active,
+      armed: !active && activeList.length > 0,
+      compact: height <= 96 && !mobile,
+      mobile: !!mobile,
+    }"
     :style="{ height: `${height}px` }"
     @contextmenu="onPanelCtx"
     @click="onActivateClick"
   >
     <div class="head">
       <div class="head-left">
-        <span class="title">{{ title }}</span>
+        <span class="title">{{ mobile ? '时间轴' : title }}</span>
         <div class="tabs" role="tablist" aria-label="录像来源" @click.stop>
           <button
             type="button"
@@ -1217,9 +1225,13 @@ onUnmounted(() => {
           <option :value="2">2×</option>
           <option :value="4">4×</option>
         </select>
-        <label class="auto" title="播完自动下一片段">
+        <label v-if="!mobile" class="auto" title="播完自动下一片段">
           <input v-model="autoNext" type="checkbox" />
           连续
+        </label>
+        <label v-else class="auto auto-tight" title="播完自动下一片段">
+          <input v-model="autoNext" type="checkbox" />
+          连
         </label>
         <button
           v-if="!remoteMode"
@@ -1252,7 +1264,10 @@ onUnmounted(() => {
       <p v-if="loading && !filteredAsc.length" class="hint">加载中…</p>
       <p v-else-if="!filteredAsc.length" class="hint">
         <template v-if="source === 'saved'">
-          暂无已保存片段。点「保存片段」可在时间轴框选时段，裁切拼接后存入受保护目录。
+          <template v-if="remoteMode">暂无已保存片段（请在主机端保存）。</template>
+          <template v-else>
+            暂无已保存片段。点「保存片段」可在时间轴框选时段，裁切拼接后存入受保护目录。
+          </template>
         </template>
         <template v-else>
           {{ segments.length ? '该日期无录像时间轴。' : '暂无录像。开始录像后将按时间轨迹显示。' }}
@@ -1897,5 +1912,119 @@ onUnmounted(() => {
 .timeline.compact .playhead .badge {
   font-size: 9px;
   padding: 0 5px;
+}
+
+/* Phone / Safari remote: two-row chrome, larger scrub surface, safe-area */
+.timeline.mobile {
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.timeline.mobile .head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 10px 6px;
+  min-height: 0;
+}
+.timeline.mobile .head-left {
+  width: 100%;
+  justify-content: space-between;
+  gap: 8px;
+}
+.timeline.mobile .title {
+  font-size: 13px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.timeline.mobile .tabs {
+  flex: 1;
+  max-width: 200px;
+}
+.timeline.mobile .tabs button {
+  height: 32px;
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  padding: 0 8px;
+}
+.timeline.mobile .actions {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 6px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+.timeline.mobile .actions::-webkit-scrollbar {
+  display: none;
+}
+.timeline.mobile .actions .day,
+.timeline.mobile .actions .rate,
+.timeline.mobile .actions button,
+.timeline.mobile .actions .auto {
+  height: 34px;
+  min-height: 34px;
+  font-size: 12px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+.timeline.mobile .actions .day {
+  min-width: 7.5em;
+  padding: 0 8px;
+}
+.timeline.mobile .actions .rate {
+  min-width: 4.2em;
+  padding: 0 6px;
+}
+.timeline.mobile .actions button {
+  padding: 0 10px;
+  flex: 0 0 auto;
+}
+.timeline.mobile .auto-tight {
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.timeline.mobile .body {
+  padding: 4px 8px 8px;
+  gap: 6px;
+}
+.timeline.mobile .viewport {
+  min-height: 56px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+}
+.timeline.mobile .ruler {
+  height: 18px;
+}
+.timeline.mobile .track {
+  min-height: 36px;
+}
+.timeline.mobile .block {
+  min-height: 28px;
+  border-radius: 4px;
+}
+.timeline.mobile .playhead .needle {
+  width: 3px;
+  margin-left: -1.5px;
+}
+.timeline.mobile .playhead .badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  bottom: 4px;
+}
+.timeline.mobile .hint {
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 0 2px;
+}
+.timeline.mobile .legend {
+  font-size: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 </style>

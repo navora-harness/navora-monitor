@@ -29,10 +29,10 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     '-loglevel',
     'warning',
     '-y',
-    // CCTV RTSP often has jittery / missing PTS; generate PTS and drop corrupt packets
-    // so segments are less likely to open as "audio clock runs / first video frame stuck".
+    // Keep camera PTS when present; only drop corrupt packets.
+    // (genpts alone does not unify A/V timelines — see finalizeSegmentTs.)
     '-fflags',
-    '+genpts+discardcorrupt',
+    '+discardcorrupt',
     '-probesize',
     '2000000',
     '-analyzeduration',
@@ -46,20 +46,28 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
   args.push(
     '-i',
     opts.inputUrl,
+    // Prefer explicit A/V maps — avoid data/metadata PIDs with odd timebases.
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a:0?',
     '-c',
     'copy',
     // Re-insert codec extradata before keyframes when the camera only sent
     // VPS/SPS/PPS once at stream open (common on H.264/H.265 RTSP).
     '-bsf:v',
     'dump_extra=freq=keyframe',
+    // Segment muxer "reset" — not a guaranteed A/V rebase; normalize on finalize.
     '-reset_timestamps',
     '1',
     '-avoid_negative_ts',
-    'make_zero',
+    'disabled',
+    '-muxdelay',
+    '0',
+    '-muxpreload',
+    '0',
     '-metadata',
     `title=${opts.title}`,
-    '-map',
-    '0',
     '-f',
     'segment',
     '-segment_time',
@@ -79,6 +87,52 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     opts.outputPattern,
   )
 
+  return args
+}
+
+export type NormalizeTsRemuxOptions = {
+  inputPath: string
+  outputPath: string
+  /** When false, video only. Default true (optional audio via 0:a:0?). */
+  includeAudio?: boolean
+}
+
+/**
+ * Stream-copy remux that rebases every mapped stream to PTS=0.
+ * Fixes CCTV segments where audio was reset (~1.4s) but video kept PCR (30k–50k s).
+ */
+export function buildNormalizeTsRemuxArgs(opts: NormalizeTsRemuxOptions): string[] {
+  const args: string[] = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-y',
+    '-i',
+    opts.inputPath,
+    '-map',
+    '0:v:0',
+  ]
+  if (opts.includeAudio !== false) {
+    args.push('-map', '0:a:0?')
+  }
+  args.push(
+    '-c',
+    'copy',
+    '-bsf:v',
+    'setts=ts=PTS-STARTPTS',
+  )
+  if (opts.includeAudio !== false) {
+    args.push('-bsf:a', 'setts=ts=PTS-STARTPTS')
+  }
+  args.push(
+    '-muxdelay',
+    '0',
+    '-muxpreload',
+    '0',
+    '-f',
+    'mpegts',
+    opts.outputPath,
+  )
   return args
 }
 
@@ -129,6 +183,101 @@ export function buildMpegtsPreviewArgs(opts: MpegtsPreviewOptions): string[] {
     'pipe:1',
   )
 
+  return args
+}
+
+export type Fmp4PlaybackRemuxOptions = {
+  /** Absolute path to a finished .ts segment on disk */
+  inputPath: string
+  /** Seek into the file (seconds). Applied before -i for keyframe-aligned copy. */
+  startSec?: number
+}
+
+/**
+ * Stream-copy MPEG-TS → fragmented MP4 on stdout (pipe:1).
+ * Note: Chromium &lt;video src&gt; cannot open progressive fMP4 (empty_moov);
+ * prefer {@link buildFaststartPlaybackRemuxArgs} for native playback.
+ */
+export function buildFmp4PlaybackRemuxArgs(opts: Fmp4PlaybackRemuxOptions): string[] {
+  const start = Math.max(0, opts.startSec ?? 0)
+  const args: string[] = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-fflags',
+    '+genpts+igndts',
+  ]
+  if (start > 0.05) {
+    args.push('-ss', start.toFixed(3))
+  }
+  args.push(
+    '-i',
+    opts.inputPath,
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a:0?',
+    '-c',
+    'copy',
+    '-tag:v',
+    'hvc1',
+    '-reset_timestamps',
+    '1',
+    '-avoid_negative_ts',
+    'make_zero',
+    '-movflags',
+    '+frag_keyframe+empty_moov+default_base_moof',
+    '-f',
+    'mp4',
+    'pipe:1',
+  )
+  return args
+}
+
+export type FaststartPlaybackRemuxOptions = {
+  inputPath: string
+  outputPath: string
+  startSec?: number
+  /** When false, video only (CCTV TS often has no audio PID). Default true. */
+  includeAudio?: boolean
+}
+
+/**
+ * Stream-copy MPEG-TS → regular MP4 with moov at front (temp file).
+ * Chromium native demuxer can play this; fragmented pipe cannot.
+ */
+export function buildFaststartPlaybackRemuxArgs(opts: FaststartPlaybackRemuxOptions): string[] {
+  const start = Math.max(0, opts.startSec ?? 0)
+  const args: string[] = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-y',
+    '-fflags',
+    '+genpts+igndts',
+  ]
+  if (start > 0.05) {
+    args.push('-ss', start.toFixed(3))
+  }
+  args.push('-i', opts.inputPath, '-map', '0:v:0')
+  if (opts.includeAudio !== false) {
+    args.push('-map', '0:a:0')
+  }
+  args.push(
+    '-c',
+    'copy',
+    '-tag:v',
+    'hvc1',
+    '-reset_timestamps',
+    '1',
+    '-avoid_negative_ts',
+    'make_zero',
+    '-movflags',
+    '+faststart',
+    '-f',
+    'mp4',
+    opts.outputPath,
+  )
   return args
 }
 
