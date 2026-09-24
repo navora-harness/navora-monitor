@@ -834,7 +834,6 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           @dragleave="onGroupDragLeave($event, bucket.name)"
           @drop.stop="onGroupDrop($event, bucket.name)"
         >
-          <span class="grip group-grip" aria-hidden="true">⋮⋮</span>
           <span class="folder" aria-hidden="true">
             <svg viewBox="0 0 16 16" width="14" height="14">
               <path
@@ -893,7 +892,6 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           >
             <div class="drop-line" :class="{ on: isChannelDropBefore(bucket.name, ch.id) }" />
             <div class="row">
-              <span class="grip channel-grip" aria-hidden="true">⋮⋮</span>
               <span
                 class="status"
                 :class="stateOf(ch.id)?.recording ?? 'idle'"
@@ -1254,22 +1252,6 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 .group-head:hover {
   background: color-mix(in srgb, var(--hover) 55%, var(--surface-2));
   border-color: var(--border-strong);
-}
-.grip {
-  flex-shrink: 0;
-  width: 12px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 10px;
-  letter-spacing: -1px;
-  line-height: 1;
-  opacity: 0.55;
-  user-select: none;
-}
-.group-head:hover .grip,
-.channel:hover .grip {
-  opacity: 0.95;
-  color: var(--text);
 }
 .folder {
   display: grid;

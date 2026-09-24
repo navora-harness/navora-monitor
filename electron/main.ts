@@ -203,6 +203,12 @@ function createWindow() {
     if (loadSettings().closeToTray) {
       e.preventDefault()
       hideMainWindow()
+      return
+    }
+    // Closing the window quits the app — confirm while recording.
+    if (activeRecordingCount() > 0) {
+      e.preventDefault()
+      void requestQuit()
     }
   })
 
@@ -218,6 +224,46 @@ function packageVersion(): string {
   } catch {
     return '0.0.0'
   }
+}
+
+let quitConfirmOpen = false
+
+function activeRecordingCount(): number {
+  return recorders.listActiveSessions().length
+}
+
+/** Ask before quitting while FFmpeg is still writing segments. */
+async function confirmQuitIfRecording(): Promise<boolean> {
+  const n = activeRecordingCount()
+  if (n <= 0) return true
+  if (quitConfirmOpen) return false
+  quitConfirmOpen = true
+  try {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+    const opts = {
+      type: 'warning' as const,
+      buttons: ['取消', '退出并停止录像'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: '正在录像',
+      message: `当前有 ${n} 路正在录像`,
+      detail:
+        '退出将立即停止录像。若开启了会话记忆，下次启动可能会自动恢复录像。确定要退出吗？',
+    }
+    const { response } = win
+      ? await dialog.showMessageBox(win, opts)
+      : await dialog.showMessageBox(opts)
+    return response === 1
+  } finally {
+    quitConfirmOpen = false
+  }
+}
+
+async function requestQuit() {
+  if (isQuitting) return
+  if (!(await confirmQuitIfRecording())) return
+  quitApp()
 }
 
 function quitApp() {
@@ -677,7 +723,7 @@ function registerIpc() {
   })
   ipcMain.handle('nm:windowClose', () => {
     if (loadSettings().closeToTray) hideMainWindow()
-    else quitApp()
+    else void requestQuit()
   })
   ipcMain.handle('nm:toggleDevTools', () => {
     const wc = mainWindow?.webContents
@@ -711,7 +757,7 @@ app.whenReady().then(async () => {
     ensureMainWindow: () => {
       if (!mainWindow || mainWindow.isDestroyed()) createWindow()
     },
-    onQuit: () => quitApp(),
+    onQuit: () => void requestQuit(),
     initialIconVisible: true,
   })
   applyOpenAtLogin(loadSettings())

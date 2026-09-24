@@ -597,12 +597,25 @@ onBeforeUnmount(() => {
         <div class="left">
           <button
             type="button"
-            class="icon"
-            :title="playing ? '暂停 (Space)' : '播放 (Space)'"
+            class="icon play-toggle"
+            :class="{ loading: buffering && !liveRecording }"
+            :title="
+              buffering && !liveRecording
+                ? '加载中…'
+                : playing
+                  ? '暂停 (Space)'
+                  : '播放 (Space)'
+            "
+            :aria-busy="buffering && !liveRecording ? 'true' : undefined"
             :disabled="liveRecording"
             @click="togglePlay"
           >
-            <svg v-if="!playing" viewBox="0 0 24 24" aria-hidden="true">
+            <span
+              v-if="buffering && !liveRecording"
+              class="buf-spin"
+              aria-hidden="true"
+            />
+            <svg v-else-if="!playing" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M8 5.5v13l11-6.5L8 5.5Z" fill="currentColor" />
             </svg>
             <svg v-else viewBox="0 0 24 24" aria-hidden="true">
@@ -610,13 +623,6 @@ onBeforeUnmount(() => {
               <rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor" />
             </svg>
           </button>
-          <span
-            v-if="buffering && !liveRecording"
-            class="buf-spin"
-            title="加载中"
-            aria-label="加载中"
-            aria-hidden="true"
-          />
           <button type="button" class="icon skip" title="后退 5 秒 (←)" @click="skipBy(-5)">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path
@@ -894,6 +900,13 @@ onBeforeUnmount(() => {
   border-top-color: #3dba8f;
   animation: spin 0.75s linear infinite;
   pointer-events: none;
+}
+.icon.play-toggle.loading {
+  color: #3dba8f;
+  cursor: default;
+}
+.icon.play-toggle.loading:hover {
+  background: transparent;
 }
 @keyframes spin {
   to {

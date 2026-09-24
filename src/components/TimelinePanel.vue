@@ -629,15 +629,23 @@ function fitView(mode: 'auto' | 'all' = 'auto') {
   userAnchored = false
   const range = dataRange.value
   const list = filteredAsc.value
+  /** Live preview with recording: keep playhead on "now" (source/day refits must not yank to history). */
+  const liveFollow = !props.active && !!props.followLiveEdge
+
   if (!range || !list.length) {
     pxPerMs.value = DEFAULT_PX_PER_MS
-    // Live browse: stay put if we already have a center; only seed once
-    if (!Number.isFinite(liveCenterMs) || liveCenterMs <= 0) {
+    // Live browse: stay put if we already have a center; only seed once —
+    // except when live-following, always stay on "now".
+    if (liveFollow || !Number.isFinite(liveCenterMs) || liveCenterMs <= 0) {
       commitCenter(Date.now(), 'none')
     } else {
       paintLiveCenter(liveCenterMs)
     }
     viewFittedKey = structuralFitKey(false)
+    if (liveFollow) {
+      followLockUntil = 0
+      startLiveEdgeFollow()
+    }
     return
   }
 
@@ -667,6 +675,17 @@ function fitView(mode: 'auto' | 'all' = 'auto') {
   const pad = Math.max(span * 0.08, 20_000)
   span += pad * 2
   pxPerMs.value = clampZoom(w / Math.max(span, 3 * 60_000))
+
+  // Auto-fit while live-following: adjust zoom from data, but never leave "now"
+  // (switching 循环↔已保存 used to center on clip midpoint and kill live scroll).
+  if (liveFollow && mode === 'auto') {
+    followLockUntil = 0
+    commitCenter(Date.now(), 'none')
+    viewFittedKey = structuralFitKey(true)
+    startLiveEdgeFollow()
+    return
+  }
+
   commitCenter((start + end) / 2, 'none')
   viewFittedKey = structuralFitKey(true)
 }
@@ -938,6 +957,11 @@ watch(source, () => {
   dayFilter.value = ''
   viewFittedKey = ''
   userAnchored = false
+  // Live + recording: releasing the structural fit key will call fitView('auto'),
+  // which now keeps "now". Also clear any leftover follow lock from pans.
+  if (!props.active && props.followLiveEdge) {
+    followLockUntil = 0
+  }
 })
 
 watch(dayFilter, () => {
@@ -968,8 +992,10 @@ watch(
       stopLiveEdgeFollow()
       return
     }
-    // Do not commitCenter(now) here — that yanks the strip when selecting a
-    // recording OSD. Live-edge ticks only nudge when already near "now".
+    // Preview just started (or timeline shown again): snap to now and keep following.
+    followLockUntil = 0
+    userAnchored = false
+    commitCenter(Date.now(), 'none')
     startLiveEdgeFollow()
   },
 )
@@ -981,25 +1007,18 @@ watch(
       stopLiveEdgeFollow()
       return
     }
-    // Leaving playback → live
+    // Leaving playback → live: always snap playhead to "now".
+    // (Previously we only resumed when already within 20s — scrubbing history
+    // then exiting left userAnchored=true and tickLiveEdge never caught up.)
     if (was && !on) {
-      if (props.followLiveEdge) {
-        // Resume live edge only if we were already near now
-        followLockUntil = 0
-        if (Math.abs(Date.now() - liveCenterMs) <= 20_000) {
-          userAnchored = false
-          commitCenter(Date.now(), 'none')
-        } else {
-          userAnchored = true
-        }
-        startLiveEdgeFollow()
-      } else {
-        userAnchored = true
-        followLockUntil = Date.now() + 3000
-      }
-    } else if (props.followLiveEdge) {
-      startLiveEdgeFollow()
+      followLockUntil = 0
+      userAnchored = false
+      commitCenter(Date.now(), 'none')
+      if (props.followLiveEdge) startLiveEdgeFollow()
+      else stopLiveEdgeFollow()
+      return
     }
+    if (props.followLiveEdge) startLiveEdgeFollow()
   },
 )
 
@@ -1059,8 +1078,6 @@ function tickLiveEdge() {
   if (userGrabbing.value || selectMode.value || panActive) return
   if (Date.now() < followLockUntil) return
   const now = Date.now()
-  // Far from live edge = browsing history (or just switched OSD). Don't yank.
-  if (Math.abs(now - liveCenterMs) > 20_000) return
   nowMs.value = now
   schedulePaint(now)
   if (Math.abs(now - centerMs.value) > 400) {
@@ -1349,7 +1366,7 @@ onUnmounted(() => {
             <span v-if="underCenterSeg" class="dim">
               · {{
                 followLiveEdge && !active
-                  ? '实时录制'
+                  ? '实时跟播'
                   : isSegmentWriting(underCenterSeg, nowMs)
                     ? '正在录制中'
                     : underCenterSeg.protected
@@ -1358,7 +1375,7 @@ onUnmounted(() => {
               }}
               · {{ formatSegmentDuration(segStart(underCenterSeg), Math.max(segStart(underCenterSeg), segEnd(underCenterSeg))) }}
             </span>
-            <span v-else-if="followLiveEdge && !active" class="dim"> · 实时录制</span>
+            <span v-else-if="followLiveEdge && !active" class="dim"> · 实时跟播</span>
             <span v-else class="dim"> · 无录像</span>
           </span>
           <span class="muted">

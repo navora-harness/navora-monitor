@@ -95,10 +95,16 @@ const dialogState = computed(() => {
 const recordingCount = computed(
   () => Object.values(states.value).filter((s) => s.recording === 'recording').length,
 )
-/** Live mode + selected channel recording → timeline playhead tracks "now". */
+/** Live mode + timeline visible + live preview playing → playhead tracks "now". */
 const timelineFollowLiveEdge = computed(() => {
-  if (viewMode.value !== 'live' || !selectedId.value) return false
-  return states.value[selectedId.value]?.recording === 'recording'
+  if (viewMode.value !== 'live') return false
+  if (!layout.showTimeline) return false
+  if (!windowVisible.value) return false
+  const ids = slotIds.value.slice(0, layout.mosaic).filter((x): x is string => !!x)
+  return ids.some((id) => {
+    const st = states.value[id]
+    return st?.preview === 'live' || st?.preview === 'starting'
+  })
 })
 const groups = computed(() => listGroups(channels.value, groupOrder.value))
 

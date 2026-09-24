@@ -100,8 +100,13 @@ const recordingCount = computed(
   () => Object.values(states.value).filter((s) => s.recording === 'recording').length,
 )
 const timelineFollowLiveEdge = computed(() => {
-  if (viewMode.value !== 'live' || !selectedId.value) return false
-  return states.value[selectedId.value]?.recording === 'recording'
+  if (viewMode.value !== 'live') return false
+  if (!layout.showTimeline) return false
+  const ids = slotIds.value.filter((x): x is string => !!x).slice(0, layout.mosaic)
+  return ids.some((id) => {
+    const st = states.value[id]
+    return st?.preview === 'live' || st?.preview === 'starting'
+  })
 })
 const selected = computed(() => channels.value.find((c) => c.id === selectedId.value) ?? null)
 const showTimelinePanel = computed(
