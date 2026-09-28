@@ -1,8 +1,12 @@
 node_modules/
 dist/
 dist-electron/
+dist-go/
 release/
 electron-builder.pack.json
+
+# Local archive of retired Electron sources / old packages (do not commit)
+_recycle/
 
 # Local runtime data (may contain RTSP credentials, recordings, layout)
 portable/**
@@ -29,3 +33,8 @@ Thumbs.db
 *.local
 .vscode/
 .idea/
+
+.navora-dev-data/
+
+# Vite output staged into the Go embed tree
+server/internal/webui/files/assets/

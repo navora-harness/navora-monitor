@@ -1,8 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { AppSettings } from '@shared/settings'
 import { DEFAULT_SETTINGS } from '@shared/settings'
-import type { DiskSpaceInfo, RemoteAccessStatus } from '@shared/ipc-types'
+import type {
+  DiskSpaceInfo,
+  RemoteAccessStatus,
+  SystemServiceAction,
+  SystemServiceInfo,
+} from '@shared/ipc-types'
 import { bytesToGb, formatDurationLabel, formatGbLabel, gbToBytes } from '@shared/storage-policy'
 import {
   withStorageLeaf,
@@ -11,9 +17,18 @@ import {
   findStorageNestConflict,
   stripKnownStorageLeaf,
 } from '@shared/storage-path'
+import { OPEN_SOURCE_CREDITS } from '@shared/open-source-credits'
 import { applyUiTheme, type UiTheme } from '../theme'
 
-type CatId = 'appearance' | 'paths' | 'storage' | 'recording' | 'capture' | 'remote' | 'about'
+type CatId =
+  | 'appearance'
+  | 'paths'
+  | 'storage'
+  | 'recording'
+  | 'capture'
+  | 'remote'
+  | 'service'
+  | 'about'
 
 const props = defineProps<{
   currentTheme?: 'light' | 'dark' | 'system'
@@ -25,6 +40,7 @@ const emit = defineEmits<{
   saved: [settings: AppSettings]
   exportConfig: []
   importConfig: []
+  quitApp: []
 }>()
 
 const cats: { id: CatId; label: string }[] = [
@@ -34,6 +50,7 @@ const cats: { id: CatId; label: string }[] = [
   { id: 'recording', label: '录像' },
   { id: 'capture', label: '采集' },
   { id: 'remote', label: '远程访问' },
+  { id: 'service', label: '系统服务' },
   { id: 'about', label: '关于' },
 ]
 
@@ -46,6 +63,10 @@ const clearing = ref(false)
 const cleanupMsg = ref('')
 const disk = ref<DiskSpaceInfo | null>(null)
 const remoteStatus = ref<RemoteAccessStatus | null>(null)
+const serviceInfo = ref<SystemServiceInfo | null>(null)
+const serviceBusy = ref(false)
+const serviceMsg = ref('')
+const serviceMsgOk = ref(true)
 const showRemotePassword = ref(false)
 const copyMsg = ref('')
 const resolved = reactive({
@@ -83,11 +104,77 @@ async function refresh() {
   appMeta.licenseNote = info.licenseNote
   disk.value = await api().getDiskSpace()
   remoteStatus.value = await api().getRemoteStatus()
+  await refreshSystemService()
 }
+
+async function refreshSystemService() {
+  try {
+    serviceInfo.value = await api().getSystemService()
+  } catch (e) {
+    serviceInfo.value = {
+      supported: false,
+      platform: '',
+      name: 'NavoraMonitor',
+      display: 'Navora Monitor',
+      installed: false,
+      running: false,
+      elevated: false,
+      error: e instanceof Error ? e.message : String(e),
+    }
+  }
+}
+
+const serviceStartLabel = computed(() => {
+  const t = serviceInfo.value?.startType
+  if (t === 'auto') return '自动（开机自启）'
+  if (t === 'manual') return '手动'
+  if (t === 'disabled') return '已禁用'
+  return '—'
+})
+
+const servicePlatformLabel = computed(() => {
+  const p = serviceInfo.value?.platform
+  if (p === 'windows') return 'Windows 服务'
+  if (p === 'linux') return 'systemd'
+  if (p === 'darwin') return 'macOS'
+  return p || '—'
+})
+
+async function runSystemServiceAction(action: SystemServiceAction, confirmText?: string) {
+  if (confirmText && !window.confirm(confirmText)) return
+  serviceBusy.value = true
+  serviceMsg.value = ''
+  serviceMsgOk.value = true
+  try {
+    const info = await api().systemServiceAction(action)
+    serviceInfo.value = info
+    if (info.error) {
+      serviceMsg.value = info.error
+      serviceMsgOk.value = false
+    } else {
+      serviceMsg.value = info.message || '操作完成'
+      serviceMsgOk.value = true
+    }
+  } catch (e) {
+    serviceMsg.value = e instanceof Error ? e.message : String(e)
+    serviceMsgOk.value = false
+    await refreshSystemService()
+  } finally {
+    serviceBusy.value = false
+  }
+}
+
+watch(cat, (id) => {
+  if (id === 'service') void refreshSystemService()
+})
 
 async function openHomepage() {
   if (!appMeta.homepage) return
   await api().openExternal(appMeta.homepage)
+}
+
+async function openCredit(url: string) {
+  await api().openExternal(url)
 }
 
 watch(
@@ -212,9 +299,6 @@ async function save() {
       status.value = `无法保存：${nest}`
       return
     }
-    if (draft.remoteEnabled && !draft.remotePassword.trim()) {
-      draft.remotePassword = await api().generateRemotePassword()
-    }
     const next = await api().setSettings({ ...draft })
     Object.assign(draft, next)
     applyUiTheme(next.uiTheme)
@@ -284,22 +368,20 @@ function onBackdrop(e: MouseEvent) {
   if (e.target === e.currentTarget) close()
 }
 
-function onKey(e: KeyboardEvent) {
-  if (e.key === 'Escape') close()
-}
-
 function close() {
   applyUiTheme((props.currentTheme ?? draft.uiTheme) as UiTheme)
   emit('close')
 }
 
+let popEscape: (() => void) | null = null
+
 onMounted(() => {
   void refresh()
-  window.addEventListener('keydown', onKey)
+  popEscape = pushEscapeLayer(() => close(), { fromInput: true })
 })
 
 onUnmounted(() => {
-  window.removeEventListener('keydown', onKey)
+  popEscape?.()
 })
 </script>
 
@@ -372,23 +454,6 @@ onUnmounted(() => {
                 </div>
               </div>
               <p class="hint">切换后即时预览，保存后记住偏好。也可在标题栏「查看」菜单中切换。</p>
-              <label class="check block">
-                <input v-model="draft.showMainOnStartup" type="checkbox" />
-                <span>启动时显示主界面</span>
-              </label>
-              <p class="hint">关闭后启动仅驻留托盘，双击托盘图标可打开主窗口。</p>
-              <label class="check block">
-                <input v-model="draft.closeToTray" type="checkbox" />
-                <span>关闭窗口时销毁界面并驻留托盘</span>
-              </label>
-              <p class="hint">关闭主窗口会释放界面内存；录像与远程服务仍在主进程继续，可从托盘恢复窗口或退出。</p>
-              <label class="check block">
-                <input v-model="draft.openAtLogin" type="checkbox" />
-                <span>开机自动启动</span>
-              </label>
-              <p class="hint">
-                注册到系统「登录时启动」列表（仅安装版生效；便携版 / 开发模式保存后不会写入注册表）。若同时关闭「启动时显示主界面」，开机将静默驻留托盘。
-              </p>
             </section>
 
             <section v-show="cat === 'paths'">
@@ -595,13 +660,8 @@ onUnmounted(() => {
             <section v-show="cat === 'remote'">
               <h3>远程访问</h3>
               <p class="hint">
-                在局域网内用浏览器登录后，可查看实时预览与录像回放（时间轴拖动、mpegts 流式播放）。
-                桌面端布局接近本机；手机端可纵向滚动查看多路画面。保存片段 / 导出请在主机操作。
+                本程序以网页提供全部监控功能。浏览器打开下面的地址即可登录。修改端口后需要重新启动命令行进程才会生效。
               </p>
-              <label class="check block">
-                <input v-model="draft.remoteEnabled" type="checkbox" />
-                <span>启用远程访问服务</span>
-              </label>
               <div class="grid">
                 <label>
                   <span>端口</span>
@@ -613,7 +673,7 @@ onUnmounted(() => {
                     v-model="draft.remoteUsername"
                     spellcheck="false"
                     autocomplete="username"
-                    placeholder="admin"
+                    placeholder="navora"
                   />
                 </label>
               </div>
@@ -633,13 +693,12 @@ onUnmounted(() => {
                   </button>
                   <button type="button" @click="randomRemotePassword">随机生成</button>
                 </div>
-                <p class="hint">启用时若密码为空，保存时会自动生成安全密码。</p>
+                <p class="hint">留空表示保持当前密码。填写新密码并保存后立即生效。命令行只在首次生成或 --reset-password 时打印密码。</p>
               </div>
               <div v-if="remoteStatus" class="remote-status">
                 <p class="label">服务状态</p>
                 <p class="resolved block">
-                  <template v-if="!draft.remoteEnabled">未启用</template>
-                  <template v-else-if="remoteStatus.listening">
+                  <template v-if="remoteStatus.listening">
                     运行中 · 端口 {{ remoteStatus.port }}
                   </template>
                   <template v-else>
@@ -657,6 +716,101 @@ onUnmounted(() => {
                   <p v-if="copyMsg" class="hint ok">{{ copyMsg }}</p>
                 </template>
               </div>
+            </section>
+
+            <section v-show="cat === 'service'">
+              <h3>系统服务</h3>
+              <p class="hint">
+                将本程序注册为系统服务后，可在无人值守时开机自启、后台长期运行。通过本页可远程查看状态，并执行注册、移除、启动与停止。注册与移除需要主机上以管理员（Windows）或 root（Linux）身份运行本程序。若启动报「找不到文件」，点「更新路径」或先移除再注册。
+              </p>
+              <div v-if="serviceInfo" class="remote-status">
+                <p class="label">服务状态</p>
+                <p class="resolved block">
+                  <template v-if="!serviceInfo.supported"> 当前系统不支持以服务方式安装 </template>
+                  <template v-else>
+                    {{ serviceInfo.display }}（{{ serviceInfo.name }}）·
+                    {{ servicePlatformLabel }} ·
+                    <template v-if="serviceInfo.installed">
+                      已注册 ·
+                      {{ serviceInfo.running ? '运行中' : '已停止' }} ·
+                      启动类型 {{ serviceStartLabel }}
+                    </template>
+                    <template v-else> 未注册 </template>
+                  </template>
+                </p>
+                <p class="label">权限</p>
+                <p class="resolved block">
+                  {{ serviceInfo.elevated ? '当前进程具备管理权限' : '当前进程无管理员权限（注册/移除可能失败）' }}
+                </p>
+                <template v-if="serviceInfo.command">
+                  <p class="label">运行命令</p>
+                  <p class="resolved block" :title="serviceInfo.command">{{ serviceInfo.command }}</p>
+                </template>
+                <template v-if="serviceInfo.dataPath">
+                  <p class="label">数据目录</p>
+                  <p class="resolved block" :title="serviceInfo.dataPath">{{ serviceInfo.dataPath }}</p>
+                </template>
+                <p
+                  v-if="serviceMsg || serviceInfo.message || serviceInfo.error"
+                  class="hint"
+                  :class="{ ok: serviceMsg ? serviceMsgOk : !serviceInfo.error }"
+                >
+                  {{ serviceMsg || serviceInfo.error || serviceInfo.message }}
+                </p>
+                <div class="path-row service-actions">
+                  <button
+                    type="button"
+                    :disabled="serviceBusy || !serviceInfo.supported"
+                    @click="runSystemServiceAction('install')"
+                  >
+                    {{ serviceInfo.installed ? '更新路径' : '注册' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="ghost danger-text"
+                    :disabled="serviceBusy || !serviceInfo.supported || !serviceInfo.installed"
+                    @click="
+                      runSystemServiceAction(
+                        'uninstall',
+                        '确定移除系统服务？移除前会尝试停止服务。',
+                      )
+                    "
+                  >
+                    移除
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="
+                      serviceBusy || !serviceInfo.supported || !serviceInfo.installed || serviceInfo.running
+                    "
+                    @click="runSystemServiceAction('start')"
+                  >
+                    启动
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="
+                      serviceBusy || !serviceInfo.supported || !serviceInfo.installed || !serviceInfo.running
+                    "
+                    @click="
+                      runSystemServiceAction('stop', '确定停止系统服务？预览与录像将中断。')
+                    "
+                  >
+                    停止
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="serviceBusy || !serviceInfo.supported || !serviceInfo.installed"
+                    @click="runSystemServiceAction('restart', '确定重启系统服务？')"
+                  >
+                    重启
+                  </button>
+                  <button type="button" class="ghost" :disabled="serviceBusy" @click="refreshSystemService">
+                    刷新
+                  </button>
+                </div>
+              </div>
+              <p v-else class="hint">正在读取服务状态…</p>
             </section>
 
             <section v-show="cat === 'about'" class="meta">
@@ -690,6 +844,17 @@ onUnmounted(() => {
                 </button>
               </div>
 
+              <h3 class="sub">开源鸣谢</h3>
+              <p class="hint">本程序基于以下开源项目构建与运行，谨致谢意。</p>
+              <ul class="credits">
+                <li v-for="item in OPEN_SOURCE_CREDITS" :key="item.url">
+                  <button type="button" class="credit-link" @click="openCredit(item.url)">
+                    {{ item.name }}
+                  </button>
+                  <span v-if="item.note" class="credit-note">{{ item.note }}</span>
+                </li>
+              </ul>
+
               <h3 class="sub">配置目录</h3>
               <p class="label">本机数据根目录</p>
               <p class="resolved block" :title="resolved.configRoot">{{ resolved.configRoot }}</p>
@@ -700,6 +865,14 @@ onUnmounted(() => {
               <div class="path-row">
                 <button type="button" @click="emit('exportConfig')">导出配置…</button>
                 <button type="button" @click="emit('importConfig')">导入配置…</button>
+              </div>
+
+              <h3 class="sub">退出</h3>
+              <p class="hint">
+                退出将关闭监控服务，并结束全部预览与录像进程。所有浏览器将断开，需重新运行程序才能继续使用。
+              </p>
+              <div class="path-row">
+                <button type="button" class="danger" @click="emit('quitApp')">退出程序…</button>
               </div>
             </section>
           </div>
@@ -951,6 +1124,36 @@ button.linkish {
 button.linkish:hover:not(:disabled) {
   background: var(--accent-soft);
 }
+.credits {
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+.credits li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.credit-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 12px;
+}
+.credit-link:hover {
+  color: var(--text);
+}
+.credit-note {
+  color: var(--muted);
+}
 .hint.path {
   font-family: ui-monospace, Consolas, monospace;
   word-break: break-all;
@@ -1065,6 +1268,12 @@ button.primary {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+  font-weight: 600;
+}
+button.danger {
+  color: #fff;
+  background: var(--danger);
+  border-color: var(--danger);
   font-weight: 600;
 }
 button:disabled {
@@ -1281,6 +1490,10 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.service-actions {
+  flex-wrap: wrap;
+  margin-top: 8px;
 }
 .hint.ok {
   color: var(--accent);

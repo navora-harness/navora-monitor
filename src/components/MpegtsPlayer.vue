@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import mpegts from 'mpegts.js'
 
 type LivePlayer = {
@@ -31,23 +31,75 @@ defineExpose({
 
 const videoRef = ref<HTMLVideoElement | null>(null)
 let player: LivePlayer | null = null
+/** Prevent error-auto-reconnect while tearing down (avoids UI freeze). */
+let destroying = false
+let attachGen = 0
+/** Last URL successfully handed to mpegts (skip no-op reattach on poll). */
+let attachedAbs: string | null = null
+let errorTimer: ReturnType<typeof setTimeout> | null = null
+let errorBackoffMs = 800
+
+function toAbsoluteUrl(src: string): string {
+  try {
+    return new URL(src, typeof location !== 'undefined' ? location.href : 'http://127.0.0.1').href
+  } catch {
+    return src
+  }
+}
+
+function clearErrorTimer() {
+  if (errorTimer) {
+    clearTimeout(errorTimer)
+    errorTimer = null
+  }
+}
 
 function destroy() {
-  if (player) {
+  destroying = true
+  attachGen += 1
+  clearErrorTimer()
+  attachedAbs = null
+  const p = player
+  player = null
+  const v = videoRef.value
+  if (v) {
     try {
-      player.pause()
-      player.unload()
-      player.detachMediaElement()
-      player.destroy()
+      v.pause()
     } catch {
       /* ignore */
     }
-    player = null
+    try {
+      v.removeAttribute('src')
+      v.srcObject = null
+      v.load()
+    } catch {
+      /* ignore */
+    }
   }
-  const v = videoRef.value
-  if (v) {
-    v.removeAttribute('src')
-    v.load()
+  // Detach MSE off the click stack so rapid cell removes don't freeze the UI.
+  if (p) {
+    queueMicrotask(() => {
+      try {
+        p.pause()
+      } catch {
+        /* ignore */
+      }
+      try {
+        p.unload()
+      } catch {
+        /* ignore */
+      }
+      try {
+        p.detachMediaElement()
+      } catch {
+        /* ignore */
+      }
+      try {
+        p.destroy()
+      } catch {
+        /* ignore */
+      }
+    })
   }
 }
 
@@ -75,55 +127,100 @@ function applyPaused() {
 }
 
 function attach(src: string | null) {
-  destroy()
-  const v = videoRef.value
-  if (!v || !src) return
-
-  applyAudio()
-
-  if (!mpegts.getFeatureList().mseLivePlayback) {
-    v.src = src
-    if (!props.paused) void v.play().catch(() => undefined)
+  if (!src) {
+    destroy()
+    destroying = false
     return
   }
 
-  const live = props.isLive !== false
-  player = mpegts.createPlayer(
-    {
-      type: 'mpegts',
-      isLive: live,
-      url: src,
-      hasAudio: true,
-      hasVideo: true,
-    },
-    live
-      ? {
-          enableStashBuffer: false,
-          stashInitialSize: 128,
-          liveBufferLatencyChasing: true,
-          liveBufferLatencyMaxLatency: 1.5,
-          liveBufferLatencyMinRemain: 0.3,
-          lazyLoad: false,
-          deferLoadAfterSourceOpen: false,
-        }
-      : {
-          enableStashBuffer: true,
-          stashInitialSize: 384,
-          lazyLoad: false,
-          deferLoadAfterSourceOpen: false,
-          seekType: 'range',
-        },
-  ) as LivePlayer
-  player.attachMediaElement(v)
-  player.load()
-  if (!props.paused) void player.play().catch(() => undefined)
+  const abs = toAbsoluteUrl(src)
+  // Polling /api/previews rewrites the same absolute URL — do not tear down MSE.
+  if (player && attachedAbs === abs && !destroying) {
+    applyAudio()
+    applyPaused()
+    return
+  }
 
-  player.on(mpegts.Events.ERROR, () => {
-    if (!live) return
-    const url = props.src
-    setTimeout(() => {
-      if (props.src === url) attach(url)
-    }, 800)
+  destroy()
+  destroying = false
+  const gen = ++attachGen
+  const wanted = src
+
+  void nextTick(() => {
+    if (destroying || gen !== attachGen || props.src !== wanted) return
+    const v = videoRef.value
+    if (!v) {
+      console.warn('[mpegts] video element missing, retry')
+      setTimeout(() => {
+        if (!destroying && props.src === wanted) attach(wanted)
+      }, 50)
+      return
+    }
+
+    applyAudio()
+
+    if (!mpegts.isSupported() || !mpegts.getFeatureList().mseLivePlayback) {
+      console.error('[mpegts] MSE live playback not supported in this browser')
+      return
+    }
+
+    const live = props.isLive !== false
+    try {
+      // Preview ffmpeg uses `-an` (video-only). hasAudio:true stalls forever.
+      player = mpegts.createPlayer(
+        {
+          type: 'mpegts',
+          isLive: live,
+          url: abs,
+          hasAudio: false,
+          hasVideo: true,
+          cors: true,
+          withCredentials: true,
+        },
+        live
+          ? {
+              enableWorker: false,
+              enableStashBuffer: false,
+              stashInitialSize: 128,
+              liveBufferLatencyChasing: true,
+              liveBufferLatencyMaxLatency: 1.5,
+              liveBufferLatencyMinRemain: 0.3,
+              lazyLoad: false,
+              deferLoadAfterSourceOpen: false,
+              autoCleanupSourceBuffer: true,
+            }
+          : {
+              enableWorker: false,
+              enableStashBuffer: true,
+              stashInitialSize: 384,
+              lazyLoad: false,
+              deferLoadAfterSourceOpen: false,
+              seekType: 'range',
+            },
+      ) as LivePlayer
+      player.attachMediaElement(v)
+      player.load()
+      attachedAbs = abs
+      errorBackoffMs = 800
+      if (!props.paused) void player.play().catch(() => undefined)
+
+      player.on(mpegts.Events.ERROR, () => {
+        if (!live || destroying) return
+        const url = props.src
+        clearErrorTimer()
+        const delay = errorBackoffMs
+        errorBackoffMs = Math.min(8_000, Math.round(errorBackoffMs * 1.6))
+        errorTimer = setTimeout(() => {
+          errorTimer = null
+          if (destroying || props.src !== url) return
+          attachedAbs = null
+          attach(url)
+        }, delay)
+      })
+    } catch (err) {
+      console.error('[mpegts] createPlayer/load failed', err)
+      attachedAbs = null
+    }
   })
 }
 

@@ -615,7 +615,11 @@ export class PlaybackController {
       return
     }
 
-    let url = seg.playbackUrl || seg.url
+    // Play the recording file (.ts). playbackUrl may still point at the MP4 remux cache.
+    let url = seg.url || seg.playbackUrl || ''
+    if (!url || url.includes('/media/play/')) {
+      url = seg.url || ''
+    }
     if (!url) {
       this.emit('error', '录像地址无效')
       return
@@ -624,11 +628,12 @@ export class PlaybackController {
     // Prefer localhost HTTP Range for mpegts.js (navora:// is Range-hostile).
     url = forceHttpMediaUrl(url, this.mediaBaseUrl || this.sampleMediaUrl)
 
-    const playFileName = seg.fileName
-    const transport = isMpegTsPath(seg.fileName) || isMpegTsPath(url) ? 'mpegts' : 'native'
+    const remux = url.includes('/media/play/')
+    const playFileName = remux ? seg.fileName.replace(/\.(ts|mkv)$/i, '.mp4') : seg.fileName
+    const transport = remux || !isMpegTsPath(playFileName) ? 'native' : 'mpegts'
 
     this.streamPlayFile = playFileName
-    this.streamViaRemux = false
+    this.streamViaRemux = remux
 
     url = withVodAuth(url, this.authToken)
     this.streamPlayUrl = url

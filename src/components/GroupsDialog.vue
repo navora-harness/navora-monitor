@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import { DEFAULT_GROUP, groupChannels } from '@shared/groups'
 import type { ChannelConfig } from '@shared/types'
 
@@ -96,6 +97,12 @@ function moveDown(index: number) {
   const after = list[index + 2]
   emit('moveBefore', row.name, after ? after.name : null)
 }
+
+let popEscape: (() => void) | null = null
+onMounted(() => {
+  popEscape = pushEscapeLayer(() => emit('close'), { fromInput: true })
+})
+onUnmounted(() => popEscape?.())
 </script>
 
 <template>

@@ -47,6 +47,7 @@ const emit = defineEmits<{
   maximize: []
   close: []
   logout: []
+  quitApp: []
   displayGroup: []
 }>()
 
@@ -150,6 +151,9 @@ const menus = computed<MenuDef[]>(() => {
       { separator: true, label: '' },
       { id: 'openSettings', label: '设置…', shortcut: 'Ctrl+,' },
       { id: 'openAbout', label: '关于…' },
+      { separator: true, label: '' },
+      { id: 'logout', label: '退出登录' },
+      { id: 'quitApp', label: '退出程序…', danger: true },
     ],
   },
   {
@@ -206,8 +210,6 @@ const menus = computed<MenuDef[]>(() => {
         label: props.ffmpegOk ? 'FFmpeg 就绪' : '未检测到 FFmpeg',
         disabled: true,
       },
-      { separator: true, label: '' },
-      { id: 'openDevTools', label: '开发者工具', shortcut: 'F12' },
     ],
   },
   ]
@@ -299,6 +301,9 @@ function pick(item: MenuItem) {
       break
     case 'logout':
       emit('logout')
+      break
+    case 'quitApp':
+      emit('quitApp')
       break
     case 'displayGroup':
       emit('displayGroup')
@@ -628,44 +633,11 @@ onUnmounted(() => document.removeEventListener('click', onDocClick))
 
         <span v-if="remoteMode" class="remote-tag no-drag">远程</span>
 
-        <div v-if="!remoteMode" class="win no-drag">
-          <button type="button" title="最小化" @click="emit('minimize')">
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path d="M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-            </svg>
-          </button>
-          <button type="button" title="最大化" @click="emit('maximize')">
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <rect
-                x="3.75"
-                y="3.75"
-                width="8.5"
-                height="8.5"
-                rx="1"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.35"
-              />
-            </svg>
-          </button>
-          <button type="button" class="close" title="关闭" @click="emit('close')">
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-              />
-            </svg>
-          </button>
-        </div>
         <button
-          v-else
           type="button"
           class="logout-btn no-drag"
-          title="退出登录"
-          @click="emit('logout')"
+          :title="remoteMode ? '退出登录' : '退出程序'"
+          @click="remoteMode ? emit('logout') : emit('quitApp')"
         >
           退出
         </button>

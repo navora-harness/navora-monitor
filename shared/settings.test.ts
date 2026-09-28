@@ -25,16 +25,16 @@ describe('sanitizeSettings', () => {
     expect(s.defaultRtspTransport).toBe('udp')
   })
 
-  it('defaults openAtLogin to false', () => {
-    expect(sanitizeSettings({}).openAtLogin).toBe(false)
-    expect(DEFAULT_SETTINGS.openAtLogin).toBe(false)
+  it('defaults relaunchTrayWhenIdle to true', () => {
+    expect(sanitizeSettings({}).relaunchTrayWhenIdle).toBe(true)
+    expect(sanitizeSettings({ relaunchTrayWhenIdle: false }).relaunchTrayWhenIdle).toBe(false)
   })
 
   it('sanitizes remoteUsername', () => {
     expect(sanitizeSettings({ remoteUsername: ' ops ' }).remoteUsername).toBe('ops')
-    expect(sanitizeSettings({ remoteUsername: '' }).remoteUsername).toBe('admin')
-    expect(sanitizeSettings({ remoteUsername: 'bad name!' }).remoteUsername).toBe('admin')
-    expect(sanitizeSettings({ remoteUsername: 'a'.repeat(33) }).remoteUsername).toBe('admin')
-    expect(DEFAULT_SETTINGS.remoteUsername).toBe('admin')
+    expect(sanitizeSettings({ remoteUsername: '' }).remoteUsername).toBe('navora')
+    expect(sanitizeSettings({ remoteUsername: 'bad name!' }).remoteUsername).toBe('navora')
+    expect(sanitizeSettings({ remoteUsername: 'a'.repeat(33) }).remoteUsername).toBe('navora')
+    expect(DEFAULT_SETTINGS.remoteUsername).toBe('navora')
   })
 })

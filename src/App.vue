@@ -25,6 +25,8 @@ import StatusBar from './components/StatusBar.vue'
 import ResizeHandle from './components/ResizeHandle.vue'
 import SettingsView from './components/SettingsView.vue'
 import ContextMenuHost from './components/ContextMenuHost.vue'
+import ServerDialogs from './components/ServerDialogs.vue'
+import { login as apiLogin, logout as apiLogout, probeSession, startEvents, uploadConfigFile } from './api/bridge'
 import type { AppSettings } from '@shared/settings'
 import { DEFAULT_SETTINGS } from '@shared/settings'
 import { applyUiTheme, type UiTheme } from './theme'
@@ -57,8 +59,11 @@ const configImportPath = ref<string | null>(null)
 const configDropActive = ref(false)
 let configDropDepth = 0
 /** False when window hidden/minimized — pause live & playback UI, stop preview ffmpeg. */
-const windowVisible = ref(true)
+const windowVisible = ref(false)
+/** When false, MosaicView unmounts all MpegtsPlayers (clean MSE/GPU teardown). */
+const playersEnabled = ref(true)
 let unsubWindowVisibility: (() => void) | null = null
+let unsubMediaTeardown: (() => void) | null = null
 const channelDraft = ref<ChannelConfig | null>(null)
 const appSettings = ref<AppSettings>({ ...DEFAULT_SETTINGS })
 const viewMode = ref<'live' | 'playback'>('live')
@@ -77,14 +82,27 @@ const playbackPlaylist = computed(() =>
   timelineSource.value === 'saved' ? savedClips.value : segments.value,
 )
 const timelineRef = ref<InstanceType<typeof TimelinePanel> | null>(null)
+const authed = ref(false)
+const loginUser = ref('navora')
+const loginPass = ref('')
+const loginError = ref('')
+const loggingIn = ref(false)
 
 const layout = reactive<UiLayoutState>(defaultUiLayout())
 let layoutTimer: ReturnType<typeof setTimeout> | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let syncTimer: ReturnType<typeof setTimeout> | null = null
+/** Bumps when a newer mosaic sync is requested — stale in-flight work bails out. */
+let syncGen = 0
+/** Serialize preview sync so rapid cell removes don't overlap destroy/taskkill. */
+let syncChain: Promise<void> = Promise.resolve()
+/** Channels the user explicitly stopped while still in a mosaic slot. */
+const pausedPreviews = new Set<string>()
 let diskTimer: ReturnType<typeof setInterval> | null = null
 let unsubStorageAction: (() => void) | null = null
 let unsubStorageChanged: (() => void) | null = null
+let unsubTimeline: (() => void) | null = null
+let unsubStatesPush: (() => void) | null = null
 
 const selected = computed(() => channels.value.find((c) => c.id === selectedId.value) ?? null)
 const dialogChannel = computed(() => channelDraft.value ?? selected.value)
@@ -155,11 +173,38 @@ async function refreshRecordings(opts?: { silent?: boolean }) {
   }
 }
 
+function clearPreviewUiForIds(ids: Iterable<string>) {
+  for (const id of ids) {
+    const st = states.value[id]
+    if (!st) continue
+    if (st.preview === 'idle' && !st.previewUrl) continue
+    states.value[id] = { ...st, preview: 'idle', previewUrl: null, previewError: null }
+  }
+}
+
 function setSlotIds(next: (string | null)[]) {
+  const before = new Set(
+    slotIds.value.slice(0, layout.mosaic).filter((x): x is string => !!x),
+  )
   slotIds.value = next
   layout.slotIds = [...next]
+  const after = new Set(
+    slotIds.value.slice(0, layout.mosaic).filter((x): x is string => !!x),
+  )
+  // Drop MSE players immediately for removed cells (don't wait for debounced sync).
+  const removed: string[] = []
+  for (const id of before) {
+    if (!after.has(id)) removed.push(id)
+  }
+  if (removed.length) {
+    clearPreviewUiForIds(removed)
+    for (const id of removed) pausedPreviews.delete(id)
+  }
   scheduleSaveLayout()
 }
+
+/** Which cell is the exclusive single picture, if the user enlarged one pane. */
+const enlargedSlot = ref<number | null>(null)
 
 function ensureSlot(id: string) {
   if (slotIds.value.includes(id)) return
@@ -171,6 +216,17 @@ function ensureSlot(id: string) {
     return
   }
   setSlotIds([id, ...slotIds.value.slice(1)])
+}
+
+/** Replace the only visible pane. If the camera is already in another cell, swap. */
+function placeOnSlot(id: string, slotIndex: number) {
+  const next = [...slotIds.value]
+  while (next.length <= slotIndex) next.push(null)
+  if (next[slotIndex] === id) return
+  const from = next.findIndex((x) => x === id)
+  if (from >= 0 && from !== slotIndex) next[from] = next[slotIndex] ?? null
+  next[slotIndex] = id
+  setSlotIds(next)
 }
 
 function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
@@ -199,7 +255,63 @@ function onAssignSlot(index: number, id: string | null) {
   scheduleSyncPreviews()
 }
 
-function onAssignGroup(channelIds: string[]) {
+/** Put group channels into empty mosaic cells; expand grid if needed. Does not clear occupied cells. */
+function fillGroupIntoEmptySlots(channelIds: string[]) {
+  const ids = [...new Set(channelIds)].filter((id) => channels.value.some((c) => c.id === id))
+  if (!ids.length) return
+
+  const next = [...slotIds.value]
+  const onWall = new Set(next.filter((x): x is string => !!x))
+  const queue = ids.filter((id) => !onWall.has(id))
+  if (!queue.length) {
+    status.value = '分组通道已在宫格中'
+    const first = ids.find((id) => onWall.has(id))
+    if (first) selectedId.value = first
+    return
+  }
+
+  let mosaic = layout.mosaic
+  let placed = 0
+
+  const fillEmpties = () => {
+    for (let i = 0; i < mosaic; i++) {
+      if (next[i]) continue
+      const id = queue.shift()
+      if (!id) break
+      next[i] = id
+      placed += 1
+    }
+  }
+
+  fillEmpties()
+
+  // Still have channels → grow mosaic (up to 16) and keep filling empties.
+  while (queue.length) {
+    const occupied = next.filter((x): x is string => !!x).length
+    const need = Math.min(16, occupied + queue.length)
+    const grown = mosaicForCount(need)
+    if (grown <= mosaic) break
+    mosaic = grown
+    layout.mosaic = mosaic
+    fillEmpties()
+  }
+
+  setSlotIds(next)
+  const focus = next.find((x) => x && ids.includes(x)) ?? ids[0] ?? null
+  if (focus) {
+    selectedId.value = focus
+    const ch = channels.value.find((c) => c.id === focus)
+    if (ch) activeGroup.value = channelGroup(ch)
+  }
+  const left = queue.length
+  status.value = left
+    ? `已填入空位 ${placed} 路（宫格已满，剩余 ${left} 路未放入）`
+    : `已填入空位 ${placed} 路（${layout.mosaic} 宫格）`
+  scheduleSyncPreviews()
+}
+
+/** Replace the wall with the group (双击 / 展示到宫格). */
+function replaceWallWithGroup(channelIds: string[]) {
   const ids = [...new Set(channelIds)].filter((id) => channels.value.some((c) => c.id === id))
   if (!ids.length) return
   const mosaic = mosaicForCount(ids.length)
@@ -212,6 +324,15 @@ function onAssignGroup(channelIds: string[]) {
   if (ch) activeGroup.value = channelGroup(ch)
   status.value = `已展示分组 ${ids.length} 路（${mosaic} 宫格）`
   scheduleSyncPreviews()
+}
+
+/** Drag-drop group onto mosaic → fill empty slots only. */
+function onAssignGroup(channelIds: string[]) {
+  fillGroupIntoEmptySlots(channelIds)
+}
+
+function channelsInNamedGroup(group: string): string[] {
+  return channels.value.filter((c) => channelGroup(c) === group).map((c) => c.id)
 }
 
 function onSwapSlots(fromIndex: number, toIndex: number) {
@@ -320,36 +441,92 @@ function activeSlotIds(): string[] {
   return slotIds.value.slice(0, layout.mosaic).filter((x): x is string => !!x)
 }
 
+/** Mosaic slots minus channels the user explicitly paused/stopped. */
+function activePreviewIds(): string[] {
+  return activeSlotIds().filter((id) => !pausedPreviews.has(id))
+}
+
 function scheduleSyncPreviews() {
   if (syncTimer) clearTimeout(syncTimer)
+  // Coalesce rapid mosaic edits (two removes in a row → one FFmpeg sync).
   syncTimer = setTimeout(() => {
-    void (async () => {
-      if (!windowVisible.value) {
-        await api().syncPreviews([])
+    syncTimer = null
+    const gen = ++syncGen
+    syncChain = syncChain
+      .catch(() => undefined)
+      .then(async () => {
+        if (gen !== syncGen) return
+        const want = !windowVisible.value || !playersEnabled.value ? [] : activePreviewIds()
+        // Ensure UI already dropped players for anything not in `want`.
+        const drop: string[] = []
+        for (const id of Object.keys(states.value)) {
+          if (want.includes(id)) continue
+          const st = states.value[id]
+          if (!st) continue
+          if (st.preview === 'idle' && !st.previewUrl) continue
+          drop.push(id)
+        }
+        if (drop.length) {
+          clearPreviewUiForIds(drop)
+          await nextTick()
+          // One frame is enough once UI state is cleared; avoid long double-rAF stalls.
+          await new Promise<void>((r) => requestAnimationFrame(() => r()))
+        }
+        if (gen !== syncGen) return
+        await api().syncPreviews(want)
+        if (gen !== syncGen) return
         await refreshStates()
-        return
-      }
-      await api().syncPreviews(activeSlotIds())
-      await refreshStates()
-      const errs = activeSlotIds()
-        .map((id) => states.value[id])
-        .filter((s) => s?.preview === 'error' && s.previewError)
-      if (errs.length === 1) {
-        status.value = `预览失败：${errs[0]!.previewError}`
-      } else if (errs.length > 1) {
-        status.value = `${errs.length} 路预览失败（见画面提示）`
-      }
-    })()
-  }, 250)
+        if (gen !== syncGen || !want.length) return
+        const errs = want
+          .map((id) => states.value[id])
+          .filter((s) => s?.preview === 'error' && s.previewError)
+        if (errs.length === 1) {
+          status.value = `预览失败：${errs[0]!.previewError}`
+        } else if (errs.length > 1) {
+          status.value = `${errs.length} 路预览失败（见画面提示）`
+        }
+      })
+    void syncChain
+  }, 400)
+}
+
+async function teardownLivePlayersForDismiss() {
+  playersEnabled.value = false
+  windowVisible.value = false
+  if (syncTimer) clearTimeout(syncTimer)
+  // Clear preview UI state so v-if drops MpegtsPlayer immediately.
+  for (const id of Object.keys(states.value)) {
+    const st = states.value[id]
+    if (!st) continue
+    if (st.preview === 'idle' && !st.previewUrl) continue
+    states.value[id] = { ...st, preview: 'idle', previewUrl: null, previewError: null }
+  }
+  await nextTick()
+  await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+  try {
+    await api().syncPreviews([])
+  } catch {
+    /* ignore */
+  }
 }
 
 async function onWindowVisibility(p: { visible: boolean }) {
   const next = !!p.visible
-  if (windowVisible.value === next) return
+  if (windowVisible.value === next && playersEnabled.value === next) return
   windowVisible.value = next
   if (!next) {
     if (syncTimer) clearTimeout(syncTimer)
+    playersEnabled.value = false
     try {
+      // Same order as removing mosaic cells: drop players, then stop FFmpeg.
+      for (const id of Object.keys(states.value)) {
+        const st = states.value[id]
+        if (!st) continue
+        if (st.preview === 'idle' && !st.previewUrl) continue
+        states.value[id] = { ...st, preview: 'idle', previewUrl: null, previewError: null }
+      }
+      await nextTick()
+      await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
       await api().syncPreviews([])
       await refreshStates()
     } catch {
@@ -357,6 +534,7 @@ async function onWindowVisibility(p: { visible: boolean }) {
     }
     status.value = '窗口已隐藏 · 预览已暂停（录像仍继续）'
   } else {
+    playersEnabled.value = true
     scheduleSyncPreviews()
     status.value = '窗口已恢复 · 正在恢复预览'
   }
@@ -364,7 +542,9 @@ async function onWindowVisibility(p: { visible: boolean }) {
 
 function onSelect(id: string) {
   selectedId.value = id
-  ensureSlot(id)
+  const singleSlot = layout.mosaic === 1 ? 0 : enlargedSlot.value
+  if (singleSlot != null) placeOnSlot(id, singleSlot)
+  else ensureSlot(id)
   probeMessage.value = null
   const ch = channels.value.find((c) => c.id === id)
   if (ch) activeGroup.value = channelGroup(ch)
@@ -485,19 +665,6 @@ function isExternalFileDrag(e: DragEvent): boolean {
   return list.includes('Files')
 }
 
-function pathFromConfigDrop(e: DragEvent): string | null {
-  const files = e.dataTransfer?.files
-  if (!files?.length) return null
-  for (let i = 0; i < files.length; i++) {
-    const f = files.item(i)
-    if (!f) continue
-    const p = (f as File & { path?: string }).path?.trim() || ''
-    const name = f.name || p
-    if (/\.json$/i.test(name) || /\.json$/i.test(p)) return p || null
-  }
-  return null
-}
-
 function onShellDragEnter(e: DragEvent) {
   if (!isExternalFileDrag(e)) return
   e.preventDefault()
@@ -523,19 +690,33 @@ async function onShellDrop(e: DragEvent) {
   e.preventDefault()
   configDropDepth = 0
   configDropActive.value = false
-  const path = pathFromConfigDrop(e)
-  if (!path) {
+  const file = fileFromConfigDrop(e)
+  if (!file) {
     status.value = '请拖入 Navora Monitor 配置 .json 文件'
     return
   }
+  const uploaded = await uploadConfigFile(file)
+  if (!uploaded?.ok || !uploaded.path) {
+    status.value = uploaded?.error || '无法读取配置'
+    return
+  }
   showSettings.value = false
-  // Remount dialog so initialPath is inspected even if import wizard was already open
   if (configWizard.value) {
     configWizard.value = null
     configImportPath.value = null
     await nextTick()
   }
-  await onImportConfig(path)
+  await onImportConfig(uploaded.path)
+}
+
+function fileFromConfigDrop(e: DragEvent): File | null {
+  const files = e.dataTransfer?.files
+  if (!files?.length) return null
+  for (let i = 0; i < files.length; i++) {
+    const f = files.item(i)
+    if (f && /\.json$/i.test(f.name)) return f
+  }
+  return null
 }
 
 async function onConfigWizardDone(message: string) {
@@ -560,8 +741,10 @@ async function onConfigWizardDone(message: string) {
 }
 
 async function onRepairChannel(id: string) {
+  pausedPreviews.delete(id)
   await api().stopPreview(id)
   const res = await api().startPreview(id)
+  scheduleSyncPreviews()
   await refreshStates()
   status.value = res.ok ? `已修复预览：${id}` : `修复预览失败：${res.error}`
 }
@@ -716,6 +899,16 @@ async function onContextMenu(
       break
     case 'stopGroup':
       if (group) await onStopGroup(group)
+      break
+    case 'displayGroup': {
+      const name = group || activeGroup.value
+      if (!name) break
+      activeGroup.value = name
+      replaceWallWithGroup(channelsInNamedGroup(name))
+      break
+    }
+    case 'displayChannels':
+      if (payload?.channelIds?.length) replaceWallWithGroup(payload.channelIds)
       break
     case 'previewStart':
       if (id) await onPreviewStart(id)
@@ -972,14 +1165,19 @@ async function onProbe(id: string) {
 }
 
 async function onPreviewStart(id: string) {
+  pausedPreviews.delete(id)
   ensureSlot(id)
   const res = await api().startPreview(id)
+  scheduleSyncPreviews()
   await refreshStates()
   status.value = res.ok ? `预览中：${id}` : `预览失败：${res.error}`
 }
 
 async function onPreviewStop(id: string) {
+  pausedPreviews.add(id)
+  clearPreviewUiForIds([id])
   await api().stopPreview(id)
+  await api().syncPreviews(activePreviewIds())
   await refreshStates()
   status.value = `已停止预览：${id}`
 }
@@ -1120,7 +1318,7 @@ function onGlobalKey(e: KeyboardEvent) {
     void onSaveClip()
     return
   }
-  if (mod && e.key.toLowerCase() === 'r') {
+  if (mod && e.altKey && e.key.toLowerCase() === 'r') {
     e.preventDefault()
     if (!selectedId.value) return
     const st = states.value[selectedId.value]
@@ -1148,7 +1346,41 @@ function onGlobalKey(e: KeyboardEvent) {
   }
 }
 
-onMounted(async () => {
+async function bootApp() {
+  startEvents()
+  api().watchTimeline(selectedId.value ?? '')
+  unsubTimeline = api().onTimeline((msg) => {
+    if (!msg || (selectedId.value && msg.channelId !== selectedId.value)) return
+    if (Array.isArray(msg.segments)) segments.value = msg.segments
+    if (Array.isArray(msg.saved)) savedClips.value = msg.saved
+  })
+  unsubStatesPush = api().onRuntimeStates((list) => {
+    const map: Record<string, ChannelRuntimeState> = {}
+    for (const s of list) map[s.id] = s
+    states.value = map
+  })
+  // Subscribe first so we never treat a hidden/tray window as "visible" and
+  // spawn mosaic preview FFmpeg before knowing real visibility.
+  unsubWindowVisibility = api().onWindowVisibility((p) => {
+    void onWindowVisibility(p)
+  })
+  unsubMediaTeardown = api().onPrepareMediaTeardown(() => {
+    void (async () => {
+      try {
+        await teardownLivePlayersForDismiss()
+      } finally {
+        api().notifyMediaTeardownDone()
+      }
+    })()
+  })
+  try {
+    const vis = await api().getWindowVisible()
+    windowVisible.value = !!vis?.visible
+    playersEnabled.value = windowVisible.value
+  } catch {
+    windowVisible.value = false
+    playersEnabled.value = false
+  }
   const saved = sanitizeUiLayout(await api().getLayout())
   Object.assign(layout, saved)
   slotIds.value = [...saved.slotIds]
@@ -1161,25 +1393,82 @@ onMounted(async () => {
   await refreshStates()
   await refreshRecordings()
   await refreshDiskSpace()
-  scheduleSyncPreviews()
+  // Only sync live previews when the window is actually shown.
+  if (windowVisible.value) scheduleSyncPreviews()
+  else void api().syncPreviews([])
   if (!info.value?.ffmpegOk) {
     status.value = '未检测到 FFmpeg：请在设置中指定路径，或加入 PATH'
-  } else if (info.value.mediaBaseUrl) {
+  } else {
     status.value = `就绪 · 录像 ${info.value.recordingsPath}`
   }
   pollTimer = setInterval(() => {
-    void refreshStates()
-    if (recordingCount.value > 0) void refreshRecordings({ silent: true })
+    if (!api().timelineFresh()) void refreshStates()
+    if (recordingCount.value > 0 && !api().timelineFresh()) {
+      void refreshRecordings({ silent: true })
+    }
   }, 2000)
   diskTimer = setInterval(() => {
     void refreshDiskSpace()
   }, 30_000)
   unsubStorageAction = api().onStorageAction(onStorageAction)
   unsubStorageChanged = api().onStorageChanged(onStorageChanged)
-  unsubWindowVisibility = api().onWindowVisibility((p) => {
-    void onWindowVisibility(p)
-  })
   window.addEventListener('keydown', onGlobalKey)
+}
+
+async function doLogin() {
+  loggingIn.value = true
+  loginError.value = ''
+  try {
+    await apiLogin(loginUser.value.trim(), loginPass.value)
+    loginPass.value = ''
+    authed.value = true
+    await bootApp()
+  } catch (e) {
+    loginError.value = e instanceof Error ? e.message : '登录失败'
+  } finally {
+    loggingIn.value = false
+  }
+}
+
+async function onLogout() {
+  await apiLogout()
+  location.reload()
+}
+
+async function onQuitApp() {
+  const ok = window.confirm(
+    '确定退出 Navora Monitor？\n\n' +
+      '将关闭：\n' +
+      '• 监控服务（所有浏览器将断开）\n' +
+      '• 全部实时预览与循环录像进程\n\n' +
+      '退出后需重新运行程序才能继续使用。',
+  )
+  if (!ok) return
+  showSettings.value = false
+  status.value = '正在退出…'
+  try {
+    await api().shutdownApp()
+  } catch {
+    /* server may close before the response arrives */
+  }
+  status.value = '服务已退出，可关闭此页面'
+}
+
+onMounted(async () => {
+  try {
+    const res = await fetch('/api/status')
+    if (res.ok) {
+      const meta = await res.json()
+      if (typeof meta?.username === 'string' && meta.username.trim()) {
+        loginUser.value = meta.username.trim()
+      }
+    }
+  } catch {
+    /* keep the default until the server answers */
+  }
+  const ok = await probeSession()
+  authed.value = ok
+  if (ok) await bootApp()
 })
 
 onUnmounted(() => {
@@ -1189,7 +1478,10 @@ onUnmounted(() => {
   if (syncTimer) clearTimeout(syncTimer)
   unsubStorageAction?.()
   unsubStorageChanged?.()
+  unsubTimeline?.()
+  unsubStatesPush?.()
   unsubWindowVisibility?.()
+  unsubMediaTeardown?.()
   systemThemeMql?.removeEventListener('change', onSystemThemeChange)
   window.removeEventListener('keydown', onGlobalKey)
 })
@@ -1208,14 +1500,39 @@ watch(viewMode, (mode, prev) => {
   }
 })
 
-watch(selectedId, () => {
+watch(selectedId, (id) => {
+  api().watchTimeline(id ?? '')
   void refreshRecordings()
   if (viewMode.value === 'playback') playbackSeg.value = null
 })
 </script>
 
 <template>
+  <div v-if="!authed" class="login-screen">
+    <form class="login-card" @submit.prevent="doLogin">
+      <div class="login-brand">
+        <img src="/icon.png" width="40" height="40" alt="" />
+        <div>
+          <h1>Navora Monitor</h1>
+          <p>使用命令行中的管理员账户登录</p>
+        </div>
+      </div>
+      <label>
+        <span>账户</span>
+        <input v-model="loginUser" autocomplete="username" spellcheck="false" />
+      </label>
+      <label>
+        <span>密码</span>
+        <input v-model="loginPass" type="password" autocomplete="current-password" />
+      </label>
+      <p v-if="loginError" class="login-error">{{ loginError }}</p>
+      <button type="submit" class="primary" :disabled="loggingIn || !loginPass.trim()">
+        {{ loggingIn ? '登录中…' : '登录' }}
+      </button>
+    </form>
+  </div>
   <div
+    v-else
     class="shell"
     :class="{ 'config-drop': configDropActive }"
     @contextmenu.prevent
@@ -1224,6 +1541,7 @@ watch(selectedId, () => {
     @dragleave="onShellDragLeave"
     @drop="onShellDrop"
   >
+    <ServerDialogs />
     <ContextMenuHost />
     <TitleBar
       :title="selected?.name ?? '未选择通道'"
@@ -1269,9 +1587,12 @@ watch(selectedId, () => {
       @repair-config="onRepairConfig"
       @repair-recording-timestamps="onRepairRecordingTimestamps"
       @open-dev-tools="() => void api().toggleDevTools()"
+      @display-group="() => replaceWallWithGroup(channelsInNamedGroup(activeGroup))"
       @minimize="() => api().windowMinimize()"
       @maximize="() => api().windowMaximize()"
       @close="() => api().windowClose()"
+      @logout="onLogout"
+      @quit-app="onQuitApp"
     />
 
     <SettingsView
@@ -1281,6 +1602,7 @@ watch(selectedId, () => {
       :current-theme="appSettings.uiTheme"
       @close="showSettings = false"
       @saved="onSettingsSaved"
+      @quit-app="onQuitApp"
       @export-config="
         () => {
           showSettings = false
@@ -1406,6 +1728,7 @@ watch(selectedId, () => {
           :selected-id="selectedId"
           :slot-ids="slotIds"
           :playback-suspended="!windowVisible"
+          :players-enabled="playersEnabled && windowVisible"
           @select="onSelect"
           @assign="onAssignSlot"
           @assign-group="onAssignGroup"
@@ -1414,6 +1737,7 @@ watch(selectedId, () => {
           @save-clip="onSaveClip"
           @enter-playback="() => enterPlayback()"
           @menu="onContextMenu"
+          @enlarged="(index) => (enlargedSlot = index)"
         />
         <template v-if="layout.showTimeline || viewMode === 'playback'">
           <ResizeHandle
@@ -1439,6 +1763,7 @@ watch(selectedId, () => {
             :export-busy="exportBusy"
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
             :follow-live-edge="timelineFollowLiveEdge"
+            :channel-recording="!!selectedId && states[selectedId]?.recording === 'recording'"
             @refresh="refreshRecordings"
             @save-clip="() => onSaveClip()"
             @delete-saved="onDeleteSaved"
@@ -1540,5 +1865,70 @@ watch(selectedId, () => {
   flex-direction: column;
   background: #1a2332;
   overflow: hidden;
+}
+.login-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgb(13 107 84 / 18%), transparent),
+    var(--bg);
+}
+.login-card {
+  width: min(380px, calc(100% - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+.login-brand {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.login-brand h1 {
+  margin: 0;
+  font-size: 18px;
+}
+.login-brand p,
+.login-card label span {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.login-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.login-card input {
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text);
+  padding: 0 10px;
+}
+.login-card button.primary {
+  height: 36px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 650;
+  cursor: pointer;
+}
+.login-card button.primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.login-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
 }
 </style>

@@ -118,6 +118,26 @@ function stateOf(id: string): ChannelRuntimeState | undefined {
   return props.states[id]
 }
 
+function redactSecrets(text: string): string {
+  return text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/g, '$1')
+}
+
+function recordStatusTitle(id: string): string {
+  const st = stateOf(id)
+  if (st?.recording === 'recording') return '录像中'
+  if (st?.recording === 'error') {
+    const err = redactSecrets(st.lastError ?? '').replace(/\s+/g, ' ').trim()
+    return err ? `录像异常：${err}` : '录像异常'
+  }
+  return '未录像'
+}
+
+function recordErrorText(id: string): string {
+  const st = stateOf(id)
+  if (st?.recording !== 'error') return ''
+  return redactSecrets(st.lastError ?? '').replace(/\s+/g, ' ').trim()
+}
+
 function groupRecordingCount(channels: ChannelConfig[]): number {
   return channels.filter((c) => stateOf(c.id)?.recording === 'recording').length
 }
@@ -530,7 +550,7 @@ function onChannelCtx(e: MouseEvent, ch: ChannelConfig) {
     { id: 'props', label: '属性…' },
     { id: 'rename', label: '修改名称' },
     { separator: true },
-    { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像', disabled: !recording && !ch.enabled },
+    { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像', shortcut: 'Ctrl+Alt+R', disabled: !recording && !ch.enabled },
     {
       id: previewing ? 'previewStop' : 'previewStart',
       label: previewing ? '停止预览' : '开始预览',
@@ -608,6 +628,7 @@ function onGroupCtx(e: MouseEvent, group: string) {
     { separator: true },
     { id: 'addInGroup', label: '在本组添加设备' },
     { id: 'selectGroup', label: '全选本组' },
+    { id: 'displayGroup', label: '展示到宫格' },
     { id: 'toggleCollapse', label: isCollapsed(group) ? '展开分组' : '折叠分组', disabled: isGroupLocked(group) },
     { separator: true },
     { id: 'manageGroups', label: '分组管理…' },
@@ -883,7 +904,9 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
               dragging: draggingKind === 'channel' && checkedSet.has(ch.id),
             }"
             @click="onChannelClick($event, ch)"
-            @dblclick="emit('menu', 'props', { channelId: ch.id })"
+            @dblclick="
+              remoteMode ? emit('select', ch.id) : emit('menu', 'props', { channelId: ch.id })
+            "
             @contextmenu.stop="onChannelCtx($event, ch)"
             @dragstart="onChannelDragStart($event, ch)"
             @dragend="onDragEnd"
@@ -895,13 +918,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
               <span
                 class="status"
                 :class="stateOf(ch.id)?.recording ?? 'idle'"
-                :title="
-                  stateOf(ch.id)?.recording === 'recording'
-                    ? '录像中'
-                    : stateOf(ch.id)?.recording === 'error'
-                      ? '录像异常'
-                      : '未录像'
-                "
+                :title="recordStatusTitle(ch.id)"
                 aria-hidden="true"
               >
                 <svg v-if="stateOf(ch.id)?.recording === 'recording'" viewBox="0 0 16 16">
@@ -938,7 +955,10 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
                   >{{ ch.name }}</span>
                   <span v-if="stateOf(ch.id)?.preview === 'live'" class="pill live" title="预览中">LIVE</span>
                 </div>
-                <div class="id">{{ ch.id }}</div>
+                <div v-if="recordErrorText(ch.id)" class="id err" :title="recordErrorText(ch.id)">
+                  {{ recordErrorText(ch.id) }}
+                </div>
+                <div v-else class="id">{{ ch.id }}</div>
               </div>
             </div>
             <div class="drop-line after" :class="{ on: isChannelDropAfter(bucket.name, ch.id) }" />
@@ -1471,6 +1491,9 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
   text-overflow: ellipsis;
   white-space: nowrap;
   margin-top: 1px;
+}
+.id.err {
+  color: var(--danger);
 }
 .drop-line {
   height: 2px;

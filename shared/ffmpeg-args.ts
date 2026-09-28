@@ -29,14 +29,19 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     '-loglevel',
     'warning',
     '-y',
-    // Keep camera PTS when present; only drop corrupt packets.
-    // (genpts alone does not unify A/V timelines — see finalizeSegmentTs.)
+    // Bound demuxer queues — long RTSP sessions otherwise grow RSS over hours.
     '-fflags',
-    '+discardcorrupt',
+    '+nobuffer+discardcorrupt',
+    '-flags',
+    'low_delay',
+    '-max_delay',
+    '500000',
     '-probesize',
-    '2000000',
+    '1000000',
     '-analyzeduration',
-    '2000000',
+    '1000000',
+    '-thread_queue_size',
+    '64',
   ]
 
   if (opts.inputUrl.toLowerCase().startsWith('rtsp://')) {
@@ -154,10 +159,14 @@ export function buildMpegtsPreviewArgs(opts: MpegtsPreviewOptions): string[] {
     'nobuffer+genpts+discardcorrupt',
     '-flags',
     'low_delay',
+    '-max_delay',
+    '500000',
     '-probesize',
-    '1000000',
+    '500000',
     '-analyzeduration',
-    '1000000',
+    '500000',
+    '-thread_queue_size',
+    '32',
   ]
 
   if (opts.inputUrl.toLowerCase().startsWith('rtsp://')) {

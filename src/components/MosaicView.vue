@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { ChannelConfig, ChannelRuntimeState } from '@shared/types'
 import type { CtxMenuItem } from '@shared/context-menu'
 import { channelGroup } from '@shared/groups'
 import MpegtsPlayer from './MpegtsPlayer.vue'
 import { openContextMenu } from '../composables/useContextMenu'
+import { buildRemoteLivePreviewUrl } from '../media-url'
 
 const props = defineProps<{
   mosaic: 1 | 4 | 9 | 16
@@ -14,10 +16,20 @@ const props = defineProps<{
   slotIds: (string | null)[]
   /** Pause all cell players (window hidden / minimized). */
   playbackSuspended?: boolean
+  /**
+   * When false, do not mount MpegtsPlayer at all (forces clean MSE/GPU teardown
+   * before FFmpeg stop / window destroy). Default true.
+   */
+  playersEnabled?: boolean
   /** grid = classic mosaic; scroll = vertical stack (mobile remote) */
   layoutMode?: 'grid' | 'scroll'
   /** Hide desktop-only chrome (playback entry, drag empty hints) */
   remoteMode?: boolean
+  /**
+   * Remote live: parent-supplied absolute /media/preview/:id/live.ts URLs.
+   * When set, slotted channels always mount the player (do not wait for host previewUrl).
+   */
+  liveSrcById?: Record<string, string>
 }>()
 
 const emit = defineEmits<{
@@ -29,6 +41,7 @@ const emit = defineEmits<{
   saveClip: [channelId: string]
   enterPlayback: []
   menu: [action: string, payload?: { channelId?: string; slotIndex?: number }]
+  enlarged: [index: number | null]
 }>()
 
 const enlargedIndex = ref<number | null>(null)
@@ -38,12 +51,132 @@ const dragFromIndex = ref<number | null>(null)
 const dropTargetIndex = ref<number | null>(null)
 /** Whole mosaic area in OS fullscreen (multi-channel grid preserved). */
 const isFullscreen = ref(false)
+/** Fullscreen only: bottom toolbar stays hidden until the pointer nears the screen edge. */
+const toolbarPeek = ref(false)
+let toolbarHideTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Per-channel local view prefs (default muted). */
 const mutedMap = reactive<Record<string, boolean>>({})
 const volumeMap = reactive<Record<string, number>>({})
 const flippedMap = reactive<Record<string, boolean>>({})
 const pausedMap = reactive<Record<string, boolean>>({})
+
+const MIN_DIGITAL_ZOOM = 1
+const MAX_DIGITAL_ZOOM = 8
+const digitalZoom = ref(1)
+const zoomPanX = ref(0)
+const zoomPanY = ref(0)
+const zoomHitRef = ref<HTMLElement | null>(null)
+let zoomDrag: { id: number; x: number; y: number; px: number; py: number; moved: boolean } | null = null
+
+const digitalZoomEnabled = computed(() => props.mosaic === 1 || enlargedIndex.value != null)
+
+const digitalZoomStyle = computed(() => {
+  if (!digitalZoomEnabled.value || digitalZoom.value <= 1) return undefined
+  return {
+    transform: `translate(${zoomPanX.value}px, ${zoomPanY.value}px) scale(${digitalZoom.value})`,
+    transformOrigin: 'center center',
+  }
+})
+
+function resetDigitalZoom() {
+  digitalZoom.value = 1
+  zoomPanX.value = 0
+  zoomPanY.value = 0
+  zoomDrag = null
+}
+
+function clampZoomPan(x: number, y: number, zoom: number) {
+  const el = zoomHitRef.value
+  if (!el || zoom <= 1) return { x: 0, y: 0 }
+  const maxX = (el.clientWidth * (zoom - 1)) / 2
+  const maxY = (el.clientHeight * (zoom - 1)) / 2
+  return {
+    x: Math.min(maxX, Math.max(-maxX, x)),
+    y: Math.min(maxY, Math.max(-maxY, y)),
+  }
+}
+
+function onDigitalWheel(e: WheelEvent) {
+  if (!digitalZoomEnabled.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  const el = zoomHitRef.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const ox = e.clientX - rect.left - rect.width / 2
+  const oy = e.clientY - rect.top - rect.height / 2
+  const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * rect.height : e.deltaY
+  const prev = digitalZoom.value
+  let next = prev * Math.exp(-dy * 0.0018)
+  next = Math.min(MAX_DIGITAL_ZOOM, Math.max(MIN_DIGITAL_ZOOM, next))
+  if (next < 1.02) {
+    resetDigitalZoom()
+    return
+  }
+  const k = next / prev
+  const pan = clampZoomPan(ox - (ox - zoomPanX.value) * k, oy - (oy - zoomPanY.value) * k, next)
+  digitalZoom.value = next
+  zoomPanX.value = pan.x
+  zoomPanY.value = pan.y
+}
+
+function onDigitalMouseDown(e: MouseEvent) {
+  if (!digitalZoomEnabled.value || e.button !== 1) return
+  e.preventDefault()
+  e.stopPropagation()
+  resetDigitalZoom()
+}
+
+function onDigitalPointerDown(e: PointerEvent) {
+  if (!digitalZoomEnabled.value) return
+  if (e.button === 1) {
+    e.preventDefault()
+    e.stopPropagation()
+    resetDigitalZoom()
+    return
+  }
+  if (e.button !== 0 || digitalZoom.value <= 1) return
+  const el = e.currentTarget as HTMLElement
+  zoomDrag = {
+    id: e.pointerId,
+    x: e.clientX,
+    y: e.clientY,
+    px: zoomPanX.value,
+    py: zoomPanY.value,
+    moved: false,
+  }
+  el.setPointerCapture(e.pointerId)
+  e.preventDefault()
+}
+
+function onDigitalPointerMove(e: PointerEvent) {
+  if (!zoomDrag || zoomDrag.id !== e.pointerId) return
+  const dx = e.clientX - zoomDrag.x
+  const dy = e.clientY - zoomDrag.y
+  if (Math.hypot(dx, dy) > 3) zoomDrag.moved = true
+  const pan = clampZoomPan(zoomDrag.px + dx, zoomDrag.py + dy, digitalZoom.value)
+  zoomPanX.value = pan.x
+  zoomPanY.value = pan.y
+}
+
+function onDigitalPointerUp(e: PointerEvent) {
+  if (!zoomDrag || zoomDrag.id !== e.pointerId) return
+  const moved = zoomDrag.moved
+  zoomDrag = null
+  if (!moved) return
+  const el = e.currentTarget
+  if (!el) return
+  const stopClick = (ev: Event) => {
+    ev.stopPropagation()
+    ev.preventDefault()
+  }
+  el.addEventListener('click', stopClick, { capture: true, once: true })
+}
+
+watch(digitalZoomEnabled, (on) => {
+  if (!on) resetDigitalZoom()
+})
 
 const cols = computed(() => Math.round(Math.sqrt(props.mosaic)))
 
@@ -77,6 +210,13 @@ const visibleCells = computed(() => {
 
 const gridCols = computed(() => (enlargedIndex.value == null ? cols.value : 1))
 
+watch(
+  () => (digitalZoomEnabled.value ? (visibleCells.value[0]?.channel?.id ?? '') : ''),
+  (id, prev) => {
+    if (prev && id !== prev) resetDigitalZoom()
+  },
+)
+
 const activeCell = computed(() => {
   if (!props.selectedId) return null
   return cells.value.find((c) => c.channel?.id === props.selectedId) ?? null
@@ -108,13 +248,18 @@ function setPlayerRef(index: number, el: unknown) {
   playerRefs.value[index] = (el as InstanceType<typeof MpegtsPlayer> | null) ?? null
 }
 
+function setZoomHit(el: unknown, active: boolean) {
+  if (!active) return
+  zoomHitRef.value = (el as HTMLElement | null) ?? null
+}
+
 function onCellDragStart(e: DragEvent, index: number, channel: ChannelConfig | null) {
   const t = e.target as HTMLElement | null
   if (t?.closest('.toolbar, button, input, .osd-actions')) {
     e.preventDefault()
     return
   }
-  if (!channel || enlargedIndex.value != null) {
+  if (!channel || enlargedIndex.value != null || digitalZoom.value > 1) {
     e.preventDefault()
     return
   }
@@ -195,10 +340,38 @@ function onDragLeave(e: DragEvent, index: number) {
 
 function previewLabel(state: ChannelRuntimeState | null): string {
   if (!state) return ''
-  if (state.preview === 'live') return 'LIVE'
-  if (state.preview === 'starting') return '连接中'
+  if (state.preview === 'live' && state.previewUrl) return 'LIVE'
+  if (state.preview === 'starting' && state.previewUrl) return '连接中'
   if (state.preview === 'error') return '预览失败'
+  // starting/live without URL = host still preparing; do not imply a media request is in flight
+  if (state.preview === 'starting' || state.preview === 'live') return '启动中'
   return ''
+}
+
+/** Prefer parent-forced remote URLs; else remoteMode builder; else host previewUrl. */
+function cellPlaySrc(cell: {
+  channel: ChannelConfig | null
+  state: ChannelRuntimeState | null
+}): string | null {
+  if (!cell.channel) return null
+  const forced = props.liveSrcById?.[cell.channel.id]
+  if (forced) return forced
+  if (props.remoteMode) return buildRemoteLivePreviewUrl(cell.channel.id)
+  if (
+    cell.state?.previewUrl &&
+    (cell.state.preview === 'live' || cell.state.preview === 'starting')
+  ) {
+    return cell.state.previewUrl
+  }
+  return null
+}
+
+function cellShouldPlay(cell: {
+  channel: ChannelConfig | null
+  state: ChannelRuntimeState | null
+}): boolean {
+  if (props.playersEnabled === false) return false
+  return !!cellPlaySrc(cell)
 }
 
 function onDblClick(index: number, channel: ChannelConfig | null) {
@@ -260,9 +433,55 @@ async function toggleFullscreen() {
   }
 }
 
+function clearToolbarHide() {
+  if (toolbarHideTimer) {
+    clearTimeout(toolbarHideTimer)
+    toolbarHideTimer = null
+  }
+}
+
+function syncToolbarPeek(clientY: number) {
+  const fromBottom = window.innerHeight - clientY
+  const limit = toolbarPeek.value ? 72 : 48
+  if (fromBottom <= limit) {
+    clearToolbarHide()
+    toolbarPeek.value = true
+    return
+  }
+  if (!toolbarPeek.value || toolbarHideTimer) return
+  toolbarHideTimer = setTimeout(() => {
+    toolbarHideTimer = null
+    toolbarPeek.value = false
+  }, 220)
+}
+
+function onShellPointerMove(e: PointerEvent) {
+  if (!isFullscreen.value) return
+  syncToolbarPeek(e.clientY)
+}
+
+function onShellPointerLeave(e: PointerEvent) {
+  if (!isFullscreen.value) return
+  if (window.innerHeight - e.clientY <= 72) return
+  clearToolbarHide()
+  toolbarHideTimer = setTimeout(() => {
+    toolbarHideTimer = null
+    toolbarPeek.value = false
+  }, 220)
+}
+
 function onFullscreenChange() {
   const fs = document.fullscreenElement
-  isFullscreen.value = !!fs && fs === mosaicShellRef.value
+  const on = !!fs && fs === mosaicShellRef.value
+  if (on !== isFullscreen.value) {
+    window.removeEventListener('pointermove', onShellPointerMove, true)
+    if (on) window.addEventListener('pointermove', onShellPointerMove, true)
+  }
+  isFullscreen.value = on
+  if (!isFullscreen.value) {
+    clearToolbarHide()
+    toolbarPeek.value = false
+  }
 }
 
 function togglePreview() {
@@ -287,7 +506,7 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
       { id: 'snapshot', label: '截图' },
       { id: 'saveClip', label: '框选保存片段' },
       { separator: true },
-      { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像' },
+      { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像', shortcut: 'Ctrl+Alt+R' },
       { id: previewing ? 'previewStop' : 'previewStart', label: previewing ? '停止预览' : '开始预览' },
       { id: 'repairChannel', label: '修复此通道预览' },
       { separator: true },
@@ -347,21 +566,35 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
   })
 }
 
-function onKey(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
-  if (document.fullscreenElement) {
-    void document.exitFullscreen()
-    return
-  }
-  exitEnlarge()
-}
+let popEnlarge: (() => void) | null = null
+watch(
+  () => props.mosaic,
+  () => {
+    if (enlargedIndex.value != null) enlargedIndex.value = null
+  },
+)
+
+watch(enlargedIndex, (index) => {
+  emit('enlarged', index)
+  popEnlarge?.()
+  popEnlarge = null
+  if (index == null) return
+  popEnlarge = pushEscapeLayer(() => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen()
+      return
+    }
+    exitEnlarge()
+  })
+})
 
 onMounted(() => {
-  window.addEventListener('keydown', onKey)
   document.addEventListener('fullscreenchange', onFullscreenChange)
 })
 onUnmounted(() => {
-  window.removeEventListener('keydown', onKey)
+  popEnlarge?.()
+  clearToolbarHide()
+  window.removeEventListener('pointermove', onShellPointerMove, true)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
 })
 </script>
@@ -370,7 +603,14 @@ onUnmounted(() => {
   <div
     ref="mosaicShellRef"
     class="mosaic-shell"
-    :class="{ remote: remoteMode, scroll: layoutMode === 'scroll', fs: isFullscreen }"
+    :class="{
+      remote: remoteMode,
+      scroll: layoutMode === 'scroll',
+      fs: isFullscreen,
+      'toolbar-peek': toolbarPeek,
+    }"
+    @pointermove="onShellPointerMove"
+    @pointerleave="onShellPointerLeave"
   >
     <div
       class="mosaic"
@@ -387,7 +627,7 @@ onUnmounted(() => {
           dragging: dragFromIndex === cell.index,
           droptarget: dropTargetIndex === cell.index && dragFromIndex !== cell.index,
         }"
-        :draggable="!!cell.channel && enlargedIndex == null"
+        :draggable="!!cell.channel && enlargedIndex == null && digitalZoom <= 1"
         @click="cell.channel && emit('select', cell.channel.id)"
         @dblclick="onDblClick(cell.index, cell.channel)"
         @contextmenu="onCellCtx($event, cell)"
@@ -440,19 +680,38 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-          <MpegtsPlayer
-            v-if="cell.state?.previewUrl && (cell.state.preview === 'live' || cell.state.preview === 'starting')"
-            :ref="(el) => setPlayerRef(cell.index, el)"
-            :src="cell.state.previewUrl"
-            :muted="isMuted(cell.channel.id)"
-            :volume="volumeOf(cell.channel.id)"
-            :mirrored="isFlipped(cell.channel.id)"
-            :paused="isPaused(cell.channel.id) || !!playbackSuspended"
-          />
-          <div v-else class="placeholder">
-            <p v-if="cell.state?.preview === 'error'">{{ cell.state.previewError || '预览失败' }}</p>
-            <p v-else>等待预览…</p>
-            <p class="hint">低延迟 MPEG-TS 预览（H.264）；H.265 浏览器可能无法播放</p>
+          <div
+            class="zoom-hit"
+            :class="{ active: digitalZoomEnabled, zoomed: digitalZoomEnabled && digitalZoom > 1 }"
+            :ref="(el) => setZoomHit(el, digitalZoomEnabled)"
+            @wheel.prevent="onDigitalWheel"
+            @mousedown="onDigitalMouseDown"
+            @pointerdown="onDigitalPointerDown"
+            @pointermove="onDigitalPointerMove"
+            @pointerup="onDigitalPointerUp"
+            @pointercancel="onDigitalPointerUp"
+          >
+            <MpegtsPlayer
+              v-if="cellShouldPlay(cell)"
+              :key="`live-${cell.channel.id}-${cellPlaySrc(cell)}`"
+              :ref="(el) => setPlayerRef(cell.index, el)"
+              :src="cellPlaySrc(cell)"
+              :muted="isMuted(cell.channel.id)"
+              :volume="volumeOf(cell.channel.id)"
+              :mirrored="isFlipped(cell.channel.id)"
+              :paused="isPaused(cell.channel.id) || !!playbackSuspended"
+              :is-live="true"
+              :style="digitalZoomEnabled ? digitalZoomStyle : undefined"
+            />
+            <div v-else class="placeholder">
+              <p v-if="cell.state?.preview === 'error'">{{ cell.state.previewError || '预览失败' }}</p>
+              <p v-else-if="remoteMode || liveSrcById">等待通道…</p>
+              <p v-else>等待预览…</p>
+              <p class="hint">HLS 预览（H.264）。离开页面会释放播放器。H.265 在部分浏览器无法播放。</p>
+            </div>
+            <div v-if="digitalZoomEnabled && digitalZoom > 1" class="zoom-chip">
+              {{ digitalZoom.toFixed(1) }}× · 滚轮键还原
+            </div>
           </div>
         </template>
         <template v-else>
@@ -673,6 +932,22 @@ onUnmounted(() => {
 .mosaic-shell:-webkit-full-screen .mosaic {
   flex: 1 1 0;
 }
+.mosaic-shell:fullscreen .toolbar,
+.mosaic-shell:-webkit-full-screen .toolbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  transform: translateY(100%);
+  transition: transform 0.16s ease;
+  pointer-events: none;
+}
+.mosaic-shell:fullscreen.toolbar-peek .toolbar,
+.mosaic-shell:-webkit-full-screen.toolbar-peek .toolbar {
+  transform: translateY(0);
+  pointer-events: auto;
+}
 .mosaic {
   flex: 1 1 0;
   width: 100%;
@@ -744,6 +1019,32 @@ onUnmounted(() => {
   outline: 2px dashed color-mix(in srgb, var(--accent) 85%, #fff);
   outline-offset: -3px;
   background: color-mix(in srgb, var(--accent) 12%, #0f161f);
+}
+.zoom-hit {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+}
+.zoom-hit.zoomed {
+  cursor: grab;
+  touch-action: none;
+}
+.zoom-hit.zoomed:active {
+  cursor: grabbing;
+}
+.zoom-chip {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 3;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 55%);
+  color: #e8edf2;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
 }
 .osd {
   position: absolute;

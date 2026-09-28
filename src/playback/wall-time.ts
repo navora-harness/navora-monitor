@@ -37,7 +37,7 @@ export function toTimedClip(seg: RecordingSegment): TimedClip {
     id: seg.id,
     startMs: segStartMs(seg),
     endMs: segEndMs(seg),
-    url: seg.playbackUrl || seg.url,
+    url: seg.url || seg.playbackUrl || '',
     fileName: seg.fileName,
   }
 }

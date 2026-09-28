@@ -15,6 +15,7 @@ declare module 'mpegts.js' {
     isLive?: boolean
     url: string
     cors?: boolean
+    withCredentials?: boolean
     hasAudio?: boolean
     hasVideo?: boolean
   }

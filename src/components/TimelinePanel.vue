@@ -9,7 +9,7 @@ import {
   formatSegmentTimeRange,
 } from '@shared/segment-time'
 import { isSparseTimeline, recentActivityRange } from '@shared/segment-range'
-import { isSegmentWriting } from '@shared/segment-writing'
+import { isOpenTimelineSegment, isSegmentWriting } from '@shared/segment-writing'
 import { openContextMenu } from '../composables/useContextMenu'
 
 const props = defineProps<{
@@ -32,6 +32,8 @@ const props = defineProps<{
    * (shows realtime / writing edge). Ignored while `active` (playback).
    */
   followLiveEdge?: boolean
+  /** Selected channel is recording — draw the open segment out to now. */
+  channelRecording?: boolean
   /** Remote browser — hide host-only save/export actions */
   remoteMode?: boolean
   /** Phone / narrow viewport — denser chrome, larger touch targets */
@@ -87,6 +89,11 @@ const userGrabbing = ref(false)
 let resizeObs: ResizeObserver | null = null
 let panLastX = 0
 let panPointerId: number | null = null
+const activePointers = new Map<number, { x: number; y: number }>()
+let pinchBaseDist = 0
+let pinching = false
+let pendingPxPerMs = 0
+let zoomRaf = 0
 /** Structural viewport fit key — channel/source/day only (not drifting range ends). */
 let viewFittedKey = ''
 let selectAnchorMs = 0
@@ -125,6 +132,31 @@ function segStart(s: RecordingSegment) {
 
 function segEnd(s: RecordingSegment) {
   return s.endMs ?? s.mtimeMs
+}
+
+function openSegmentId(list: RecordingSegment[], now: number): string | null {
+  if (!list.length || source.value !== 'loop') return null
+  const last = list[list.length - 1]!
+  const start = segStart(last)
+  if (
+    !isOpenTimelineSegment(last, {
+      newest: true,
+      startMs: start,
+      nowMs: now,
+      channelRecording: props.channelRecording,
+    })
+  ) {
+    return null
+  }
+  return last.id
+}
+
+/** Wall end used for paint and hit-testing. The open file grows to now. */
+function displayEnd(s: RecordingSegment, now: number, openId: string | null): number {
+  const a = segStart(s)
+  const b = Math.max(a + 500, segEnd(s))
+  if (openId != null && s.id === openId) return Math.max(b, now)
+  return b
 }
 
 const dayOptions = computed(() => {
@@ -244,6 +276,9 @@ type BlockView = {
   seg: RecordingSegment
   left: number
   width: number
+  top: string
+  height: string
+  bottom: string
   writing: boolean
   startLabel: string
   endLabel: string
@@ -252,6 +287,7 @@ type BlockView = {
   showDuration: boolean
   durationLabel: string
   rangeTitle: string
+  radius: string
 }
 
 /**
@@ -293,17 +329,42 @@ const layoutBlocks = computed(() => {
   const ppm = pxPerMs.value
   const withSec = ppm * 1000 >= 0.04
   const now = nowMs.value
-  const out: BlockView[] = []
-  for (const seg of filteredAsc.value) {
+  const list = filteredAsc.value
+  const openId = openSegmentId(list, now)
+  const fullRadius = props.mobile ? 4 : 5
+  const viewW = viewportW.value
+  const viewSpan = Math.max(1000, viewW / Math.max(ppm, 1e-12))
+  const secondScale = viewW > 0 && pickTickStep(viewSpan, viewW) < 60_000
+  const zoomRadius = secondScale ? fullRadius : 0
+  const spans: { seg: RecordingSegment; a: number; b: number; lane: number }[] = []
+  const laneEnds: number[] = []
+  for (const seg of list) {
     const a = segStart(seg)
-    const b = Math.max(a + 500, segEnd(seg))
+    const b = displayEnd(seg, now, openId)
+    let lane = laneEnds.findIndex((end) => end <= a + 200)
+    if (lane < 0) {
+      lane = laneEnds.length
+      laneEnds.push(b)
+    } else {
+      laneEnds[lane] = b
+    }
+    spans.push({ seg, a, b, lane })
+  }
+  const lanes = Math.max(1, laneEnds.length)
+  const out: BlockView[] = []
+  for (const { seg, a, b, lane } of spans) {
     const left = (a - origin) * ppm
     const width = Math.max(3, (b - a) * ppm)
-    const writing = isSegmentWriting(seg, now)
+    const writing = seg.id === openId || isSegmentWriting(seg, now)
+    const stacked = lanes > 1
+    const radiusPx = Math.min(zoomRadius, Math.max(0, (width - 2) / 2))
     out.push({
       seg,
       left,
       width,
+      top: stacked ? `calc(3px + ${lane} * ((100% - 6px) / ${lanes}))` : '4px',
+      height: stacked ? `calc((100% - 6px) / ${lanes} - 2px)` : 'calc(100% - 8px)',
+      bottom: 'auto',
       writing,
       startLabel: formatSegmentClock(a, withSec),
       endLabel: formatSegmentClock(b, withSec),
@@ -314,6 +375,7 @@ const layoutBlocks = computed(() => {
       rangeTitle: writing
         ? `${formatSegmentTimeRange(seg.startMs, seg.endMs)} · 正在录制中`
         : `${formatSegmentTimeRange(seg.startMs, seg.endMs)} · ${formatSegmentDuration(a, b)}`,
+      radius: radiusPx < 0.75 ? '0' : `${Math.round(radiusPx * 10) / 10}px`,
     })
   }
   return out
@@ -423,6 +485,8 @@ const selectionLabel = computed(() => {
 
 function segmentAt(ms: number): RecordingSegment | null {
   const list = filteredAsc.value
+  const now = nowMs.value
+  const openId = openSegmentId(list, now)
   // Binary search first segment that ends after ms, then scan a few
   let lo = 0
   let hi = list.length - 1
@@ -430,7 +494,7 @@ function segmentAt(ms: number): RecordingSegment | null {
   while (lo <= hi) {
     const mid = (lo + hi) >> 1
     const s = list[mid]!
-    const b = Math.max(segStart(s) + 1, segEnd(s))
+    const b = displayEnd(s, now, openId)
     if (b < ms) lo = mid + 1
     else {
       idx = mid
@@ -441,7 +505,7 @@ function segmentAt(ms: number): RecordingSegment | null {
   for (let i = idx; i < Math.min(list.length, idx + 8); i++) {
     const s = list[i]!
     const a = segStart(s)
-    const b = Math.max(a + 1, segEnd(s))
+    const b = displayEnd(s, now, openId)
     if (ms >= a && ms <= b) return s
     if (a > ms) break
   }
@@ -735,10 +799,25 @@ function centerOnPlaying() {
 }
 
 function zoomAt(_clientX: number, factor: number) {
-  // Keep center playhead time fixed while zooming
-  pxPerMs.value = clampZoom(pxPerMs.value * factor)
-  // Zoom rebuilds block geometry — re-paint strip at same center
-  nextTick(() => paintLiveCenter(liveCenterMs))
+  // Keep the center playhead time fixed. Coalesce pinch events to one paint per frame.
+  const base = pendingPxPerMs > 0 ? pendingPxPerMs : pxPerMs.value
+  pendingPxPerMs = clampZoom(base * factor)
+  if (zoomRaf) return
+  zoomRaf = requestAnimationFrame(() => {
+    zoomRaf = 0
+    if (!(pendingPxPerMs > 0)) return
+    pxPerMs.value = pendingPxPerMs
+    pendingPxPerMs = 0
+    paintLiveCenter(liveCenterMs)
+  })
+}
+
+function pointerSpan(): number {
+  const pts = [...activePointers.values()]
+  if (pts.length < 2) return 0
+  const a = pts[0]!
+  const b = pts[1]!
+  return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
 function onWheel(e: WheelEvent) {
@@ -759,25 +838,47 @@ function onWheel(e: WheelEvent) {
     return
   }
   const zoomIn = e.deltaY < 0
-  zoomAt(e.clientX, zoomIn ? 1.12 : 1 / 1.12)
+  const step = props.mobile ? 1.2 : 1.12
+  zoomAt(e.clientX, zoomIn ? step : 1 / step)
 }
 
 function onViewportPointerDown(e: PointerEvent) {
-  if (e.button !== 0) return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
   if (props.scrubLocked) {
     e.preventDefault()
     return
   }
   const el = viewportRef.value
   if (!el) return
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
 
   if (selectMode.value) {
+    if (activePointers.size > 1) return
     selecting.value = true
     selectAnchorMs = clientXToMs(e.clientX)
     selA.value = selectAnchorMs
     selB.value = selectAnchorMs
     panPointerId = e.pointerId
     el.setPointerCapture(e.pointerId)
+    e.preventDefault()
+    return
+  }
+
+  if (activePointers.size >= 2) {
+    pinching = true
+    panActive = false
+    panning.value = false
+    panPointerId = null
+    pinchBaseDist = pointerSpan()
+    userGrabbing.value = true
+    userAnchored = true
+    for (const id of activePointers.keys()) {
+      try {
+        el.releasePointerCapture(id)
+      } catch {
+        /* not captured */
+      }
+    }
     e.preventDefault()
     return
   }
@@ -790,10 +891,36 @@ function onViewportPointerDown(e: PointerEvent) {
   suppressClick = false
   panLastX = e.clientX
   panPointerId = e.pointerId
-  el.setPointerCapture(e.pointerId)
+  // Touch: don't capture until the gesture is clearly a one-finger drag.
+  // Capturing on pointerdown swallows the second finger and blocks pinch-zoom.
+  if (e.pointerType !== 'touch') el.setPointerCapture(e.pointerId)
 }
 
 function onViewportPointerMove(e: PointerEvent) {
+  const tracked = activePointers.get(e.pointerId)
+  if (tracked) {
+    tracked.x = e.clientX
+    tracked.y = e.clientY
+  } else if (panPointerId !== e.pointerId) {
+    return
+  }
+
+  if (pinching && activePointers.size >= 2) {
+    const dist = pointerSpan()
+    if (pinchBaseDist > 24 && dist > 24) {
+      let factor = dist / pinchBaseDist
+      factor = Math.min(1.4, Math.max(1 / 1.4, factor))
+      if (Math.abs(factor - 1) > 0.01) {
+        zoomAt(e.clientX, factor)
+        pinchBaseDist = dist
+      }
+    } else if (dist > 24) {
+      pinchBaseDist = dist
+    }
+    e.preventDefault()
+    return
+  }
+
   if (panPointerId !== e.pointerId) return
 
   if (selecting.value && selectMode.value) {
@@ -802,6 +929,13 @@ function onViewportPointerMove(e: PointerEvent) {
   }
 
   if (!panActive) return
+  if (e.pointerType === 'touch' && activePointers.size === 1) {
+    try {
+      viewportRef.value?.setPointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+  }
   const dx = e.clientX - panLastX
   panLastX = e.clientX
   panDistance += Math.abs(dx)
@@ -809,6 +943,35 @@ function onViewportPointerMove(e: PointerEvent) {
 }
 
 function onViewportPointerUp(e: PointerEvent) {
+  activePointers.delete(e.pointerId)
+
+  if (pinching) {
+    if (activePointers.size >= 2) {
+      pinchBaseDist = pointerSpan()
+      return
+    }
+    pinching = false
+    pinchBaseDist = 0
+    suppressClick = true
+    followLockUntil = Date.now() + 2500
+    if (activePointers.size === 1) {
+      const [id, p] = [...activePointers.entries()][0]!
+      panPointerId = id
+      panLastX = p.x
+      panActive = true
+      panning.value = true
+      userGrabbing.value = true
+      panDistance = 0
+      return
+    }
+    panActive = false
+    panning.value = false
+    panPointerId = null
+    userGrabbing.value = false
+    commitCenter(liveCenterMs, 'none')
+    return
+  }
+
   if (panPointerId !== e.pointerId) return
   const wasPanning = panActive
   panActive = false
@@ -1146,7 +1309,7 @@ onMounted(() => {
   paintLiveCenter(centerMs.value)
   writingClockTimer = setInterval(() => {
     nowMs.value = Date.now()
-  }, 2000)
+  }, 1000)
   if (props.followLiveEdge && !props.active) startLiveEdgeFollow()
 })
 
@@ -1156,6 +1319,7 @@ onUnmounted(() => {
   resizeObsBound = false
   if (scrubTimer) clearTimeout(scrubTimer)
   if (transformRaf) cancelAnimationFrame(transformRaf)
+  if (zoomRaf) cancelAnimationFrame(zoomRaf)
   if (wheelCommitTimer) clearTimeout(wheelCommitTimer)
   if (followCommitTimer) clearTimeout(followCommitTimer)
   if (writingClockTimer) clearInterval(writingClockTimer)
@@ -1329,7 +1493,14 @@ onUnmounted(() => {
                   writing: b.writing,
                   hover: hoverId === b.seg.id,
                 }"
-                :style="{ left: `${b.left}px`, width: `${b.width}px` }"
+                :style="{
+                  left: `${b.left}px`,
+                  width: `${b.width}px`,
+                  top: b.top,
+                  height: b.height,
+                  bottom: b.bottom,
+                  borderRadius: b.radius,
+                }"
                 :title="b.rangeTitle"
                 @click.stop="onBlockClick(b.seg, $event)"
                 @mouseenter="hoverId = b.seg.id"
@@ -1395,7 +1566,10 @@ onUnmounted(() => {
           </span>
           <span class="muted">
             <template v-if="selectMode">拖动调整保存范围，确认后裁切拼接</template>
-            <template v-else-if="followLiveEdge && !active">实时跟播 · 中线为当前时间 · 共 {{ filteredAsc.length }} 段</template>
+            <template v-else-if="followLiveEdge && !active">
+              实时跟播 · 中线为当前时间<span v-if="mobile"> · 双指缩放</span> · 共 {{ filteredAsc.length }} 段
+            </template>
+            <template v-else-if="mobile">单指滑动 · 双指缩放 · 中线为播放点 · 共 {{ filteredAsc.length }} 段</template>
             <template v-else>抓取滚动 · 中线为播放点 · 滚轮缩放 · 共 {{ filteredAsc.length }} 段</template>
           </span>
           <span class="right">
@@ -1779,8 +1953,6 @@ onUnmounted(() => {
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 28px;
 }
 .block:hover,
 .block.hover {
@@ -1802,6 +1974,7 @@ onUnmounted(() => {
   background: color-mix(in srgb, #9ca3af 55%, #4b5563);
   color: #f3f4f6;
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 8%);
+  z-index: 2;
 }
 .block.writing:hover,
 .block.writing.hover {

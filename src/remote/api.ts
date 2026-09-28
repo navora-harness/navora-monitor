@@ -127,16 +127,39 @@ export function fetchSavedClips(channelId?: string | null) {
   return request<{ segments: RecordingSegment[] }>(`/api/saved-clips${q}`)
 }
 
-/** Attach auth token so mpegts.js / video media requests pass remote auth. */
+/**
+ * Prefer {@link buildRemoteLivePreviewUrl} for live cells — host previewUrl is
+ * often 127.0.0.1 and never fetched by the remote browser.
+ */
+export { buildRemoteLivePreviewUrl as remoteLivePreviewUrl } from '../media-url'
+
+/**
+ * Normalize host media URLs for the remote browser:
+ * - Force absolute URL on current origin (mpegts.js often skips relative/127.0.0.1)
+ * - Map /preview and /recordings onto /media/* auth proxy
+ * - Attach session token
+ */
 export function withMediaAuth(url: string | null | undefined): string | null {
   if (!url) return null
   const token = getStoredToken()
-  if (!token) return url
+  const origin =
+    typeof location !== 'undefined' && location.origin ? location.origin : 'http://local'
   try {
-    const u = new URL(url, typeof location !== 'undefined' ? location.origin : 'http://local')
-    u.searchParams.set('token', token)
-    return u.pathname + u.search
+    const u = new URL(url, origin)
+    let path = u.pathname
+    if (path.startsWith('/preview/')) path = `/media${path}`
+    else if (path.startsWith('/recordings/') || path.startsWith('/saved/')) path = `/media${path}`
+
+    const out = new URL(path, origin)
+    for (const [k, v] of u.searchParams) {
+      if (k === 'token') continue
+      out.searchParams.set(k, v)
+    }
+    if (token) out.searchParams.set('token', token)
+    // Always absolute — relative paths caused "连接中" with zero network requests.
+    return out.href
   } catch {
+    if (!token) return url
     const sep = url.includes('?') ? '&' : '?'
     return `${url}${sep}token=${encodeURIComponent(token)}`
   }

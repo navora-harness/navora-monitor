@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { ChannelConfig } from '@shared/types'
 import type { DiscoveredCamera, ScanSubnetInfo } from '@shared/ipc-types'
 import { CAMERA_PRESETS, buildRtspUrls, getCameraPreset } from '@shared/camera-presets'
@@ -427,7 +428,15 @@ function confirmAdd() {
   emit('add', channels)
 }
 
+let popEscape: (() => void) | null = null
 onMounted(() => {
+  popEscape = pushEscapeLayer(() => {
+    if (scanning.value) {
+      void cancelScan()
+      return
+    }
+    emit('close')
+  }, { fromInput: true })
   unsubProgress = api().onScanProgress((p) => {
     progress.value = p
   })
@@ -438,6 +447,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  popEscape?.()
   unsubProgress?.()
   if (scanning.value) void api().cancelDeviceScan()
 })

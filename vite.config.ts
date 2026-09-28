@@ -1,10 +1,26 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
+const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf8')) as {
+  version: string
+}
+
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [
+    vue(),
+    {
+      name: 'nm-ui-version',
+      transformIndexHtml(html) {
+        return html.replaceAll('%NM_UI_VERSION%', pkg.version)
+      },
+    },
+  ],
   base: './',
+  define: {
+    __NM_UI_VERSION__: JSON.stringify(pkg.version),
+  },
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
@@ -15,6 +31,13 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5188,
     strictPort: true,
+    watch: {
+      ignored: ['**/release/**', '**/vendor/**', '**/portable/**', '**/_recycle/**'],
+    },
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:8780', changeOrigin: true, ws: true },
+      '/media': { target: 'http://127.0.0.1:8780', changeOrigin: true },
+    },
   },
   build: {
     outDir: 'dist',
@@ -22,8 +45,10 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
-        remote: resolve(__dirname, 'remote.html'),
       },
     },
+  },
+  test: {
+    exclude: ['**/node_modules/**', '**/dist/**', '**/_recycle/**'],
   },
 })

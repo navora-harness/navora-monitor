@@ -22,6 +22,12 @@ export type AppSettings = {
   closeToTray: boolean
   /** Show main window when the app starts (false → tray only until opened) */
   showMainOnStartup: boolean
+  /**
+   * When closing to tray with no recording and no remote preview demand,
+   * relaunch as `--tray-only` so the Chromium GPU process is torn down
+   * (proven holder of post-mosaic RSS). Keeps hardware decode for next open.
+   */
+  relaunchTrayWhenIdle: boolean
   /** Register OS login item — launch when user signs in (packaged builds only) */
   openAtLogin: boolean
   /** Optional absolute path to ffmpeg.exe; empty → PATH / env */
@@ -89,6 +95,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultRtspTransport: 'tcp',
   closeToTray: true,
   showMainOnStartup: true,
+  relaunchTrayWhenIdle: true,
   openAtLogin: false,
   ffmpegPath: '',
   retentionDays: 0,
@@ -102,7 +109,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiTheme: 'system',
   remoteEnabled: false,
   remotePort: 8780,
-  remoteUsername: 'admin',
+  remoteUsername: 'navora',
   remotePassword: '',
 }
 
@@ -127,6 +134,7 @@ export function sanitizeSettings(raw: Partial<AppSettings> | null | undefined): 
     defaultRtspTransport: raw.defaultRtspTransport === 'udp' ? 'udp' : 'tcp',
     closeToTray: raw.closeToTray !== false,
     showMainOnStartup: raw.showMainOnStartup !== false,
+    relaunchTrayWhenIdle: raw.relaunchTrayWhenIdle !== false,
     openAtLogin: raw.openAtLogin === true,
     ffmpegPath: typeof raw.ffmpegPath === 'string' ? raw.ffmpegPath.trim() : '',
     retentionDays: Number.isFinite(retention) && retention >= 0 ? Math.round(retention) : 0,

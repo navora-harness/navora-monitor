@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { RecordingSegment } from '@shared/types'
 import { formatSegmentClock, formatSegmentTimeRange } from '@shared/segment-time'
 import { isMpegTsPath } from '../playback/wall-time'
@@ -64,6 +65,9 @@ const chromeVisible = ref(true)
 const scrubbing = ref(false)
 const scrubPreview = ref(0)
 const fullscreen = ref(false)
+/** Fullscreen: bottom controls stay hidden until the pointer nears the screen edge. */
+const barPeek = ref(false)
+let barHideTimer: ReturnType<typeof setTimeout> | null = null
 const showDebug = ref(false)
 const loadPhase = ref('idle')
 const debugLines = ref<string[]>([])
@@ -79,6 +83,7 @@ const playMediaUrl = ref('')
 
 const controller = new PlaybackController()
 let hideTimer: ReturnType<typeof setTimeout> | null = null
+let popEscape: (() => void) | null = null
 let scrubWallMsPreview: number | null = null
 let timeRaf = 0
 let pendingRelSec = 0
@@ -345,7 +350,60 @@ async function toggleFullscreen() {
 }
 
 function onFsChange() {
-  fullscreen.value = !!document.fullscreenElement
+  const on = !!document.fullscreenElement
+  if (on !== fullscreen.value) {
+    window.removeEventListener('pointermove', onWindowPointerMove, true)
+    if (on) window.addEventListener('pointermove', onWindowPointerMove, true)
+  }
+  fullscreen.value = on
+  if (!fullscreen.value) {
+    clearBarHide()
+    barPeek.value = false
+  }
+}
+
+function clearBarHide() {
+  if (barHideTimer) {
+    clearTimeout(barHideTimer)
+    barHideTimer = null
+  }
+}
+
+function syncBarPeek(clientY: number) {
+  const fromBottom = window.innerHeight - clientY
+  const limit = barPeek.value ? 140 : 48
+  if (fromBottom <= limit) {
+    clearBarHide()
+    barPeek.value = true
+    return
+  }
+  if (!barPeek.value || barHideTimer) return
+  barHideTimer = setTimeout(() => {
+    barHideTimer = null
+    barPeek.value = false
+  }, 220)
+}
+
+function onPlaybackLeave(e: MouseEvent) {
+  chromeVisible.value = true
+  if (!fullscreen.value) return
+  if (window.innerHeight - e.clientY <= 140) return
+  clearBarHide()
+  barHideTimer = setTimeout(() => {
+    barHideTimer = null
+    barPeek.value = false
+  }, 220)
+}
+
+function onStageMove(e: MouseEvent) {
+  bumpChrome()
+  if (!fullscreen.value) return
+  syncBarPeek(e.clientY)
+}
+
+function onWindowPointerMove(e: PointerEvent) {
+  if (!fullscreen.value) return
+  syncBarPeek(e.clientY)
 }
 
 function bumpChrome() {
@@ -354,10 +412,6 @@ function bumpChrome() {
   hideTimer = setTimeout(() => {
     if (playing.value && segment.value) chromeVisible.value = false
   }, 2800)
-}
-
-function onStageMove() {
-  bumpChrome()
 }
 
 function ratioFromEvent(e: PointerEvent): number {
@@ -418,8 +472,6 @@ function onKey(e: KeyboardEvent) {
   } else if (e.key === 'm' || e.key === 'M') {
     e.preventDefault()
     toggleMute()
-  } else if (e.key === 'Escape' && !document.fullscreenElement) {
-    emit('exit')
   }
 }
 
@@ -510,13 +562,19 @@ onMounted(async () => {
   }
   document.addEventListener('fullscreenchange', onFsChange)
   window.addEventListener('keydown', onKey)
+  popEscape = pushEscapeLayer(() => {
+    if (!document.fullscreenElement) emit('exit')
+  })
   bumpChrome()
 })
 
 onBeforeUnmount(() => {
+  popEscape?.()
   document.removeEventListener('fullscreenchange', onFsChange)
+  window.removeEventListener('pointermove', onWindowPointerMove, true)
   window.removeEventListener('keydown', onKey)
   if (hideTimer) clearTimeout(hideTimer)
+  clearBarHide()
   clearBufferingWatch()
   if (timeRaf) cancelAnimationFrame(timeRaf)
   if (wallRaf) cancelAnimationFrame(wallRaf)
@@ -529,9 +587,9 @@ onBeforeUnmount(() => {
   <div
     ref="rootRef"
     class="playback"
-    :class="{ 'chrome-hidden': segment && !chromeVisible && playing }"
+    :class="{ 'chrome-hidden': segment && !chromeVisible && playing, 'bar-peek': barPeek }"
     @mousemove="onStageMove"
-    @mouseleave="chromeVisible = true"
+    @mouseleave="onPlaybackLeave"
   >
     <header class="top" @mousemove.stop>
       <div class="mode">
@@ -1067,6 +1125,23 @@ onBeforeUnmount(() => {
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
+}
+.playback:fullscreen .bar,
+.playback:-webkit-full-screen .bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  opacity: 1;
+  transform: translateY(100%);
+  pointer-events: none;
+  transition: transform 0.16s ease;
+}
+.playback:fullscreen.bar-peek .bar,
+.playback:-webkit-full-screen.bar-peek .bar {
+  transform: translateY(0);
+  pointer-events: auto;
 }
 .scrub {
   height: 18px;

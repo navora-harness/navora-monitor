@@ -198,10 +198,21 @@ export class StreamEngine {
     if (this.pinnedRel != null) return this.pinnedRel
     const v = this.video
     if (!v || !Number.isFinite(v.currentTime)) return this.streamOriginSec
-    if (this.usingFmp4Remux) {
-      return this.streamOriginSec + Math.max(0, v.currentTime)
-    }
-    return this.timeBase.relativeSec(v.currentTime)
+    return this.fileRelativeSec(v.currentTime)
+  }
+
+  /**
+   * Seconds from the start of this file.
+   * Native faststart MP4 is already 0-based. MediaTimeBase is only for MPEG-TS PCR,
+   * whose first sample is not t=0 — using it after a native seek locks the origin
+   * at the seek target and reports 0, so the timeline jumps to the segment start
+   * while the picture stays where the user dragged.
+   */
+  private fileRelativeSec(currentTime: number): number {
+    if (!Number.isFinite(currentTime)) return this.streamOriginSec
+    if (this.usingFmp4Remux) return this.streamOriginSec + Math.max(0, currentTime)
+    if (!this.usingMpegts) return Math.max(0, currentTime)
+    return this.timeBase.relativeSec(currentTime)
   }
 
   get durationSec(): number {
@@ -418,9 +429,11 @@ export class StreamEngine {
           resolve()
           return
         }
-        const got = this.timeBase.relativeSec(v.currentTime)
+        const got = this.usingMpegts
+          ? this.timeBase.relativeSec(v.currentTime)
+          : Math.max(0, Number.isFinite(v.currentTime) ? v.currentTime : t)
         const settled = Math.min(dur > 0 ? dur : got, Math.max(0, got))
-        this.timeBase.calibrateFromSeeked(v.currentTime, settled)
+        if (this.usingMpegts) this.timeBase.calibrateFromSeeked(v.currentTime, settled)
         this.pinnedRel = settled
         this.emit('time', settled)
         this.seeking = false
@@ -1199,11 +1212,7 @@ export class StreamEngine {
     }
 
     if (this.pinnedRel != null) return
-    if (this.usingFmp4Remux) {
-      this.emit('time', this.streamOriginSec + Math.max(0, abs))
-      return
-    }
-    this.emit('time', this.timeBase.relativeSec(abs))
+    this.emit('time', this.fileRelativeSec(abs))
   }
 
   /**

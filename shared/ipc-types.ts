@@ -100,6 +100,8 @@ export type ConfigBundleParts = {
 export type NavoraMonitorApi = {
   getAppInfo: () => Promise<AppInfo>
   openExternal: (url: string) => Promise<{ ok: boolean }>
+  /** Stop the host process (HTTP + all FFmpeg). Requires confirmation in UI. */
+  shutdownApp: () => Promise<{ ok: boolean; message?: string }>
   getSettings: () => Promise<AppSettings>
   setSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>
   getDiskSpace: () => Promise<DiskSpaceInfo | null>
@@ -273,6 +275,9 @@ export type NavoraMonitorApi = {
   cancelDeviceScan: () => Promise<void>
   onScanProgress: (cb: (p: DeviceScanProgress) => void) => () => void
   onWindowVisibility: (cb: (p: { visible: boolean }) => void) => () => void
+  /** Main asks renderer to unmount all live players before killing FFmpeg / destroying window. */
+  onPrepareMediaTeardown: (cb: () => void) => () => void
+  notifyMediaTeardownDone: () => void
   saveSnapshot: (
     channelId: string,
     dataUrl: string,
@@ -284,11 +289,22 @@ export type NavoraMonitorApi = {
   windowMinimize: () => Promise<void>
   windowMaximize: () => Promise<void>
   windowClose: () => Promise<void>
+  /** Current main-window visibility (for preview gate on mount). */
+  getWindowVisible: () => Promise<{ visible: boolean }>
   /** Toggle Chromium DevTools (detached). */
   toggleDevTools: () => Promise<{ open: boolean }>
   getRemoteStatus: () => Promise<RemoteAccessStatus>
   generateRemotePassword: () => Promise<string>
   ensureRemotePassword: () => Promise<{ password: string; username: string }>
+  getSystemService: () => Promise<SystemServiceInfo>
+  systemServiceAction: (action: SystemServiceAction) => Promise<SystemServiceInfo>
+  /** Ask the server to push this channel's timeline over the WebSocket. */
+  watchTimeline: (channelId: string) => void
+  onTimeline: (
+    cb: (payload: { channelId: string; segments: RecordingSegment[]; saved: RecordingSegment[] }) => void,
+  ) => () => void
+  onRuntimeStates: (cb: (list: ChannelRuntimeState[]) => void) => () => void
+  timelineFresh: () => boolean
 }
 
 export type RemoteAccessStatus = {
@@ -298,6 +314,24 @@ export type RemoteAccessStatus = {
   urls: string[]
   username: string
   error: string | null
+}
+
+export type SystemServiceAction = 'install' | 'uninstall' | 'start' | 'stop' | 'restart'
+
+export type SystemServiceInfo = {
+  supported: boolean
+  platform: string
+  name: string
+  display: string
+  installed: boolean
+  running: boolean
+  startType?: string
+  exePath?: string
+  dataPath?: string
+  command?: string
+  elevated: boolean
+  message?: string
+  error?: string
 }
 
 export type { PanelSizes, UiLayoutState, AppSettings }

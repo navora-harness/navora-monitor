@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { ChannelConfig, ChannelRuntimeState } from '@shared/types'
 import { DEFAULT_GROUP } from '@shared/groups'
 import { CAMERA_PRESETS, buildRtspUrls, getCameraPreset } from '@shared/camera-presets'
@@ -135,7 +136,7 @@ const canSave = computed(() => {
 const statusLine = computed(() => {
   if (props.isNew || !props.state) return ''
   const parts = [`录像 ${props.state.recording}`, `预览 ${props.state.preview}`]
-  if (props.state.lastError) parts.push(`错误：${props.state.lastError}`)
+  if (props.state.lastError) parts.push(`错误：${props.state.lastError.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/g, '$1')}`)
   else if (props.state.previewError) parts.push(`预览：${props.state.previewError}`)
   return parts.join(' · ')
 })
@@ -174,6 +175,12 @@ function save() {
 function onBackdrop(e: MouseEvent) {
   if (e.target === e.currentTarget) emit('close')
 }
+
+let popEscape: (() => void) | null = null
+onMounted(() => {
+  popEscape = pushEscapeLayer(() => emit('close'), { fromInput: true })
+})
+onUnmounted(() => popEscape?.())
 </script>
 
 <template>

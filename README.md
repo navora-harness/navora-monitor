@@ -1,6 +1,6 @@
 # Navora Monitor
 
-局域网 CCTV 预览 / 录像 / 回放桌面端（Electron + Vue + FFmpeg）。
+局域网 CCTV 预览 / 录像 / 回放（Go 服务 + Vue + FFmpeg）。
 
 ## 功能概览
 
@@ -32,7 +32,8 @@ npm run ffmpeg:fetch:all
 ```bash
 npm install
 npm test
-npm run electron:dev
+npm run dev          # Vite 前端 http://127.0.0.1:5188
+npm run dev:server   # Go 后端（另开终端）
 ```
 
 本地数据写在 `portable/`（已 gitignore）。可从示例复制通道配置：
@@ -44,28 +45,45 @@ cp portable/channels.example.json portable/channels.json     # Linux
 
 **不要**把含真实 RTSP 密码的 `channels.json` / `settings.json` 提交到仓库。
 
-## 打包
+## 打包（Go + Vue）
 
 | 命令 | 说明 |
 |------|------|
-| `npm run dist` | 当前主机默认目标（Windows 上为 win-x64） |
-| `npm run dist:win` | Windows x64（NSIS + portable） |
-| `npm run dist:win-arm` | Windows ARM64 |
-| `npm run dist:linux` | Linux x64（AppImage + tar.gz） |
-| `npm run dist:linux-arm` | Linux ARM64 |
-| `npm run dist:all` | 上述四个目标依次打包 |
-| `npm run pack` | 仅解包目录（`--dir`） |
-| `npm run dist:nsis` / `dist:portable` | 仅 Windows x64 安装包 / 绿色版 |
+| `npm run dist:go` | win-x64 portable + setup + linux-x64 portable |
+| `npm run dist:go:portable` | 同上目标，仅 zip（跳过 NSIS） |
+| `npm run dist:go:setup` | 仅 Windows x64 NSIS 安装包 |
+| `npm run dist:go:win` | 仅 win-x64 |
+| `npm run dist:go:linux` | 仅 linux-x64 portable |
 
-产物在 `release/`。打包前请先 `ffmpeg:fetch` 对应架构。
-
-跨平台说明：可在 Windows 上打 Linux 包（electron-builder 下载对应 Electron）；Linux ARM / Win ARM 需已下载对应 FFmpeg。
+产物在 `release/`（如 `NavoraMonitor-<ver>-win-x64-portable.zip`）。打包前请先 `ffmpeg:fetch` / `ffmpeg:fetch:all`。Windows 安装包需要本机安装 [NSIS](https://nsis.sourceforge.io/Download)（`makensis`）。
 
 ## 开源协议
 
 本仓库源代码采用 [MIT License](./LICENSE)。
 
 发行包中内置的 FFmpeg 二进制来自 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)，遵循 **GPLv3**（见 `resources/ffmpeg/LICENSE.txt` / `vendor/ffmpeg/*/LICENSE.txt`）。分发含 FFmpeg 的安装包时，请一并遵守其 GPL 义务。
+
+## 开源鸣谢
+
+本程序基于以下开源项目构建与运行：
+
+| 项目 | 链接 |
+|------|------|
+| Vue | https://github.com/vuejs/core |
+| hls.js | https://github.com/video-dev/hls.js |
+| mpegts.js | https://github.com/xqq/mpegts.js |
+| FFmpeg | https://ffmpeg.org/ |
+| FFmpeg Builds (BtbN) | https://github.com/BtbN/FFmpeg-Builds |
+| Go | https://go.dev/ |
+| golang.org/x/crypto | https://pkg.go.dev/golang.org/x/crypto |
+| Vite | https://vitejs.dev/ |
+| TypeScript | https://www.typescriptlang.org/ |
+| vue-tsc | https://github.com/vuejs/language-tools |
+| @vitejs/plugin-vue | https://github.com/vitejs/vite-plugin-vue |
+| esbuild | https://esbuild.github.io/ |
+| Vitest | https://vitest.dev/ |
+
+完整列表见应用内「设置 → 关于 → 开源鸣谢」，以及 [`shared/open-source-credits.ts`](./shared/open-source-credits.ts)。
 
 ## 仓库隐私约定
 

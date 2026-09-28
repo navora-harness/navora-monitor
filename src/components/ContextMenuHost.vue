@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useContextMenuHost } from '../composables/useContextMenu'
+import { pushEscapeLayer } from '../ui/escape-stack'
 
 const { session, openTick, closeContextMenu, pickContextMenu } = useContextMenuHost()
 const el = ref<HTMLElement | null>(null)
@@ -28,10 +29,6 @@ watch(openTick, async () => {
   }
 })
 
-function onKey(e: KeyboardEvent) {
-  if (e.key === 'Escape') closeContextMenu()
-}
-
 function onDoc(e: MouseEvent) {
   if (!session.value) return
   const t = e.target as HTMLElement
@@ -42,15 +39,21 @@ function onScroll() {
   if (session.value) closeContextMenu()
 }
 
+let popEscape: (() => void) | null = null
+watch(session, (open) => {
+  popEscape?.()
+  popEscape = null
+  if (open) popEscape = pushEscapeLayer(() => closeContextMenu())
+})
+
 onMounted(() => {
-  document.addEventListener('keydown', onKey)
   document.addEventListener('mousedown', onDoc, true)
   document.addEventListener('scroll', onScroll, true)
   window.addEventListener('blur', closeContextMenu)
 })
 
 onUnmounted(() => {
-  document.removeEventListener('keydown', onKey)
+  popEscape?.()
   document.removeEventListener('mousedown', onDoc, true)
   document.removeEventListener('scroll', onScroll, true)
   window.removeEventListener('blur', closeContextMenu)

@@ -8,8 +8,29 @@
     />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="nm-ui-version" content="%NM_UI_VERSION%" />
     <link rel="icon" type="image/png" href="/icon.png" />
     <title>Navora Monitor · 远程</title>
+    <script>
+      // Host upgraded but browser kept an old remote.html / SPA → hard-reload once.
+      ;(function () {
+        var meta = document.querySelector('meta[name="nm-ui-version"]')
+        var baked = meta && meta.getAttribute('content')
+        if (!baked || baked.indexOf('%') !== -1) return
+        fetch('/api/status', { cache: 'no-store' })
+          .then(function (r) {
+            return r.json()
+          })
+          .then(function (st) {
+            if (!st || !st.version || st.version === baked) return
+            var u = new URL(location.href)
+            if (u.searchParams.get('_v') === st.version) return
+            u.searchParams.set('_v', st.version)
+            location.replace(u.href)
+          })
+          .catch(function () {})
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

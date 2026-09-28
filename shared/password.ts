@@ -13,7 +13,7 @@ export function generateSecurePassword(length = 16): string {
   return out
 }
 
-export const REMOTE_USERNAME = 'admin'
+export const REMOTE_USERNAME = 'navora'
 
 /** Allowed remote login name: 1–32 chars, letters/digits/_-@. */
 export function sanitizeRemoteUsername(raw: unknown): string {

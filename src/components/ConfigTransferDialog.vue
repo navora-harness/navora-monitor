@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { pushEscapeLayer } from '../ui/escape-stack'
 import type { ConfigBundleParts } from '@shared/ipc-types'
 import { describeConfigParts } from '@shared/config-bundle'
 import { DEFAULT_GROUP } from '@shared/groups'
@@ -318,11 +319,16 @@ async function doImport() {
   }
 }
 
+let popEscape: (() => void) | null = null
 onMounted(() => {
+  popEscape = pushEscapeLayer(() => {
+    if (!busy.value) emit('close')
+  }, { fromInput: true })
   if (props.mode === 'import' && props.initialPath) {
     void loadFromPath(props.initialPath)
   }
 })
+onUnmounted(() => popEscape?.())
 
 watch(
   () => props.initialPath,

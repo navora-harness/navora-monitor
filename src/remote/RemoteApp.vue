@@ -11,7 +11,7 @@ import {
 import { REMOTE_USERNAME } from '@shared/password'
 import TitleBar from '../components/TitleBar.vue'
 import DeviceTree from '../components/DeviceTree.vue'
-import MosaicView from '../components/MosaicView.vue'
+import RemoteLiveGrid from './RemoteLiveGrid.vue'
 import PlaybackView from '../components/PlaybackView.vue'
 import TimelinePanel from '../components/TimelinePanel.vue'
 import StatusBar from '../components/StatusBar.vue'
@@ -24,6 +24,7 @@ import {
   fetchRecordings,
   fetchRemoteStatus,
   fetchSavedClips,
+  fetchStates,
   getStoredToken,
   login,
   logout,
@@ -32,6 +33,7 @@ import {
   withSegmentMediaAuth,
   type RemoteAppMeta,
 } from './api'
+import { buildRemoteLivePreviewUrl } from '../media-url'
 import { defaultRemoteLayout, loadRemoteLayout, saveRemoteLayout } from './layout-store'
 import {
   APP_COPYRIGHT,
@@ -40,6 +42,8 @@ import {
   APP_LICENSE_NOTE,
   APP_NAME,
 } from '@shared/app-meta'
+import { OPEN_SOURCE_CREDITS } from '@shared/open-source-credits'
+import { NM_UI_VERSION } from '../ui-version'
 
 const authed = ref(!!getStoredToken())
 const username = ref(REMOTE_USERNAME)
@@ -146,6 +150,25 @@ function activeSlotIds(): string[] {
   return slotIds.value.filter((x): x is string => !!x).slice(0, layout.mosaic)
 }
 
+/** Absolute live.ts URLs for every slotted channel — drives remote players. */
+const liveSrcById = computed(() => {
+  const out: Record<string, string> = {}
+  if (!authed.value || viewMode.value !== 'live') return out
+  let ids = activeSlotIds()
+  // Slots empty but we have channels → still build URLs so <video> can appear after fill.
+  if (!ids.length) {
+    ids = channels.value
+      .filter((c) => c.enabled)
+      .map((c) => c.id)
+      .slice(0, layout.mosaic)
+  }
+  for (const id of ids) {
+    const url = buildRemoteLivePreviewUrl(id)
+    if (url) out[id] = url
+  }
+  return out
+})
+
 function setSlotIds(next: (string | null)[]) {
   const padded = emptySlotIds()
   for (let i = 0; i < padded.length; i++) padded[i] = next[i] ?? null
@@ -177,6 +200,22 @@ function restoreLocalLayout() {
   applyUiTheme(saved.uiTheme)
 }
 
+function fillSlotsFromGroup() {
+  // Bootstrap / empty wall: fill current mosaic size only (no auto-expand).
+  let ids = channelsInGroup.value.map((c) => c.id).slice(0, layout.mosaic)
+  // Group empty → fall back to any enabled channel so remote always has something to play.
+  if (!ids.length) {
+    ids = channels.value
+      .filter((c) => c.enabled)
+      .map((c) => c.id)
+      .slice(0, layout.mosaic)
+  }
+  const slots = emptySlotIds()
+  for (let i = 0; i < layout.mosaic; i++) slots[i] = ids[i] ?? null
+  setSlotIds(slots)
+  if (!selectedId.value && ids[0]) selectedId.value = ids[0]
+}
+
 function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
   if (n <= 1) return 1
   if (n <= 4) return 4
@@ -184,12 +223,78 @@ function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
   return 16
 }
 
-function fillSlotsFromGroup() {
-  const ids = channelsInGroup.value.map((c) => c.id).slice(0, layout.mosaic)
-  const slots = emptySlotIds()
-  for (let i = 0; i < layout.mosaic; i++) slots[i] = ids[i] ?? null
-  setSlotIds(slots)
-  if (!selectedId.value && ids[0]) selectedId.value = ids[0]
+/** Drag group onto mosaic: fill empty cells; expand grid if needed. */
+function fillGroupIntoEmptySlots(channelIds: string[]) {
+  const unique = [...new Set(channelIds)].filter((id) => channels.value.some((c) => c.id === id))
+  if (!unique.length) return
+
+  const next = [...slotIds.value]
+  const onWall = new Set(next.filter((x): x is string => !!x))
+  const queue = unique.filter((id) => !onWall.has(id))
+  if (!queue.length) {
+    status.value = '分组通道已在宫格中'
+    const first = unique.find((id) => onWall.has(id))
+    if (first) selectedId.value = first
+    return
+  }
+
+  let mosaic = layout.mosaic
+  let placed = 0
+  const fillEmpties = () => {
+    for (let i = 0; i < mosaic; i++) {
+      if (next[i]) continue
+      const id = queue.shift()
+      if (!id) break
+      next[i] = id
+      placed += 1
+    }
+  }
+  fillEmpties()
+  while (queue.length) {
+    const occupied = next.filter((x): x is string => !!x).length
+    const need = Math.min(16, occupied + queue.length)
+    const grown = mosaicForCount(need)
+    if (grown <= mosaic) break
+    mosaic = grown
+    layout.mosaic = mosaic
+    fillEmpties()
+  }
+
+  setSlotIds(next)
+  const focus = next.find((x) => x && unique.includes(x)) ?? unique[0] ?? null
+  if (focus) {
+    selectedId.value = focus
+    const ch = channels.value.find((c) => c.id === focus)
+    if (ch) activeGroup.value = channelGroup(ch)
+  }
+  schedulePersist()
+  const left = queue.length
+  status.value = left
+    ? `已填入空位 ${placed} 路（宫格已满，剩余 ${left} 路未放入）`
+    : `已填入空位 ${placed} 路（${layout.mosaic} 宫格）`
+  scheduleSync()
+}
+
+function onAssignGroup(ids: string[]) {
+  fillGroupIntoEmptySlots(ids)
+}
+
+function replaceWallWithGroup(ids: string[]) {
+  const unique = [...new Set(ids)].filter((id) => channels.value.some((c) => c.id === id))
+  if (!unique.length) return
+  const mosaic = mosaicForCount(unique.length)
+  layout.mosaic = mosaic
+  const next = emptySlotIds()
+  for (let i = 0; i < mosaic; i++) next[i] = unique[i] ?? null
+  setSlotIds(next)
+  if (unique[0]) {
+    selectedId.value = unique[0]
+    const ch = channels.value.find((c) => c.id === unique[0])
+    if (ch) activeGroup.value = channelGroup(ch)
+  }
+  schedulePersist()
+  status.value = `已展示分组 ${unique.length} 路（${mosaic} 宫格）`
+  scheduleSync()
 }
 
 async function refreshPreviews() {
@@ -204,6 +309,20 @@ async function refreshPreviews() {
       return
     }
     status.value = e instanceof Error ? e.message : '同步失败'
+  }
+}
+
+/** Refresh badges without re-POSTing demand (avoids tearing down the player). */
+async function refreshStatesOnly() {
+  if (!authed.value) return
+  try {
+    const res = await fetchStates()
+    applyStates(res.states)
+  } catch (e) {
+    if (e instanceof AuthError) {
+      authed.value = false
+      return
+    }
   }
 }
 
@@ -235,10 +354,15 @@ async function bootstrap() {
       activeGroup.value = groups.value[0] ?? DEFAULT_GROUP
       schedulePersist()
     }
+    // Always (re)fill when wall has no live cells — remote must show video tags.
     if (activeSlotIds().length === 0) fillSlotsFromGroup()
-    else scheduleSync()
+    scheduleSync()
     authed.value = true
-    status.value = '就绪'
+    const n = activeSlotIds().length
+    status.value =
+      n > 0
+        ? `就绪 · 宫格 ${n} 路 · live ${Object.keys(liveSrcById.value).length}`
+        : `就绪 · 宫格为空（通道 ${channels.value.length}）`
   } catch (e) {
     if (e instanceof AuthError) {
       authed.value = false
@@ -373,20 +497,29 @@ function hostOnly(msg = '请在主机 Navora Monitor 中操作') {
   status.value = msg
 }
 
+function placeOnSlot(id: string, slotIndex: number) {
+  const next = [...slotIds.value]
+  while (next.length <= slotIndex) next.push(null)
+  if (next[slotIndex] === id) return
+  const from = next.findIndex((x) => x === id)
+  if (from >= 0 && from !== slotIndex) next[from] = next[slotIndex] ?? null
+  next[slotIndex] = id
+  setSlotIds(next)
+}
+
 function onSelect(id: string) {
   selectedId.value = id
   schedulePersist()
   if (mobile.value) mobileDrawer.value = false
-  const idx = slotIds.value.findIndex((x) => x === id)
-  if (idx < 0) {
-    const empty = slotIds.value.findIndex((x, i) => i < layout.mosaic && !x)
-    if (empty >= 0) {
+  if (layout.mosaic === 1) {
+    placeOnSlot(id, 0)
+  } else {
+    const idx = slotIds.value.findIndex((x) => x === id)
+    if (idx < 0) {
+      const empty = slotIds.value.findIndex((x, i) => i < layout.mosaic && !x)
       const next = [...slotIds.value]
-      next[empty] = id
-      setSlotIds(next)
-    } else {
-      const next = [...slotIds.value]
-      next[0] = id
+      if (empty >= 0) next[empty] = id
+      else next[0] = id
       setSlotIds(next)
     }
   }
@@ -411,23 +544,6 @@ function onAssign(slotIndex: number, id: string | null) {
     selectedId.value = id
     schedulePersist()
   }
-}
-
-function onAssignGroup(ids: string[]) {
-  const unique = [...new Set(ids)].filter((id) => channels.value.some((c) => c.id === id))
-  if (!unique.length) return
-  const mosaic = mosaicForCount(unique.length)
-  layout.mosaic = mosaic
-  const next = emptySlotIds()
-  for (let i = 0; i < mosaic; i++) next[i] = unique[i] ?? null
-  setSlotIds(next)
-  if (unique[0]) {
-    selectedId.value = unique[0]
-    const ch = channels.value.find((c) => c.id === unique[0])
-    if (ch) activeGroup.value = channelGroup(ch)
-  }
-  schedulePersist()
-  status.value = `已展示分组 ${unique.length} 路（${mosaic} 宫格）`
 }
 
 function onSwap(from: number, to: number) {
@@ -496,11 +612,11 @@ function onTreeMenu(
     const ids = channels.value
       .filter((c) => channelGroup(c) === payload.group && c.enabled)
       .map((c) => c.id)
-    onAssignGroup(ids)
+    replaceWallWithGroup(ids)
     return
   }
   if (action === 'displayChannels' && payload.channelIds?.length) {
-    onAssignGroup(payload.channelIds)
+    replaceWallWithGroup(payload.channelIds)
     return
   }
   if (action === 'copyUrl' && payload.channelId) {
@@ -564,12 +680,18 @@ function updateMobile() {
 
 function startPolling() {
   stopPolling()
+  let tick = 0
   pollTimer = setInterval(() => {
-    void refreshPreviews()
-    // Keep timeline fresh while browsing recordings or while host is recording
-    if (viewMode.value === 'playback' || recordingCount.value > 0) {
+    // Playback: keep timeline fresh, but do NOT re-POST mosaic preview IDs —
+    // that undoes enterPlayback()'s syncPreviews([]) and keeps host FFmpeg busy.
+    if (viewMode.value === 'playback') {
       void refreshRecordings({ silent: true })
+      return
     }
+    tick += 1
+    // Heartbeat demand ~every 10s; otherwise only GET states (no preview churn).
+    if (tick % 4 === 1) void refreshPreviews()
+    else void refreshStatesOnly()
   }, 2500)
 }
 
@@ -596,6 +718,22 @@ watch(authed, (v) => {
 async function loadPublicMeta() {
   try {
     const st = await fetchRemoteStatus()
+    // Host upgraded but browser still runs a cached remote SPA → media URLs break
+    // ("连接中" with zero requests). Force a cache-busting reload once per version.
+    if (st.version && NM_UI_VERSION && st.version !== NM_UI_VERSION) {
+      const key = `nm_ui_reload_${st.version}`
+      try {
+        if (!sessionStorage.getItem(key)) {
+          sessionStorage.setItem(key, '1')
+          const u = new URL(location.href)
+          u.searchParams.set('_v', st.version)
+          location.replace(u.href)
+          return
+        }
+      } catch {
+        /* ignore storage / navigation failures */
+      }
+    }
     if (st.username) username.value = st.username
     if (st.version) {
       appMeta.value = {
@@ -760,23 +898,14 @@ onUnmounted(() => {
           @busy="(on) => (playbackBusy = on)"
           @update:rate="(r) => (playbackRate = r)"
         />
-        <MosaicView
+        <!-- Dedicated remote live grid: always mounts <video> when slots have channels. -->
+        <RemoteLiveGrid
           v-else
           :mosaic="layout.mosaic"
           :channels="channels"
-          :states="states"
-          :selected-id="selectedId"
           :slot-ids="slotIds"
-          :layout-mode="layoutMode"
-          remote-mode
+          :selected-id="selectedId"
           @select="onSelect"
-          @assign="onAssign"
-          @assign-group="onAssignGroup"
-          @swap="onSwap"
-          @enter-playback="enterPlayback"
-          @menu="() => hostOnly()"
-          @snapshot="() => hostOnly()"
-          @save-clip="() => hostOnly()"
         />
         <template v-if="showTimelinePanel">
           <ResizeHandle
@@ -801,6 +930,7 @@ onUnmounted(() => {
             :active="viewMode === 'playback'"
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
             :follow-live-edge="timelineFollowLiveEdge"
+            :channel-recording="!!selectedId && states[selectedId]?.recording === 'recording'"
             remote-mode
             :mobile="mobile"
             @refresh="refreshRecordings"
@@ -849,6 +979,13 @@ onUnmounted(() => {
           </div>
         </dl>
         <p class="about-note">{{ appMeta.licenseNote }}</p>
+        <h3 class="about-sub">开源鸣谢</h3>
+        <ul class="credits">
+          <li v-for="item in OPEN_SOURCE_CREDITS" :key="item.url">
+            <a :href="item.url" target="_blank" rel="noopener noreferrer">{{ item.name }}</a>
+            <span v-if="item.note" class="credit-note">{{ item.note }}</span>
+          </li>
+        </ul>
         <div class="about-actions">
           <a
             v-if="appMeta.homepage"
@@ -1107,6 +1244,38 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--muted);
   line-height: 1.45;
+}
+.about-sub {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+}
+.credits {
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  max-height: min(220px, 36vh);
+  overflow: auto;
+}
+.credits li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.credits a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.credits a:hover {
+  text-decoration: underline;
+}
+.credit-note {
+  color: var(--muted);
 }
 .about-actions {
   display: flex;
