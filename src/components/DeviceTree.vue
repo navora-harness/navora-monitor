@@ -13,7 +13,13 @@ const props = defineProps<{
   groupOrder?: string[]
   /** Remote browser — hide host-only actions */
   remoteMode?: boolean
+  /** Phone drawer — larger taps; disable HTML5 reorder (fights scroll / swipe) */
+  compact?: boolean
 }>()
+
+const touchChrome = computed(() => !!props.remoteMode || !!props.compact)
+/** Desktop host only — HTML5 DnD to reorder / fill mosaic. */
+const allowHtmlDrag = computed(() => !props.remoteMode && !props.compact)
 
 const emit = defineEmits<{
   select: [id: string]
@@ -30,6 +36,8 @@ const emit = defineEmits<{
   batchStart: [ids: string[]]
   batchStop: [ids: string[]]
   rename: [id: string, name: string]
+  /** Mosaic cell dragged back onto the tree → clear that wall slot. */
+  clearSlot: [slotIndex: number]
 }>()
 
 type DropHint =
@@ -41,6 +49,8 @@ const checkedIds = ref<string[]>([])
 const dropHint = ref<DropHint | null>(null)
 const draggingKind = ref<'channel' | 'group' | null>(null)
 const draggingGroup = ref<string | null>(null)
+/** Highlight tree while a mosaic slot is dragged over it (remove-from-wall). */
+const slotDropActive = ref(false)
 const renamingId = ref<string | null>(null)
 const renameDraft = ref('')
 const renameInputRef = ref<HTMLInputElement | null>(null)
@@ -272,9 +282,14 @@ function clearDragState() {
   draggingKind.value = null
   draggingGroup.value = null
   dropHint.value = null
+  slotDropActive.value = false
 }
 
 function onChannelDragStart(e: DragEvent, ch: ChannelConfig) {
+  if (!allowHtmlDrag.value) {
+    e.preventDefault()
+    return
+  }
   const ids = dragIdsFor(ch)
   draggingKind.value = 'channel'
   draggingGroup.value = null
@@ -286,6 +301,10 @@ function onChannelDragStart(e: DragEvent, ch: ChannelConfig) {
 }
 
 function onGroupDragStart(e: DragEvent, group: string) {
+  if (!allowHtmlDrag.value) {
+    e.preventDefault()
+    return
+  }
   suppressGroupClick.value = true
   draggingKind.value = 'group'
   draggingGroup.value = group
@@ -304,13 +323,40 @@ function onDragEnd() {
   }, 0)
 }
 
-function readDragKind(e: DragEvent): 'channel' | 'group' | null {
+function readDragKind(e: DragEvent): 'channel' | 'group' | 'slot' | null {
   const t = e.dataTransfer?.types
   if (!t) return draggingKind.value
   const types = [...t]
+  // Mosaic wall cell — must win over text/channel-id also set on the same drag.
+  if (types.includes('application/x-navora-slot-index')) return 'slot'
   if (types.includes('application/x-navora-group')) return 'group'
   if (types.includes('application/x-navora-channel-ids') || types.includes('text/channel-id')) return 'channel'
   return draggingKind.value
+}
+
+function readSlotIndex(e: DragEvent): number | null {
+  const raw = e.dataTransfer?.getData('application/x-navora-slot-index')
+  if (raw == null || raw === '') return null
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 0 ? n : null
+}
+
+function acceptSlotDrag(e: DragEvent): boolean {
+  if (readDragKind(e) !== 'slot') return false
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  slotDropActive.value = true
+  return true
+}
+
+function commitSlotClear(e: DragEvent): boolean {
+  if (readDragKind(e) !== 'slot') return false
+  e.preventDefault()
+  e.stopPropagation()
+  const idx = readSlotIndex(e)
+  clearDragState()
+  if (idx != null) emit('clearSlot', idx)
+  return true
 }
 
 function readDragIds(e: DragEvent): string[] {
@@ -337,6 +383,7 @@ function edgeBefore(e: DragEvent, el: HTMLElement): boolean {
 }
 
 function onGroupDragOver(e: DragEvent, group: string) {
+  if (acceptSlotDrag(e)) return
   const kind = readDragKind(e)
   if (!kind) return
   e.preventDefault()
@@ -362,6 +409,10 @@ function nextGroupAfter(group: string): string | null {
 }
 
 function onChannelDragOver(e: DragEvent, group: string, ch: ChannelConfig) {
+  if (acceptSlotDrag(e)) {
+    e.stopPropagation()
+    return
+  }
   if (readDragKind(e) !== 'channel') return
   e.preventDefault()
   e.stopPropagation()
@@ -390,6 +441,7 @@ function onGroupDragLeave(e: DragEvent, group: string) {
 }
 
 function onGroupDrop(e: DragEvent, group: string) {
+  if (commitSlotClear(e)) return
   e.preventDefault()
   const kind = readDragKind(e)
   const hint = dropHint.value
@@ -416,6 +468,7 @@ function onGroupDrop(e: DragEvent, group: string) {
 }
 
 function onChannelDrop(e: DragEvent, group: string, ch: ChannelConfig) {
+  if (commitSlotClear(e)) return
   e.preventDefault()
   e.stopPropagation()
   if (readDragKind(e) !== 'channel') return
@@ -436,6 +489,7 @@ function onChannelDrop(e: DragEvent, group: string, ch: ChannelConfig) {
 }
 
 function onListDragOver(e: DragEvent) {
+  if (acceptSlotDrag(e)) return
   if (readDragKind(e) !== 'group') return
   e.preventDefault()
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
@@ -443,6 +497,7 @@ function onListDragOver(e: DragEvent) {
 }
 
 function onListDrop(e: DragEvent) {
+  if (commitSlotClear(e)) return
   if (readDragKind(e) !== 'group') return
   e.preventDefault()
   const moving = readDragGroup(e)
@@ -450,6 +505,21 @@ function onListDrop(e: DragEvent) {
   if (!moving) return
   emit('moveGroupBefore', moving, null)
   emit('update:activeGroup', moving)
+}
+
+function onTreeDragOver(e: DragEvent) {
+  acceptSlotDrag(e)
+}
+
+function onTreeDragLeave(e: DragEvent) {
+  const related = e.relatedTarget as Node | null
+  const current = e.currentTarget as HTMLElement | null
+  if (related && current?.contains(related)) return
+  slotDropActive.value = false
+}
+
+function onTreeDrop(e: DragEvent) {
+  commitSlotClear(e)
 }
 
 function isGroupDropBefore(group: string): boolean {
@@ -702,7 +772,14 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 </script>
 
 <template>
-  <aside class="tree" :class="{ remote: remoteMode }" @contextmenu="onTreeBlankCtx">
+  <aside
+    class="tree"
+    :class="{ remote: touchChrome, 'slot-drop': slotDropActive }"
+    @contextmenu="onTreeBlankCtx"
+    @dragover="onTreeDragOver"
+    @dragleave="onTreeDragLeave"
+    @drop="onTreeDrop"
+  >
     <div class="head" :class="{ searching: searchOpen }">
       <div class="head-main">
         <div class="head-title">
@@ -838,16 +915,16 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
         />
         <div
           class="group-head"
-          draggable="true"
+          :draggable="allowHtmlDrag"
           :title="
             isGroupLocked(bucket.name)
               ? '空分组（已折叠，不可展开）'
-              : remoteMode
-                ? '单击展开/折叠，双击展示到宫格'
+              : touchChrome
+                ? '单击展开/折叠'
                 : '单击展开/折叠，拖动调整顺序'
           "
           @click="onGroupHeaderClick(bucket.name)"
-          @dblclick.stop="onGroupHeaderDblClick(bucket.name)"
+          @dblclick.stop="remoteMode ? undefined : onGroupHeaderDblClick(bucket.name)"
           @contextmenu.stop="onGroupCtx($event, bucket.name)"
           @dragstart="onGroupDragStart($event, bucket.name)"
           @dragend="onDragEnd"
@@ -869,6 +946,15 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
           <div class="gmeta">
             <div class="gname">{{ bucket.name }}</div>
           </div>
+          <button
+            v-if="remoteMode && !isGroupLocked(bucket.name)"
+            type="button"
+            class="g-display"
+            title="展示到宫格"
+            @click.stop="onGroupHeaderDblClick(bucket.name)"
+          >
+            展示
+          </button>
           <span v-if="isCollapsed(bucket.name)" class="gbadges">
             <template v-for="meta in [groupMeta(bucket.channels)]" :key="`${bucket.name}-meta`">
               <span
@@ -896,7 +982,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
             v-for="ch in bucket.channels"
             :key="ch.id"
             class="channel"
-            :draggable="renamingId !== ch.id"
+            :draggable="allowHtmlDrag && renamingId !== ch.id"
             :class="{
               active: selectedId === ch.id,
               checked: checkedSet.has(ch.id),
@@ -905,7 +991,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
             }"
             @click="onChannelClick($event, ch)"
             @dblclick="
-              remoteMode ? emit('select', ch.id) : emit('menu', 'props', { channelId: ch.id })
+              remoteMode || compact ? emit('select', ch.id) : emit('menu', 'props', { channelId: ch.id })
             "
             @contextmenu.stop="onChannelCtx($event, ch)"
             @dragstart="onChannelDragStart($event, ch)"
@@ -972,11 +1058,34 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 
 <style scoped>
 .tree {
+  position: relative;
   display: flex;
   flex-direction: column;
   background: var(--panel);
   border-right: 1px solid var(--border);
   min-height: 0;
+}
+.tree.slot-drop {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+.tree.slot-drop::after {
+  content: '松开以移出宫格';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  pointer-events: none;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 650;
+  box-shadow: var(--shadow);
 }
 .head {
   display: flex;
@@ -1518,6 +1627,10 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 }
 
 /* Remote drawer / touch-friendly rows */
+.tree.remote {
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
 .tree.remote .row {
   padding: 10px 10px 10px 6px;
   min-height: 44px;
@@ -1525,6 +1638,22 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 .tree.remote .group-head {
   min-height: 44px;
   padding: 10px 10px;
+}
+.tree.remote .g-display {
+  flex-shrink: 0;
+  min-height: 32px;
+  padding: 0 10px;
+  margin-right: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.tree.remote .g-display:active {
+  background: color-mix(in srgb, var(--accent) 32%, var(--panel));
 }
 .tree.remote .name {
   font-size: 14px;

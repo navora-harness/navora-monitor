@@ -66,7 +66,7 @@ type MenuDef = { id: string; label: string; items: MenuItem[] }
 const openMenu = ref<string | null>(null)
 const groupOptions = computed(() => (props.groups.length ? props.groups : listGroups([])))
 
-/** Flattened overflow items for compact remote chrome. */
+/** Flattened overflow items for compact (phone) chrome. */
 const compactMoreItems = computed<MenuItem[]>(() => {
   const items: MenuItem[] = [
     ...groupOptions.value.map((g) => ({
@@ -76,6 +76,17 @@ const compactMoreItems = computed<MenuItem[]>(() => {
     })),
     { separator: true, label: '' },
     { id: 'displayGroup', label: `展示「${props.activeGroup}」` },
+  ]
+  if (!props.remoteMode) {
+    items.push(
+      { separator: true, label: '' },
+      { id: 'addChannel', label: '添加通道…' },
+      { id: 'scanDevices', label: '扫描设备…' },
+      { id: 'manageGroups', label: '管理分组…' },
+      { id: 'openSettings', label: '设置…' },
+    )
+  }
+  items.push(
     { separator: true, label: '' },
     { id: 'theme:light', label: '浅色主题', checked: props.uiTheme === 'light' },
     { id: 'theme:dark', label: '深色主题', checked: props.uiTheme === 'dark' },
@@ -83,7 +94,7 @@ const compactMoreItems = computed<MenuItem[]>(() => {
     { separator: true, label: '' },
     { id: 'openAbout', label: '关于…' },
     { id: 'logout', label: '退出登录', danger: true },
-  ]
+  )
   return items
 })
 
@@ -324,8 +335,8 @@ onUnmounted(() => document.removeEventListener('click', onDocClick))
 
 <template>
   <header class="titlebar" :class="{ remote: remoteMode, compact }">
-    <!-- Mobile remote: single focused row -->
-    <template v-if="compact && remoteMode">
+    <!-- Phone / narrow: single focused row -->
+    <template v-if="compact">
       <div class="m-bar no-drag">
         <button
           type="button"

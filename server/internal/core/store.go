@@ -121,8 +121,10 @@ type Core struct {
 	media *mediaKit
 
 	scheduleHold map[string]bool
-	listenPort   int
-	listenURLs   []string
+	// Manual recordings to resume after process/service restart (persisted).
+	remembered map[string]bool
+	listenPort int
+	listenURLs []string
 
 	shutdownOnce sync.Once
 	shutdownCh   chan struct{}
@@ -138,6 +140,7 @@ func Open(root string) (*Core, error) {
 		events:       newBroker(),
 		ws:           newWSHub(),
 		scheduleHold: map[string]bool{},
+		remembered:   map[string]bool{},
 	}
 	c.events.extra = func(event string, v any) {
 		c.ws.broadcast(event, v)
@@ -145,6 +148,7 @@ func Open(root string) (*Core, error) {
 	c.settings = c.loadSettings()
 	c.channels, c.groupOrder = c.loadChannels()
 	c.auth = c.loadAuth()
+	c.remembered = c.loadRemembered()
 	c.rec = newRecorder(c)
 	c.prev = newPreview(c)
 	c.media = newMedia(c)
@@ -635,7 +639,6 @@ func (c *Core) RemoveChannels(ids []string) ([]Channel, error) {
 		drop[id] = true
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	var next []Channel
 	for _, ch := range c.channels {
 		if !drop[ch.ID] {
@@ -644,9 +647,25 @@ func (c *Core) RemoveChannels(ids []string) ([]Channel, error) {
 	}
 	c.channels = next
 	if err := c.saveChannelsLocked(); err != nil {
+		c.mu.Unlock()
 		return nil, err
 	}
-	return append([]Channel(nil), c.channels...), nil
+	out := append([]Channel(nil), c.channels...)
+	changed := false
+	for _, id := range ids {
+		if c.remembered[id] {
+			delete(c.remembered, id)
+			changed = true
+		}
+	}
+	if changed {
+		c.saveRememberedLocked()
+	}
+	c.mu.Unlock()
+	for _, id := range ids {
+		_ = c.StopRecord(id, true)
+	}
+	return out, nil
 }
 
 func contains(ss []string, v string) bool {
