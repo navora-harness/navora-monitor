@@ -1,8 +1,8 @@
 # Build portable packages and publish a GitHub Release.
 #
 # Triggers:
-#   - Push tag v* (must match package.json version, e.g. v0.3.36)
-#   - Manual "Run workflow" (creates/updates release for package.json version)
+#   - Push tag v* (must match package.json + version.go, e.g. v0.3.36)
+#   - Manual "Run workflow" on main (creates/updates release for package.json version)
 #
 # Artifacts: NavoraMonitor-<ver>-{win,linux}-{x64,arm64}-portable.zip
 # (NSIS setup.exe is skipped on Linux runners — use local `npm run dist:go:setup`.)
@@ -26,11 +26,18 @@ jobs:
   release:
     name: Build & publish
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    # Manual runs must be from main so a feature branch cannot overwrite a version tag.
+    if: >
+      github.event_name == 'push' ||
+      github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history helps generate_release_notes find the previous tag.
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -53,6 +60,7 @@ jobs:
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved package.json version: ${VERSION}"
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
@@ -64,29 +72,87 @@ jobs:
           fi
 
           GO_VER="$(grep -E '^const Version' server/internal/core/version.go | sed -E 's/.*"([^"]+)".*/\1/')"
-          if [[ -n "${GO_VER}" && "${GO_VER}" != "${VERSION}" ]]; then
-            echo "::warning::server/internal/core/version.go is ${GO_VER}, package.json is ${VERSION}"
+          if [[ -z "${GO_VER}" ]]; then
+            echo "::error::Could not read server/internal/core/version.go"
+            exit 1
           fi
+          if [[ "${GO_VER}" != "${VERSION}" ]]; then
+            echo "::error::server/internal/core/version.go is ${GO_VER}, package.json is ${VERSION}"
+            exit 1
+          fi
+
+      - name: Cache FFmpeg downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/.ffmpeg-cache
+            vendor/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}
+          restore-keys: |
+            ffmpeg-${{ runner.os }}-
 
       - name: Fetch bundled FFmpeg
         run: node scripts/fetch-ffmpeg.mjs win-x64 win-arm64 linux-x64 linux-arm64
 
+      - name: Verify FFmpeg binaries
+        run: |
+          set -euo pipefail
+          for id in win-x64 win-arm64 linux-x64 linux-arm64; do
+            if [[ "$id" == win-* ]]; then
+              test -f "vendor/ffmpeg/${id}/ffmpeg.exe"
+            else
+              test -f "vendor/ffmpeg/${id}/ffmpeg"
+            fi
+            echo "ok ${id}"
+          done
+
       - name: Build portable packages
         run: node scripts/dist-go.mjs portable win-x64 win-arm64 linux-x64 linux-arm64
 
-      - name: List release artifacts
-        run: ls -lh release/NavoraMonitor-*-portable.zip
+      - name: Verify release artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          expected=(
+            "NavoraMonitor-${VERSION}-win-x64-portable.zip"
+            "NavoraMonitor-${VERSION}-win-arm64-portable.zip"
+            "NavoraMonitor-${VERSION}-linux-x64-portable.zip"
+            "NavoraMonitor-${VERSION}-linux-arm64-portable.zip"
+          )
+          missing=0
+          for f in "${expected[@]}"; do
+            if [[ -f "release/${f}" ]]; then
+              ls -lh "release/${f}"
+            else
+              echo "::error::Missing artifact release/${f}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: navora-monitor-${{ steps.ver.outputs.version }}-portable
+          path: release/NavoraMonitor-*-portable.zip
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: Navora Monitor ${{ steps.ver.outputs.version }}
           draft: false
           prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # Explicit paths (no glob ambiguity). Zip README notes MIT + FFmpeg GPLv3.
           files: |
-            release/NavoraMonitor-*-portable.zip
+            release/NavoraMonitor-${{ steps.ver.outputs.version }}-win-x64-portable.zip
+            release/NavoraMonitor-${{ steps.ver.outputs.version }}-win-arm64-portable.zip
+            release/NavoraMonitor-${{ steps.ver.outputs.version }}-linux-x64-portable.zip
+            release/NavoraMonitor-${{ steps.ver.outputs.version }}-linux-arm64-portable.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
