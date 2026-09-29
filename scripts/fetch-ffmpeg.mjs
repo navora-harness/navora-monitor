@@ -139,8 +139,17 @@ async function download(url, dest) {
 function extractArchive(archivePath, outDir, kind) {
   mkdirSync(outDir, { recursive: true })
   if (kind === 'zip') {
-    execFileSync('tar', ['-xf', archivePath, '-C', outDir], { stdio: 'inherit' })
-    return
+    // GNU tar often fails on BtbN Windows zips (ZIP64 / Deflate64). Prefer unzip/bsdtar.
+    const unzip = spawnSync('unzip', ['-q', '-o', archivePath, '-d', outDir], { stdio: 'inherit' })
+    if (unzip.status === 0) return
+    const bsdtar = spawnSync('bsdtar', ['-xf', archivePath, '-C', outDir], { stdio: 'inherit' })
+    if (bsdtar.status === 0) return
+    const tar = spawnSync('tar', ['-xf', archivePath, '-C', outDir], { stdio: 'inherit' })
+    if (tar.status === 0) return
+    throw new Error(
+      `Failed to extract zip ${archivePath} (tried unzip, bsdtar, tar). ` +
+        `unzip=${unzip.status} bsdtar=${bsdtar.status} tar=${tar.status}`,
+    )
   }
   const r = spawnSync('tar', ['-xJf', archivePath, '-C', outDir], { stdio: 'inherit' })
   if (r.status !== 0) {
