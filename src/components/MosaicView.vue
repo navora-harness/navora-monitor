@@ -42,6 +42,8 @@ const emit = defineEmits<{
   enterPlayback: []
   menu: [action: string, payload?: { channelId?: string; slotIndex?: number }]
   enlarged: [index: number | null]
+  /** Mosaic cell HTML5 drag started / ended — parent shows remove dock over timeline. */
+  slotDrag: [payload: { active: true; index: number } | { active: false }]
 }>()
 
 const enlargedIndex = ref<number | null>(null)
@@ -201,7 +203,7 @@ const visibleCells = computed(() => {
   if (enlargedIndex.value != null) {
     const one = list.find((c) => c.index === enlargedIndex.value)
     list = one ? [one] : list
-  } else if (props.layoutMode === 'scroll' && props.remoteMode) {
+  } else if (props.layoutMode === 'scroll') {
     const filled = list.filter((c) => c.channel)
     if (filled.length) list = filled
   }
@@ -266,12 +268,15 @@ function onCellDragStart(e: DragEvent, index: number, channel: ChannelConfig | n
   dragFromIndex.value = index
   e.dataTransfer?.setData('application/x-navora-slot-index', String(index))
   e.dataTransfer?.setData('text/channel-id', channel.id)
+  e.dataTransfer?.setData('application/x-navora-drag', 'slot')
   e.dataTransfer!.effectAllowed = 'move'
+  emit('slotDrag', { active: true, index })
 }
 
 function onCellDragEnd() {
   dragFromIndex.value = null
   dropTargetIndex.value = null
+  emit('slotDrag', { active: false })
 }
 
 function readSlotIndex(e: DragEvent): number | null {
@@ -710,8 +715,17 @@ onUnmounted(() => {
               <p class="hint">HLS 预览（H.264）。离开页面会释放播放器。H.265 在部分浏览器无法播放。</p>
             </div>
             <div v-if="digitalZoomEnabled && digitalZoom > 1" class="zoom-chip">
-              {{ digitalZoom.toFixed(1) }}× · 滚轮键还原
+              {{ digitalZoom.toFixed(1) }}×
+              <button type="button" class="zoom-reset" @click.stop="resetDigitalZoom">还原</button>
             </div>
+            <button
+              v-if="enlargedIndex === cell.index"
+              type="button"
+              class="enlarge-exit-chip"
+              @click.stop="exitEnlarge"
+            >
+              还原宫格
+            </button>
           </div>
         </template>
         <template v-else>
@@ -1037,14 +1051,48 @@ onUnmounted(() => {
   position: absolute;
   left: 10px;
   bottom: 10px;
-  z-index: 3;
-  padding: 3px 8px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgb(0 0 0 / 62%);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: auto;
+}
+.zoom-reset {
+  border: 1px solid rgb(255 255 255 / 28%);
   border-radius: 6px;
-  background: rgb(0 0 0 / 55%);
-  color: #e8edf2;
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  pointer-events: none;
+  background: rgb(255 255 255 / 12%);
+  color: #fff;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.enlarge-exit-chip {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 4;
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid rgb(255 255 255 / 28%);
+  background: rgb(59 130 246 / 35%);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  pointer-events: auto;
+}
+@media (hover: none), (pointer: coarse) {
+  .enlarge-exit-chip {
+    min-height: 44px;
+    font-size: 14px;
+  }
 }
 .osd {
   position: absolute;
@@ -1098,8 +1146,18 @@ onUnmounted(() => {
   transition: opacity 0.15s ease;
 }
 .cell:hover .osd-actions,
-.osd-actions:focus-within {
+.osd-actions:focus-within,
+.mosaic.enlarged .osd-actions {
   opacity: 1;
+}
+@media (hover: none), (pointer: coarse) {
+  .osd-actions {
+    opacity: 1;
+  }
+  .osd-btn {
+    width: 40px;
+    height: 40px;
+  }
 }
 .osd-btn {
   width: 28px;

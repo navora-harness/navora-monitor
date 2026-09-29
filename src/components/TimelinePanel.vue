@@ -92,6 +92,12 @@ let panPointerId: number | null = null
 const activePointers = new Map<number, { x: number; y: number }>()
 let pinchBaseDist = 0
 let pinching = false
+/** Document-level listeners so pointerup outside the viewport still clears pinch state. */
+let gestureGuards = false
+/** True while we intentionally releasePointerCapture to start a pinch (ignore lostpointercapture). */
+let releasingCaptureForPinch = false
+/** Touch pan: capture at most once per gesture (re-calling setPointerCapture causes 断触 on mobile). */
+let touchPanCaptured = false
 let pendingPxPerMs = 0
 let zoomRaf = 0
 /** Structural viewport fit key — channel/source/day only (not drifting range ends). */
@@ -513,8 +519,12 @@ function segmentAt(ms: number): RecordingSegment | null {
 }
 
 function emitScrub() {
+  if (gestureInFlight()) return
   const at = liveCenterMs
   const seg = segmentAt(at)
+  // Phone live mode: panning only browses the strip. Seek/load after entering 回放
+  // (or tapping a segment), so a swipe never kicks off media mid-gesture.
+  if (props.mobile && !props.active) return
   emit('activate')
   // Do NOT snap the playhead on scrub — keep user's chosen wall time.
   // Player/controller may snap media to nearest keyframe; followLock keeps UI stable.
@@ -546,11 +556,25 @@ function nearestSegmentAt(ms: number): RecordingSegment | null {
 
 function scheduleScrub(immediate = false) {
   if (scrubTimer) clearTimeout(scrubTimer)
-  // Always debounce — rapid drag-release / wheel must not stack segment loads
+  // Mobile: wait longer after finger-up so a continued swipe / pinch doesn't seek mid-gesture.
+  const delay = immediate ? (props.mobile ? 220 : 120) : props.mobile ? 480 : 280
   scrubTimer = setTimeout(() => {
     scrubTimer = null
+    // Gesture still running (lostcapture false-end recovered, or next finger down) → don't load.
+    if (panActive || pinching || activePointers.size > 0 || userGrabbing.value) return
+    if (props.scrubLocked) return
     emitScrub()
-  }, immediate ? 120 : 280)
+  }, delay)
+}
+
+function cancelPendingScrub() {
+  if (!scrubTimer) return
+  clearTimeout(scrubTimer)
+  scrubTimer = null
+}
+
+function gestureInFlight(): boolean {
+  return panActive || pinching || activePointers.size > 0 || userGrabbing.value
 }
 
 function setCenterAndScrub(ms: number, immediate = true) {
@@ -820,6 +844,122 @@ function pointerSpan(): number {
   return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
+function ensureGestureGuards() {
+  if (gestureGuards) return
+  gestureGuards = true
+  window.addEventListener('pointerup', onGesturePointerEnd, true)
+  window.addEventListener('pointercancel', onGesturePointerEnd, true)
+  window.addEventListener('pointermove', onGesturePointerMove, true)
+}
+
+function releaseGestureGuards() {
+  if (!gestureGuards) return
+  if (pinching || panActive || activePointers.size > 0) return
+  gestureGuards = false
+  window.removeEventListener('pointerup', onGesturePointerEnd, true)
+  window.removeEventListener('pointercancel', onGesturePointerEnd, true)
+  window.removeEventListener('pointermove', onGesturePointerMove, true)
+}
+
+function onGesturePointerMove(e: PointerEvent) {
+  if (!activePointers.has(e.pointerId) && panPointerId !== e.pointerId) return
+  onViewportPointerMove(e)
+}
+
+function onGesturePointerEnd(e: PointerEvent) {
+  if (!activePointers.has(e.pointerId) && panPointerId !== e.pointerId) return
+  onViewportPointerUp(e)
+  releaseGestureGuards()
+}
+
+function resetPinchState() {
+  pinching = false
+  pinchBaseDist = 0
+}
+
+function onViewportPointerDown(e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  // Allow an in-flight gesture to continue even if media becomes busy mid-way.
+  // Only block starting a brand-new interaction while locked.
+  if (props.scrubLocked && !gestureInFlight()) {
+    e.preventDefault()
+    return
+  }
+  const el = viewportRef.value
+  if (!el) return
+
+  // New contact cancels a pending seek from the previous swipe.
+  cancelPendingScrub()
+  touchPanCaptured = false
+
+  // Touch can miss pointerup outside the element after pinch releases capture,
+  // leaving ghost entries that make the next one-finger drag look like a pinch.
+  if (e.pointerType === 'touch') {
+    if (pinching && activePointers.size >= 2 && !activePointers.has(e.pointerId)) {
+      resetPinchState()
+      activePointers.clear()
+      panPointerId = null
+      panActive = false
+      panning.value = false
+    } else if (!pinching && !panActive && panPointerId == null && activePointers.size > 0) {
+      activePointers.clear()
+    }
+  }
+
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+  ensureGestureGuards()
+  suppressClick = false
+
+  if (selectMode.value) {
+    if (activePointers.size > 1) return
+    selecting.value = true
+    selectAnchorMs = clientXToMs(e.clientX)
+    selA.value = selectAnchorMs
+    selB.value = selectAnchorMs
+    panPointerId = e.pointerId
+    el.setPointerCapture(e.pointerId)
+    e.preventDefault()
+    return
+  }
+
+  if (activePointers.size >= 2) {
+    pinching = true
+    panActive = false
+    panning.value = false
+    panPointerId = null
+    touchPanCaptured = false
+    pinchBaseDist = pointerSpan()
+    userGrabbing.value = true
+    userAnchored = true
+    // Release element capture so both fingers keep delivering events; document
+    // guards still receive pointerup outside the viewport.
+    // Ignore the synchronous lostpointercapture that releasePointerCapture fires.
+    releasingCaptureForPinch = true
+    for (const id of activePointers.keys()) {
+      try {
+        el.releasePointerCapture(id)
+      } catch {
+        /* not captured */
+      }
+    }
+    releasingCaptureForPinch = false
+    e.preventDefault()
+    return
+  }
+
+  userGrabbing.value = true
+  panActive = true
+  panning.value = true
+  userAnchored = true
+  panDistance = 0
+  suppressClick = false
+  panLastX = e.clientX
+  panPointerId = e.pointerId
+  // Touch: don't capture until the gesture is clearly a one-finger drag.
+  // Capturing on pointerdown swallows the second finger and blocks pinch-zoom.
+  if (e.pointerType !== 'touch') el.setPointerCapture(e.pointerId)
+}
+
 function onWheel(e: WheelEvent) {
   e.preventDefault()
   userAnchored = true
@@ -842,60 +982,6 @@ function onWheel(e: WheelEvent) {
   zoomAt(e.clientX, zoomIn ? step : 1 / step)
 }
 
-function onViewportPointerDown(e: PointerEvent) {
-  if (e.pointerType === 'mouse' && e.button !== 0) return
-  if (props.scrubLocked) {
-    e.preventDefault()
-    return
-  }
-  const el = viewportRef.value
-  if (!el) return
-  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
-
-  if (selectMode.value) {
-    if (activePointers.size > 1) return
-    selecting.value = true
-    selectAnchorMs = clientXToMs(e.clientX)
-    selA.value = selectAnchorMs
-    selB.value = selectAnchorMs
-    panPointerId = e.pointerId
-    el.setPointerCapture(e.pointerId)
-    e.preventDefault()
-    return
-  }
-
-  if (activePointers.size >= 2) {
-    pinching = true
-    panActive = false
-    panning.value = false
-    panPointerId = null
-    pinchBaseDist = pointerSpan()
-    userGrabbing.value = true
-    userAnchored = true
-    for (const id of activePointers.keys()) {
-      try {
-        el.releasePointerCapture(id)
-      } catch {
-        /* not captured */
-      }
-    }
-    e.preventDefault()
-    return
-  }
-
-  userGrabbing.value = true
-  panActive = true
-  panning.value = true
-  userAnchored = true
-  panDistance = 0
-  suppressClick = false
-  panLastX = e.clientX
-  panPointerId = e.pointerId
-  // Touch: don't capture until the gesture is clearly a one-finger drag.
-  // Capturing on pointerdown swallows the second finger and blocks pinch-zoom.
-  if (e.pointerType !== 'touch') el.setPointerCapture(e.pointerId)
-}
-
 function onViewportPointerMove(e: PointerEvent) {
   const tracked = activePointers.get(e.pointerId)
   if (tracked) {
@@ -903,6 +989,10 @@ function onViewportPointerMove(e: PointerEvent) {
     tracked.y = e.clientY
   } else if (panPointerId !== e.pointerId) {
     return
+  }
+
+  if (pinching && activePointers.size < 2) {
+    resetPinchState()
   }
 
   if (pinching && activePointers.size >= 2) {
@@ -929,9 +1019,10 @@ function onViewportPointerMove(e: PointerEvent) {
   }
 
   if (!panActive) return
-  if (e.pointerType === 'touch' && activePointers.size === 1) {
+  if (e.pointerType === 'touch' && activePointers.size === 1 && !touchPanCaptured) {
     try {
       viewportRef.value?.setPointerCapture(e.pointerId)
+      touchPanCaptured = true
     } catch {
       /* ignore */
     }
@@ -950,8 +1041,7 @@ function onViewportPointerUp(e: PointerEvent) {
       pinchBaseDist = pointerSpan()
       return
     }
-    pinching = false
-    pinchBaseDist = 0
+    resetPinchState()
     suppressClick = true
     followLockUntil = Date.now() + 2500
     if (activePointers.size === 1) {
@@ -962,25 +1052,34 @@ function onViewportPointerUp(e: PointerEvent) {
       panning.value = true
       userGrabbing.value = true
       panDistance = 0
+      touchPanCaptured = false
+      releaseGestureGuards()
       return
     }
     panActive = false
     panning.value = false
     panPointerId = null
     userGrabbing.value = false
+    // Pinch only changes scale — never seek/load media on pinch end.
     commitCenter(liveCenterMs, 'none')
+    releaseGestureGuards()
     return
   }
 
-  if (panPointerId !== e.pointerId) return
+  if (panPointerId !== e.pointerId) {
+    releaseGestureGuards()
+    return
+  }
   const wasPanning = panActive
   panActive = false
   panning.value = false
   selecting.value = false
   panPointerId = null
   userGrabbing.value = false
+  touchPanCaptured = false
   followLockUntil = Date.now() + 2500
-  if (panDistance > 5) suppressClick = true
+  const moved = panDistance > (props.mobile ? 8 : 5)
+  if (moved) suppressClick = true
   if (transformRaf) {
     cancelAnimationFrame(transformRaf)
     transformRaf = 0
@@ -990,8 +1089,27 @@ function onViewportPointerUp(e: PointerEvent) {
   } catch {
     /* ignore */
   }
-  // Debounce media scrub — timeline stays at release position via followLock
-  commitCenter(liveCenterMs, wasPanning && !selectMode.value ? 'debounce' : 'none')
+  // Only scrub-seek after a real drag; taps on segments are handled by click.
+  // Pinch→pan handoff already returned above; this is one-finger pan release.
+  commitCenter(liveCenterMs, wasPanning && moved && !selectMode.value ? 'debounce' : 'none')
+  releaseGestureGuards()
+}
+
+function onViewportLostCapture(e: PointerEvent) {
+  if (releasingCaptureForPinch) return
+  // Safari / Chrome often fire lostpointercapture mid-gesture (pinch handoff,
+  // compositor, scroll parent). Do NOT treat that as finger-up — document
+  // guards keep tracking until real pointerup/cancel.
+  if (pinching) {
+    ensureGestureGuards()
+    return
+  }
+  if (e.pointerType === 'touch' && (panActive || activePointers.has(e.pointerId))) {
+    ensureGestureGuards()
+    return
+  }
+  if (!activePointers.has(e.pointerId) && panPointerId !== e.pointerId) return
+  onViewportPointerUp(e)
 }
 
 function onViewportPointerLeave() {
@@ -1102,18 +1220,19 @@ watch(
   () => props.scrubLocked,
   (locked) => {
     if (!locked) return
-    // Abort in-flight drag so release doesn't fire another scrub
-    if (panActive || selecting.value) {
-      panActive = false
-      panning.value = false
-      selecting.value = false
-      userGrabbing.value = false
-      panPointerId = null
-      if (scrubTimer) {
-        clearTimeout(scrubTimer)
-        scrubTimer = null
-      }
-    }
+    // Never tear down an in-flight pan/pinch — that feels like 断触 and blocks zoom.
+    // Only cancel a pending seek; new gestures stay blocked via pointerdown.
+    cancelPendingScrub()
+    if (gestureInFlight()) return
+    panActive = false
+    panning.value = false
+    selecting.value = false
+    userGrabbing.value = false
+    panPointerId = null
+    activePointers.clear()
+    resetPinchState()
+    suppressClick = true
+    releaseGestureGuards()
   },
 )
 
@@ -1325,6 +1444,16 @@ onUnmounted(() => {
   if (writingClockTimer) clearInterval(writingClockTimer)
   writingClockTimer = null
   stopLiveEdgeFollow()
+  activePointers.clear()
+  resetPinchState()
+  panActive = false
+  panPointerId = null
+  if (gestureGuards) {
+    gestureGuards = false
+    window.removeEventListener('pointerup', onGesturePointerEnd, true)
+    window.removeEventListener('pointercancel', onGesturePointerEnd, true)
+    window.removeEventListener('pointermove', onGesturePointerMove, true)
+  }
 })
 </script>
 
@@ -1449,6 +1578,7 @@ onUnmounted(() => {
           @pointerup="onViewportPointerUp"
           @pointercancel="onViewportPointerUp"
           @pointerleave="onViewportPointerLeave"
+          @lostpointercapture="onViewportLostCapture"
           @dblclick="onViewportDblClick"
         >
           <div ref="rulerLayerRef" class="ruler-layer">
@@ -1745,7 +1875,13 @@ onUnmounted(() => {
 }
 .viewport.locked {
   cursor: wait;
-  opacity: 0.85;
+  opacity: 0.92;
+}
+/* Don't dim / block the strip while the user is still dragging or pinching. */
+.viewport.panning.locked,
+.viewport.locked:active {
+  cursor: grabbing;
+  opacity: 1;
 }
 .playhead {
   position: absolute;
@@ -2188,6 +2324,7 @@ onUnmounted(() => {
   font-size: 11px;
   padding: 3px 8px;
   border-radius: 6px;
+  top: auto;
   bottom: 4px;
 }
 .timeline.mobile .hint {

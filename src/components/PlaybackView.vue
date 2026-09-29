@@ -67,6 +67,8 @@ const scrubPreview = ref(0)
 const fullscreen = ref(false)
 /** Fullscreen: bottom controls stay hidden until the pointer nears the screen edge. */
 const barPeek = ref(false)
+/** Touch / coarse pointer — avoid accidental stage tap toggles under timeline. */
+const coarsePointer = ref(false)
 let barHideTimer: ReturnType<typeof setTimeout> | null = null
 const showDebug = ref(false)
 const loadPhase = ref('idle')
@@ -548,6 +550,9 @@ watch(
 onMounted(async () => {
   bindController()
   await nextTick()
+  if (typeof window !== 'undefined' && window.matchMedia) {
+    coarsePointer.value = window.matchMedia('(hover: none), (pointer: coarse)').matches
+  }
   if (videoRef.value) {
     controller.attach(videoRef.value)
     controller.setVolume(volume.value, muted.value)
@@ -616,7 +621,12 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div class="stage" @click="segment && !liveRecording ? togglePlay() : undefined">
+    <div
+      class="stage"
+      @click="
+        segment && !liveRecording && !coarsePointer ? togglePlay() : undefined
+      "
+    >
       <video
         ref="videoRef"
         class="video"
@@ -1193,6 +1203,17 @@ onBeforeUnmount(() => {
 .scrub:hover .scrub-thumb,
 .scrub:active .scrub-thumb {
   opacity: 1;
+}
+@media (hover: none), (pointer: coarse) {
+  .scrub-thumb {
+    opacity: 1;
+    width: 16px;
+    height: 16px;
+    margin: -8px 0 0 -8px;
+  }
+  .scrub-track {
+    height: 6px;
+  }
 }
 .controls {
   display: flex;

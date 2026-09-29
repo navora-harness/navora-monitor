@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -216,13 +217,14 @@ func (c *Core) pushTimeline(id string) {
 	if c.ws == nil || id == "" || !safeChannelID(id) {
 		return
 	}
-	segs := c.ListRecordings(id)
-	saved := c.ListSaved(id)
-	fp := timelineFP(segs) + "|" + timelineFP(saved)
-	if c.ws.sameFP(id, fp) {
+	// Cheap dir fingerprint first — skip ListRecordings when nothing on disk changed.
+	dirFP := c.timelineDirFP(id)
+	if c.ws.sameFP(id, dirFP) {
 		return
 	}
-	c.ws.setFP(id, fp)
+	segs := c.ListRecordings(id)
+	saved := c.ListSaved(id)
+	c.ws.setFP(id, dirFP)
 	clients := c.ws.watchers()[id]
 	if len(clients) == 0 {
 		return
@@ -241,6 +243,39 @@ func (c *Core) pushTimeline(id string) {
 	for _, cl := range clients {
 		cl.send(msg)
 	}
+}
+
+// timelineDirFP is a lightweight name:size:mtime digest of recording/saved dirs.
+func (c *Core) timelineDirFP(id string) string {
+	var b strings.Builder
+	roots := []string{c.channelRecordDir(id), c.channelSavedDir(id)}
+	if cache := c.channelCacheDir(id); cache != "" {
+		roots = append(roots, cache)
+	}
+	for _, dir := range roots {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		b.WriteString(dir)
+		b.WriteByte('|')
+		for _, e := range entries {
+			if e.IsDir() || !isRecordingMediaFile(e.Name()) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			b.WriteString(e.Name())
+			b.WriteByte(':')
+			b.WriteString(itoa64(info.Size()))
+			b.WriteByte(':')
+			b.WriteString(itoa64(info.ModTime().UnixMilli()))
+			b.WriteByte(';')
+		}
+	}
+	return b.String()
 }
 
 func (c *Core) pushStates() {

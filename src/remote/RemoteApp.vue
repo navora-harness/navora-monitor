@@ -72,6 +72,16 @@ const status = ref('就绪')
 const loading = ref(false)
 const mobile = ref(false)
 const mobileDrawer = ref(false)
+const drawerDragX = ref(0)
+const drawerDragging = ref(false)
+let drawerSwipe: {
+  pointerId: number
+  startX: number
+  startY: number
+  width: number
+  tracking: boolean
+  decided: boolean
+} | null = null
 
 const viewMode = ref<'live' | 'playback'>('live')
 const segments = ref<RecordingSegment[]>([])
@@ -451,8 +461,11 @@ function setViewMode(mode: 'live' | 'playback') {
 }
 
 function setShowTimeline(v: boolean) {
+  // Playback always shows the timeline; don't persist a false that hides it on exit.
+  if (viewMode.value === 'playback' && !v) return
   layout.showTimeline = v
   schedulePersist()
+  if (v) void refreshRecordings()
 }
 
 function setPanelTimeline(v: number) {
@@ -575,7 +588,81 @@ function setMosaic(n: 1 | 4 | 9 | 16) {
 function setShowExplorer(v: boolean) {
   layout.showExplorer = v
   schedulePersist()
-  if (mobile.value) mobileDrawer.value = v
+  if (mobile.value) {
+    mobileDrawer.value = v
+    if (!v) {
+      drawerDragX.value = 0
+      drawerDragging.value = false
+      drawerSwipe = null
+    }
+  }
+}
+
+function onDrawerPointerDown(e: PointerEvent) {
+  if (!mobile.value || !mobileDrawer.value) return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  const t = e.target as HTMLElement | null
+  if (t?.closest('input, textarea, button, a, select, [contenteditable="true"]')) return
+  const panel = e.currentTarget as HTMLElement
+  drawerSwipe = {
+    pointerId: e.pointerId,
+    startX: e.clientX,
+    startY: e.clientY,
+    width: panel.getBoundingClientRect().width || 280,
+    tracking: false,
+    decided: false,
+  }
+  drawerDragging.value = false
+  drawerDragX.value = 0
+  try {
+    panel.setPointerCapture(e.pointerId)
+  } catch {
+    /* ignore */
+  }
+}
+
+function onDrawerPointerMove(e: PointerEvent) {
+  const s = drawerSwipe
+  if (!s || e.pointerId !== s.pointerId) return
+  const dx = e.clientX - s.startX
+  const dy = e.clientY - s.startY
+  if (!s.decided) {
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return
+    s.decided = true
+    if (dx >= -8 || Math.abs(dx) <= Math.abs(dy) * 1.15) {
+      drawerSwipe = null
+      drawerDragging.value = false
+      drawerDragX.value = 0
+      return
+    }
+    s.tracking = true
+    drawerDragging.value = true
+  }
+  if (!s.tracking) return
+  e.preventDefault()
+  drawerDragX.value = Math.min(0, dx)
+}
+
+function onDrawerPointerUp(e: PointerEvent) {
+  const s = drawerSwipe
+  if (!s || e.pointerId !== s.pointerId) return
+  const dx = drawerDragX.value
+  const shouldClose = s.tracking && (dx < -56 || dx < -s.width * 0.28)
+  drawerSwipe = null
+  drawerDragging.value = false
+  if (shouldClose) {
+    drawerDragX.value = 0
+    setShowExplorer(false)
+    return
+  }
+  drawerDragX.value = 0
+}
+
+function onDrawerPointerCancel(e: PointerEvent) {
+  if (!drawerSwipe || e.pointerId !== drawerSwipe.pointerId) return
+  drawerSwipe = null
+  drawerDragging.value = false
+  drawerDragX.value = 0
 }
 
 function setPanelExplorer(v: number) {
@@ -675,6 +762,9 @@ function updateMobile() {
   mobile.value = window.matchMedia('(max-width: 768px)').matches
   if (mobile.value) {
     mobileDrawer.value = false
+    drawerDragX.value = 0
+    drawerDragging.value = false
+    drawerSwipe = null
   }
 }
 
@@ -837,11 +927,10 @@ onUnmounted(() => {
     />
 
     <div class="body">
-      <template v-if="(!mobile && layout.showExplorer) || (mobile && mobileDrawer)">
+      <template v-if="!mobile && layout.showExplorer">
         <DeviceTree
           class="explorer"
-          :class="{ drawer: mobile }"
-          :style="mobile ? undefined : { width: `${layout.panelSizes.explorer}px` }"
+          :style="{ width: `${layout.panelSizes.explorer}px` }"
           :channels="channels"
           :states="states"
           :selected-id="selectedId"
@@ -864,7 +953,6 @@ onUnmounted(() => {
           @move-group-before="() => hostOnly()"
         />
         <ResizeHandle
-          v-if="!mobile"
           axis="horizontal"
           edge="end"
           :value="layout.panelSizes.explorer"
@@ -872,7 +960,6 @@ onUnmounted(() => {
           :max="PANEL_LIMITS.explorer.max"
           @update:value="setPanelExplorer"
         />
-        <div v-if="mobile" class="scrim" @click="mobileDrawer = false" />
       </template>
 
       <div class="center">
@@ -905,6 +992,8 @@ onUnmounted(() => {
           :channels="channels"
           :slot-ids="slotIds"
           :selected-id="selectedId"
+          :mobile="mobile"
+          :layout-mode="layoutMode"
           @select="onSelect"
         />
         <template v-if="showTimelinePanel">
@@ -946,6 +1035,46 @@ onUnmounted(() => {
             @menu="() => hostOnly()"
           />
         </template>
+      </div>
+    </div>
+
+    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true">
+      <div class="scrim" @click="setShowExplorer(false)" />
+      <div
+        class="drawer-panel"
+        :class="{ dragging: drawerDragging }"
+        :style="{
+          transform: drawerDragX ? `translate3d(${drawerDragX}px,0,0)` : undefined,
+        }"
+        @pointerdown="onDrawerPointerDown"
+        @pointermove="onDrawerPointerMove"
+        @pointerup="onDrawerPointerUp"
+        @pointercancel="onDrawerPointerCancel"
+      >
+        <DeviceTree
+          class="explorer drawer"
+          remote-mode
+          compact
+          :channels="channels"
+          :states="states"
+          :selected-id="selectedId"
+          :active-group="activeGroup"
+          :group-order="groupOrder"
+          @select="onSelect"
+          @update:active-group="setActiveGroup"
+          @menu="onTreeMenu"
+          @add="() => hostOnly()"
+          @manage-groups="() => hostOnly()"
+          @scan-devices="() => hostOnly()"
+          @batch-enable="() => hostOnly()"
+          @batch-remove="() => hostOnly()"
+          @batch-start="() => hostOnly()"
+          @batch-stop="() => hostOnly()"
+          @rename="() => hostOnly()"
+          @move-to-group="() => hostOnly()"
+          @move-channels-before="() => hostOnly()"
+          @move-group-before="() => hostOnly()"
+        />
       </div>
     </div>
 
@@ -1092,6 +1221,7 @@ onUnmounted(() => {
   background: var(--bg);
   padding-left: env(safe-area-inset-left, 0);
   padding-right: env(safe-area-inset-right, 0);
+  position: relative;
 }
 .body {
   flex: 1 1 0;
@@ -1124,6 +1254,24 @@ onUnmounted(() => {
   color: var(--accent);
   flex-shrink: 0;
 }
+.shell.mobile :deep(.titlebar) {
+  position: relative;
+  z-index: 120;
+  flex-shrink: 0;
+}
+.drawer-layer {
+  position: absolute;
+  top: calc(48px + env(safe-area-inset-top, 0px));
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  pointer-events: none;
+}
+.drawer-layer .scrim,
+.drawer-layer .drawer-panel {
+  pointer-events: auto;
+}
 .scrim {
   position: absolute;
   inset: 0;
@@ -1131,15 +1279,31 @@ onUnmounted(() => {
   z-index: 1;
   animation: fade-in 0.18s ease;
 }
-
-.shell.mobile .explorer.drawer {
+.drawer-panel {
   position: absolute;
-  inset: 0 auto 0 0;
+  top: 0;
+  bottom: 0;
+  left: 0;
   width: min(88vw, 320px);
   z-index: 2;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
   box-shadow: var(--shadow);
   animation: drawer-in 0.22s ease;
-  border-right: 1px solid var(--border);
+  will-change: transform;
+  touch-action: pan-y;
+}
+.drawer-panel.dragging {
+  animation: none;
+  transition: none;
+}
+.drawer-panel .explorer.drawer {
+  flex: 1 1 0;
+  width: 100% !important;
+  min-height: 0;
+  height: 100%;
 }
 
 @keyframes fade-in {
@@ -1152,11 +1316,11 @@ onUnmounted(() => {
 }
 @keyframes drawer-in {
   from {
-    transform: translateX(-12px);
+    transform: translate3d(-12px, 0, 0);
     opacity: 0.85;
   }
   to {
-    transform: translateX(0);
+    transform: translate3d(0, 0, 0);
     opacity: 1;
   }
 }

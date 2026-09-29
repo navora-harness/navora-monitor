@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"os"
@@ -39,10 +40,17 @@ type recorder struct {
 	sess map[string]*recSession
 	// path -> fail count for auto normalize
 	fail map[string]int
+	// path currently queued/running normalize (prevents goroutine stampede)
+	pending map[string]bool
 }
 
 func newRecorder(c *Core) *recorder {
-	return &recorder{c: c, sess: map[string]*recSession{}, fail: map[string]int{}}
+	return &recorder{
+		c:       c,
+		sess:    map[string]*recSession{},
+		fail:    map[string]int{},
+		pending: map[string]bool{},
+	}
 }
 
 var ffScan struct {
@@ -166,6 +174,9 @@ func (c *Core) StartRecord(id, reason string) (runtimeState, error) {
 		return runtimeState{}, errStr("磁盘空间不足，已禁止录像")
 	}
 	if c.rec.claimExternal(ch, reason) {
+		if reason == "manual" {
+			c.rememberRecord(id)
+		}
 		st := c.States()
 		for _, s := range st {
 			if s.ID == id {
@@ -180,6 +191,9 @@ func (c *Core) StartRecord(id, reason string) (runtimeState, error) {
 	c.mu.Lock()
 	delete(c.scheduleHold, id)
 	c.mu.Unlock()
+	if reason == "manual" {
+		c.rememberRecord(id)
+	}
 	st := c.States()
 	for _, s := range st {
 		if s.ID == id {
@@ -192,6 +206,7 @@ func (c *Core) StartRecord(id, reason string) (runtimeState, error) {
 func (c *Core) StopRecord(id string, manual bool) error {
 	c.rec.stop(id)
 	if manual {
+		c.forgetRecord(id)
 		c.mu.Lock()
 		c.scheduleHold[id] = true
 		c.mu.Unlock()
@@ -420,7 +435,32 @@ func (r *recorder) normalizeLater(path string) {
 	if !stringsHasSuffixFold(path, ".ts") {
 		return
 	}
+	if _, err := os.Stat(path + ".normed"); err == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.fail[path] >= 3 {
+		r.mu.Unlock()
+		// Permanent skip so flushAll stops re-queueing this file forever.
+		_ = os.WriteFile(path+".normed", []byte("skip"), 0o644)
+		r.mu.Lock()
+		delete(r.fail, path)
+		r.mu.Unlock()
+		return
+	}
+	if r.pending[path] {
+		r.mu.Unlock()
+		return
+	}
+	r.pending[path] = true
+	r.mu.Unlock()
+
 	go func() {
+		defer func() {
+			r.mu.Lock()
+			delete(r.pending, path)
+			r.mu.Unlock()
+		}()
 		r.c.media.withExclusive(func() {
 			if isSegmentWriting(modTimeMs(path), time.Now().UnixMilli()) {
 				return
@@ -432,6 +472,10 @@ func (r *recorder) normalizeLater(path string) {
 			fails := r.fail[path]
 			r.mu.Unlock()
 			if fails >= 3 {
+				_ = os.WriteFile(path+".normed", []byte("skip"), 0o644)
+				r.mu.Lock()
+				delete(r.fail, path)
+				r.mu.Unlock()
 				return
 			}
 			if r.c.normalizeTS(path) {
@@ -443,9 +487,37 @@ func (r *recorder) normalizeLater(path string) {
 			}
 			r.mu.Lock()
 			r.fail[path] = fails + 1
+			n := r.fail[path]
 			r.mu.Unlock()
+			if n >= 3 {
+				_ = os.WriteFile(path+".normed", []byte("skip"), 0o644)
+				r.mu.Lock()
+				delete(r.fail, path)
+				r.mu.Unlock()
+			}
 		})
 	}()
+}
+
+func (r *recorder) pruneNormalizeState() {
+	r.mu.Lock()
+	paths := make([]string, 0, len(r.fail)+len(r.pending))
+	for p := range r.fail {
+		paths = append(paths, p)
+	}
+	for p := range r.pending {
+		paths = append(paths, p)
+	}
+	r.mu.Unlock()
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			continue
+		}
+		r.mu.Lock()
+		delete(r.fail, path)
+		delete(r.pending, path)
+		r.mu.Unlock()
+	}
 }
 
 // moveFile renames within a volume and copies across volumes. The cache often
@@ -600,8 +672,142 @@ func (r *recorder) adoptAll() {
 	}
 }
 
+func (c *Core) recordingSessionPath() string {
+	return filepath.Join(c.root, "recording-session.json")
+}
+
+type recordingSessionFile struct {
+	Version    int      `json:"version"`
+	ChannelIDs []string `json:"channelIds"`
+}
+
+func (c *Core) loadRemembered() map[string]bool {
+	out := map[string]bool{}
+	b, err := os.ReadFile(c.recordingSessionPath())
+	if err != nil {
+		return out
+	}
+	var doc recordingSessionFile
+	if json.Unmarshal(b, &doc) != nil || doc.ChannelIDs == nil {
+		return out
+	}
+	for _, id := range doc.ChannelIDs {
+		id = strings.TrimSpace(id)
+		if safeChannelID(id) {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func (c *Core) saveRememberedLocked() {
+	ids := make([]string, 0, len(c.remembered))
+	for id := range c.remembered {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	doc := recordingSessionFile{Version: 1, ChannelIDs: ids}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(c.recordingSessionPath(), b)
+}
+
+func (c *Core) rememberRecord(id string) {
+	if !safeChannelID(id) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remembered == nil {
+		c.remembered = map[string]bool{}
+	}
+	if c.remembered[id] {
+		return
+	}
+	c.remembered[id] = true
+	c.saveRememberedLocked()
+}
+
+func (c *Core) forgetRecord(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remembered == nil || !c.remembered[id] {
+		return
+	}
+	delete(c.remembered, id)
+	c.saveRememberedLocked()
+}
+
+func (c *Core) forgetRecords(ids []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	changed := false
+	for _, id := range ids {
+		if c.remembered[id] {
+			delete(c.remembered, id)
+			changed = true
+		}
+	}
+	if changed {
+		c.saveRememberedLocked()
+	}
+}
+
+// resumeRemembered restarts manual recordings from recording-session.json.
+// Schedule-driven recordings are handled separately by applySchedule.
+func (c *Core) resumeRemembered() int {
+	if c.recordingBlocked() {
+		return 0
+	}
+	c.mu.Lock()
+	ids := make([]string, 0, len(c.remembered))
+	for id := range c.remembered {
+		ids = append(ids, id)
+	}
+	c.mu.Unlock()
+	if len(ids) == 0 {
+		return 0
+	}
+	known := map[string]bool{}
+	for _, ch := range c.Channels() {
+		known[ch.ID] = true
+	}
+	started := 0
+	var drop []string
+	for _, id := range ids {
+		if !known[id] {
+			drop = append(drop, id)
+			continue
+		}
+		c.mu.Lock()
+		ch, ok := c.channelByID(id)
+		c.mu.Unlock()
+		if !ok || !ch.Enabled {
+			continue
+		}
+		if c.rec.running(id) {
+			continue
+		}
+		if _, err := c.StartRecord(id, "manual"); err != nil {
+			log.Printf("resume recording %s: %v", id, err)
+			continue
+		}
+		started++
+	}
+	if len(drop) > 0 {
+		c.forgetRecords(drop)
+	}
+	if started > 0 {
+		log.Printf("resumed %d remembered recording(s)", started)
+	}
+	return started
+}
+
 func (c *Core) RunLoops() {
 	c.rec.adoptAll()
+	c.resumeRemembered()
 	flush := time.NewTicker(2 * time.Second)
 	prev := time.NewTicker(5 * time.Second)
 	sched := time.NewTicker(15 * time.Second)
@@ -631,6 +837,8 @@ func (c *Core) RunLoops() {
 		case <-sched.C:
 			c.applySchedule()
 		case <-slow.C:
+			c.resumeRemembered()
+			c.rec.pruneNormalizeState()
 			c.rec.recycle()
 			c.prev.recycle()
 			c.maybeCleanup()

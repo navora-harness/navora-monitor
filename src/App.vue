@@ -87,6 +87,21 @@ const loginUser = ref('navora')
 const loginPass = ref('')
 const loginError = ref('')
 const loggingIn = ref(false)
+/** Phone / narrow viewport — explorer becomes overlay drawer. */
+const mobile = ref(false)
+const mobileDrawer = ref(false)
+/** Finger-follow offset while swiping drawer closed (px, ≤ 0). */
+const drawerDragX = ref(0)
+const drawerDragging = ref(false)
+let mobileMq: MediaQueryList | null = null
+let drawerSwipe: {
+  pointerId: number
+  startX: number
+  startY: number
+  width: number
+  tracking: boolean
+  decided: boolean
+} | null = null
 
 const layout = reactive<UiLayoutState>(defaultUiLayout())
 let layoutTimer: ReturnType<typeof setTimeout> | null = null
@@ -104,6 +119,14 @@ let unsubStorageChanged: (() => void) | null = null
 let unsubTimeline: (() => void) | null = null
 let unsubStatesPush: (() => void) | null = null
 
+const layoutMode = computed<'grid' | 'scroll'>(() => (mobile.value ? 'scroll' : 'grid'))
+/** Taller scrub chrome on phone; scales with viewport. */
+const mobileTimelineHeight = computed(() => {
+  if (typeof window === 'undefined') return 196
+  const vh = window.innerHeight || 700
+  const base = Math.min(220, Math.max(168, vh * 0.27))
+  return Math.round(base + 28)
+})
 const selected = computed(() => channels.value.find((c) => c.id === selectedId.value) ?? null)
 const dialogChannel = computed(() => channelDraft.value ?? selected.value)
 const dialogState = computed(() => {
@@ -236,6 +259,48 @@ function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
   return 16
 }
 
+/** Which mosaic cell is currently HTML5-dragged (shows remove dock over timeline). */
+const slotDragIndex = ref<number | null>(null)
+const slotRemoveOver = ref(false)
+
+function onMosaicSlotDrag(p: { active: true; index: number } | { active: false }) {
+  if (p.active) {
+    slotDragIndex.value = p.index
+    slotRemoveOver.value = false
+  } else {
+    slotDragIndex.value = null
+    slotRemoveOver.value = false
+  }
+}
+
+function onSlotRemoveDragOver(e: DragEvent) {
+  const types = e.dataTransfer ? [...e.dataTransfer.types] : []
+  if (!types.includes('application/x-navora-slot-index') && slotDragIndex.value == null) return
+  e.preventDefault()
+  e.stopPropagation()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  slotRemoveOver.value = true
+}
+
+function onSlotRemoveDragLeave(e: DragEvent) {
+  const related = e.relatedTarget as Node | null
+  const current = e.currentTarget as HTMLElement | null
+  if (related && current?.contains(related)) return
+  slotRemoveOver.value = false
+}
+
+function onSlotRemoveDrop(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  const raw =
+    e.dataTransfer?.getData('application/x-navora-slot-index') ||
+    (slotDragIndex.value != null ? String(slotDragIndex.value) : '')
+  const idx = Number(raw)
+  slotRemoveOver.value = false
+  slotDragIndex.value = null
+  if (Number.isInteger(idx) && idx >= 0) onAssignSlot(idx, null)
+}
+
 function onAssignSlot(index: number, id: string | null) {
   const next = [...slotIds.value]
   if (!id) {
@@ -355,6 +420,21 @@ function setPanelSize(key: keyof PanelSizes, value: number) {
 
 function setMosaic(n: 1 | 4 | 9 | 16) {
   layout.mosaic = n
+  if (mobile.value) {
+    const kept = slotIds.value.slice(0, n).filter((x): x is string => !!x)
+    const next = emptySlotIds()
+    for (let i = 0; i < n; i++) next[i] = kept[i] ?? null
+    if (kept.length < n) {
+      const pool = channelsInNamedGroup(activeGroup.value)
+      let pi = 0
+      for (let i = 0; i < n; i++) {
+        if (next[i]) continue
+        while (pi < pool.length && kept.includes(pool[pi]!)) pi++
+        if (pi < pool.length) next[i] = pool[pi++]!
+      }
+    }
+    setSlotIds(next)
+  }
   scheduleSaveLayout()
   scheduleSyncPreviews()
 }
@@ -362,6 +442,93 @@ function setMosaic(n: 1 | 4 | 9 | 16) {
 function setShowExplorer(v: boolean) {
   layout.showExplorer = v
   scheduleSaveLayout()
+  if (mobile.value) {
+    mobileDrawer.value = v
+    if (!v) {
+      drawerDragX.value = 0
+      drawerDragging.value = false
+      drawerSwipe = null
+    }
+  }
+}
+
+function updateMobile() {
+  const next = window.matchMedia('(max-width: 768px)').matches
+  mobile.value = next
+  if (next) {
+    mobileDrawer.value = false
+    drawerDragX.value = 0
+    drawerDragging.value = false
+    drawerSwipe = null
+  }
+}
+
+function onDrawerPointerDown(e: PointerEvent) {
+  if (!mobile.value || !mobileDrawer.value) return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  const t = e.target as HTMLElement | null
+  if (t?.closest('input, textarea, button, a, select, [contenteditable="true"]')) return
+  const panel = e.currentTarget as HTMLElement
+  drawerSwipe = {
+    pointerId: e.pointerId,
+    startX: e.clientX,
+    startY: e.clientY,
+    width: panel.getBoundingClientRect().width || 280,
+    tracking: false,
+    decided: false,
+  }
+  drawerDragging.value = false
+  drawerDragX.value = 0
+  try {
+    panel.setPointerCapture(e.pointerId)
+  } catch {
+    /* ignore */
+  }
+}
+
+function onDrawerPointerMove(e: PointerEvent) {
+  const s = drawerSwipe
+  if (!s || e.pointerId !== s.pointerId) return
+  const dx = e.clientX - s.startX
+  const dy = e.clientY - s.startY
+  if (!s.decided) {
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return
+    s.decided = true
+    // Prefer vertical scroll inside the tree; only take over for clear left-swipe.
+    if (dx >= -8 || Math.abs(dx) <= Math.abs(dy) * 1.15) {
+      drawerSwipe = null
+      drawerDragging.value = false
+      drawerDragX.value = 0
+      return
+    }
+    s.tracking = true
+    drawerDragging.value = true
+  }
+  if (!s.tracking) return
+  e.preventDefault()
+  drawerDragX.value = Math.min(0, dx)
+}
+
+function onDrawerPointerUp(e: PointerEvent) {
+  const s = drawerSwipe
+  if (!s || e.pointerId !== s.pointerId) return
+  const dx = drawerDragX.value
+  const shouldClose = s.tracking && (dx < -56 || dx < -s.width * 0.28)
+  drawerSwipe = null
+  drawerDragging.value = false
+  if (shouldClose) {
+    drawerDragX.value = 0
+    setShowExplorer(false)
+    return
+  }
+  drawerDragX.value = 0
+}
+
+function onDrawerPointerCancel(e: PointerEvent) {
+  if (!drawerSwipe || e.pointerId !== drawerSwipe.pointerId) return
+  drawerSwipe = null
+  drawerDragging.value = false
+  drawerDragX.value = 0
 }
 
 function setShowTimeline(v: boolean) {
@@ -542,6 +709,7 @@ async function onWindowVisibility(p: { visible: boolean }) {
 
 function onSelect(id: string) {
   selectedId.value = id
+  if (mobile.value) mobileDrawer.value = false
   const singleSlot = layout.mosaic === 1 ? 0 : enlargedSlot.value
   if (singleSlot != null) placeOnSlot(id, singleSlot)
   else ensureSlot(id)
@@ -1108,6 +1276,16 @@ async function onStop(id: string) {
 }
 
 async function onStopAll() {
+  const n = recordingCount.value
+  if (
+    !window.confirm(
+      n > 0
+        ? `确定停止全部录像？\n当前正在录像 ${n} 路。`
+        : '当前没有正在录像的通道。仍要发送停止全部指令吗？',
+    )
+  ) {
+    return
+  }
   await api().stopAllRecords()
   await refreshStates()
   status.value = '已停止全部录像'
@@ -1305,7 +1483,7 @@ function onGlobalKey(e: KeyboardEvent) {
   }
   if (mod && e.key.toLowerCase() === 'e') {
     e.preventDefault()
-    setShowExplorer(!layout.showExplorer)
+    setShowExplorer(mobile.value ? !mobileDrawer.value : !layout.showExplorer)
     return
   }
   if (mod && e.key.toLowerCase() === 't') {
@@ -1455,6 +1633,9 @@ async function onQuitApp() {
 }
 
 onMounted(async () => {
+  updateMobile()
+  mobileMq = window.matchMedia('(max-width: 768px)')
+  mobileMq.addEventListener('change', updateMobile)
   try {
     const res = await fetch('/api/status')
     if (res.ok) {
@@ -1483,6 +1664,7 @@ onUnmounted(() => {
   unsubWindowVisibility?.()
   unsubMediaTeardown?.()
   systemThemeMql?.removeEventListener('change', onSystemThemeChange)
+  mobileMq?.removeEventListener('change', updateMobile)
   window.removeEventListener('keydown', onGlobalKey)
 })
 
@@ -1534,7 +1716,7 @@ watch(selectedId, (id) => {
   <div
     v-else
     class="shell"
-    :class="{ 'config-drop': configDropActive }"
+    :class="{ 'config-drop': configDropActive, mobile }"
     @contextmenu.prevent
     @dragenter="onShellDragEnter"
     @dragover="onShellDragOver"
@@ -1550,10 +1732,11 @@ watch(selectedId, (id) => {
       :ffmpeg-ok="!!info?.ffmpegOk"
       :groups="groups"
       :active-group="activeGroup"
-      :show-explorer="layout.showExplorer"
+      :show-explorer="mobile ? mobileDrawer : layout.showExplorer"
       :show-timeline="layout.showTimeline"
       :view-mode="viewMode"
       :ui-theme="appSettings.uiTheme"
+      :compact="mobile"
       @mosaic="setMosaic"
       @update:active-group="(g) => (activeGroup = g)"
       @update:show-explorer="setShowExplorer"
@@ -1664,7 +1847,7 @@ watch(selectedId, (id) => {
     />
 
     <div class="body">
-      <template v-if="layout.showExplorer">
+      <template v-if="!mobile && layout.showExplorer">
         <DeviceTree
           class="explorer"
           :style="{ width: `${layout.panelSizes.explorer}px` }"
@@ -1687,6 +1870,7 @@ watch(selectedId, (id) => {
           @batch-start="onBatchStart"
           @batch-stop="onBatchStop"
           @rename="onRenameChannel"
+          @clear-slot="(i) => onAssignSlot(i, null)"
         />
         <ResizeHandle
           axis="horizontal"
@@ -1729,6 +1913,7 @@ watch(selectedId, (id) => {
           :slot-ids="slotIds"
           :playback-suspended="!windowVisible"
           :players-enabled="playersEnabled && windowVisible"
+          :layout-mode="layoutMode"
           @select="onSelect"
           @assign="onAssignSlot"
           @assign-group="onAssignGroup"
@@ -1738,9 +1923,44 @@ watch(selectedId, (id) => {
           @enter-playback="() => enterPlayback()"
           @menu="onContextMenu"
           @enlarged="(index) => (enlargedSlot = index)"
+          @slot-drag="onMosaicSlotDrag"
         />
-        <template v-if="layout.showTimeline || viewMode === 'playback'">
+        <!-- While dragging a mosaic cell, cover the timeline with a remove dock. -->
+        <div
+          v-if="slotDragIndex != null"
+          class="slot-remove-dock"
+          :class="{
+            over: slotRemoveOver,
+            strip: !(layout.showTimeline || viewMode === 'playback'),
+          }"
+          :style="
+            layout.showTimeline || viewMode === 'playback'
+              ? { height: `${mobile ? mobileTimelineHeight : layout.panelSizes.timeline}px` }
+              : undefined
+          "
+          @dragover="onSlotRemoveDragOver"
+          @dragenter="onSlotRemoveDragOver"
+          @dragleave="onSlotRemoveDragLeave"
+          @drop="onSlotRemoveDrop"
+        >
+          <div class="slot-remove-inner">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M6 7h12M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7m-7 0v11.5A1.5 1.5 0 0 0 9.5 20h5a1.5 1.5 0 0 0 1.5-1.5V7"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <strong>移出宫格</strong>
+            <span>拖到此处松开即可移除</span>
+          </div>
+        </div>
+        <template v-else-if="layout.showTimeline || viewMode === 'playback'">
           <ResizeHandle
+            v-if="!mobile"
             axis="vertical"
             edge="start"
             :value="layout.panelSizes.timeline"
@@ -1750,7 +1970,7 @@ watch(selectedId, (id) => {
           />
           <TimelinePanel
             ref="timelineRef"
-            :height="layout.panelSizes.timeline"
+            :height="mobile ? mobileTimelineHeight : layout.panelSizes.timeline"
             :channel-id="selectedId"
             :channel-name="selected?.name ?? null"
             :segments="segments"
@@ -1764,6 +1984,7 @@ watch(selectedId, (id) => {
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
             :follow-live-edge="timelineFollowLiveEdge"
             :channel-recording="!!selectedId && states[selectedId]?.recording === 'recording'"
+            :mobile="mobile"
             @refresh="refreshRecordings"
             @save-clip="() => onSaveClip()"
             @delete-saved="onDeleteSaved"
@@ -1780,12 +2001,54 @@ watch(selectedId, (id) => {
       </div>
     </div>
 
+    <!-- Mobile drawer: shell-level overlay so video/timeline cannot paint above it. -->
+    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true">
+      <div class="scrim" @click="setShowExplorer(false)" />
+      <div
+        class="drawer-panel"
+        :class="{ dragging: drawerDragging }"
+        :style="{
+          transform: drawerDragX ? `translate3d(${drawerDragX}px,0,0)` : undefined,
+        }"
+        @pointerdown="onDrawerPointerDown"
+        @pointermove="onDrawerPointerMove"
+        @pointerup="onDrawerPointerUp"
+        @pointercancel="onDrawerPointerCancel"
+      >
+        <DeviceTree
+          class="explorer drawer"
+          compact
+          :channels="channels"
+          :states="states"
+          :selected-id="selectedId"
+          :active-group="activeGroup"
+          :group-order="groupOrder"
+          @select="onSelect"
+          @add="startAdd"
+          @manage-groups="showGroupsDialog = true"
+          @scan-devices="openScanDialog"
+          @update:active-group="(g) => (activeGroup = g)"
+          @menu="onContextMenu"
+          @move-to-group="onMoveToGroup"
+          @move-channels-before="onMoveChannelsBefore"
+          @move-group-before="onMoveGroupBefore"
+          @batch-enable="onBatchEnable"
+          @batch-remove="onBatchRemove"
+          @batch-start="onBatchStart"
+          @batch-stop="onBatchStop"
+          @rename="onRenameChannel"
+          @clear-slot="(i) => onAssignSlot(i, null)"
+        />
+      </div>
+    </div>
+
     <StatusBar
       :message="status"
       :channel-count="channels.length"
       :recording-count="recordingCount"
       :data-root="info?.recordingsPath ?? info?.dataRoot ?? ''"
       :app-version="info?.version"
+      :compact="mobile"
       :disk-label="diskSpace ? formatGbLabel(diskSpace.freeBytes) : undefined"
       :disk-used-label="diskSpace ? formatGbLabel(diskSpace.recordingsBytes) : undefined"
       :disk-saved-label="
@@ -1813,10 +2076,17 @@ watch(selectedId, (id) => {
 <style scoped>
 .shell {
   height: 100%;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   position: relative;
+}
+.shell.mobile {
+  height: 100dvh;
+  height: 100svh;
+  padding-left: env(safe-area-inset-left, 0);
+  padding-right: env(safe-area-inset-right, 0);
 }
 .shell.config-drop::after {
   content: '';
@@ -1850,12 +2120,90 @@ watch(selectedId, (id) => {
   min-height: 0;
   display: flex;
   overflow: hidden;
+  position: relative;
 }
 .explorer {
   flex: 0 0 auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+.shell.mobile :deep(.titlebar) {
+  position: relative;
+  z-index: 120;
+  flex-shrink: 0;
+}
+.drawer-layer {
+  position: absolute;
+  /* Sit under compact titlebar so the hamburger stays usable. */
+  top: calc(48px + env(safe-area-inset-top, 0px));
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  pointer-events: none;
+}
+.drawer-layer .scrim,
+.drawer-layer .drawer-panel {
+  pointer-events: auto;
+}
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: var(--mask);
+  z-index: 1;
+  animation: fade-in 0.18s ease;
+}
+.drawer-panel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(88vw, 320px);
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  animation: drawer-in 0.22s ease;
+  will-change: transform;
+  touch-action: pan-y;
+}
+.drawer-panel.dragging {
+  animation: none;
+  transition: none;
+}
+.drawer-panel .explorer.drawer {
+  flex: 1 1 0;
+  width: 100% !important;
+  min-height: 0;
+  height: 100%;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes drawer-in {
+  from {
+    transform: translate3d(-12px, 0, 0);
+    opacity: 0.85;
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+    opacity: 1;
+  }
+}
+.shell.mobile .center {
+  background: #0c1118;
+}
+.shell.mobile .center :deep(.timeline.mobile) {
+  border-top-color: color-mix(in srgb, var(--border) 80%, #000);
+  box-shadow: 0 -8px 24px rgb(0 0 0 / 28%);
 }
 .center {
   flex: 1 1 0;
@@ -1866,13 +2214,77 @@ watch(selectedId, (id) => {
   background: #1a2332;
   overflow: hidden;
 }
+.slot-remove-dock {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  min-height: 96px;
+  margin: 0;
+  border-top: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 40%, color-mix(in srgb, var(--danger) 16%, transparent), transparent),
+    color-mix(in srgb, var(--danger) 8%, var(--panel));
+  color: var(--danger);
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  animation: slot-remove-in 0.18s ease;
+}
+.slot-remove-dock.strip {
+  min-height: 72px;
+  height: 72px;
+}
+.slot-remove-dock.over {
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 40%, color-mix(in srgb, var(--danger) 28%, transparent), transparent),
+    color-mix(in srgb, var(--danger) 16%, var(--panel));
+  border-top-color: var(--danger);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--danger) 55%, transparent);
+}
+.slot-remove-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+  user-select: none;
+}
+.slot-remove-inner svg {
+  width: 28px;
+  height: 28px;
+  opacity: 0.9;
+}
+.slot-remove-inner strong {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.slot-remove-inner span {
+  font-size: 12px;
+  opacity: 0.85;
+  color: var(--muted);
+}
+.slot-remove-dock.over .slot-remove-inner span {
+  color: var(--danger);
+  opacity: 1;
+}
+@keyframes slot-remove-in {
+  from {
+    opacity: 0.55;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 .login-screen {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   background:
     radial-gradient(ellipse 80% 50% at 50% -10%, rgb(13 107 84 / 18%), transparent),
     var(--bg);
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
 }
 .login-card {
   width: min(380px, calc(100% - 32px));
@@ -1919,12 +2331,12 @@ watch(selectedId, (id) => {
   border-radius: 8px;
   background: var(--accent);
   color: #fff;
-  font-weight: 650;
+  font-weight: 600;
   cursor: pointer;
 }
 .login-card button.primary:disabled {
-  opacity: 0.5;
-  cursor: default;
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .login-error {
   margin: 0;
