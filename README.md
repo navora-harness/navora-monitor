@@ -61,19 +61,24 @@ cp portable/channels.example.json portable/channels.json     # Linux
 
 仓库工作流 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 会在打标签或手动触发时：
 
-1. 拉取各平台 FFmpeg  
-2. 交叉编译 win/linux × x64/arm64 绿色版 zip  
-3. 创建（或更新）GitHub Release 并挂上产物  
+1. 校验 `package.json` 与 `server/internal/core/version.go` 版本一致  
+2. 拉取（并缓存）各平台 FFmpeg  
+3. 交叉编译 win/linux × x64/arm64 绿色版 zip  
+4. 上传 Actions artifact，并创建/更新 GitHub Release  
 
-**打标签发布**（`package.json` / `server/internal/core/version.go` 版本需与标签一致）：
+**前提：** 工作流文件必须已在要打的标签所指向的提交上（先合并进 `main`，再打标签）。
+
+**打标签发布**（版本号三处一致：`package.json`、`version.go`、标签 `vX.Y.Z`）：
 
 ```bash
-# 例如当前版本 0.3.36
+# 例如当前版本 0.3.36（已在 main）
+git checkout main
+git pull
 git tag v0.3.36
 git push origin v0.3.36
 ```
 
-也可在 GitHub → Actions → **Release** → **Run workflow** 手动跑一遍（按 `package.json` 版本发 Release）。
+也可在 GitHub → Actions → **Release** → **Run workflow**（仅 `main`）手动跑一遍。
 
 CI 在 Linux 上跳过 NSIS 安装包；需要 `.exe` 安装包时请在 Windows 本机执行 `npm run dist:go:setup`。
 
