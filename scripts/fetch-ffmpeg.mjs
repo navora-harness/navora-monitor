@@ -14,6 +14,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
 } from 'node:fs'
@@ -65,6 +66,20 @@ const RELEASE_BASE =
   process.env.FFMPEG_RELEASE_BASE ||
   'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
 
+/** Reject truncated / empty cache entries (common after flaky CI downloads). */
+const MIN_ARCHIVE_BYTES = 5 * 1024 * 1024
+
+function authHeaders() {
+  const token = process.env.FFMPEG_GITHUB_TOKEN || process.env.GITHUB_TOKEN || ''
+  /** @type {Record<string, string>} */
+  const h = {
+    'User-Agent': 'navora-monitor-ffmpeg-fetch',
+    Accept: 'application/octet-stream',
+  }
+  if (token) h.Authorization = `Bearer ${token}`
+  return h
+}
+
 function hostBuildId() {
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
   if (process.platform === 'win32') return `win-${arch}`
@@ -79,17 +94,46 @@ function parseArgs(argv) {
   return { force, all, ids }
 }
 
+function archiveLooksValid(path) {
+  try {
+    return existsSync(path) && statSync(path).size >= MIN_ARCHIVE_BYTES
+  } catch {
+    return false
+  }
+}
+
 async function download(url, dest) {
   mkdirSync(dirname(dest), { recursive: true })
+  const tmp = `${dest}.partial`
+  rmSync(tmp, { force: true })
   console.log(`Downloading ${url}`)
-  const res = await fetch(url, { redirect: 'follow' })
-  if (!res.ok || !res.body) {
-    throw new Error(`HTTP ${res.status} for ${url}`)
+
+  let lastErr = /** @type {unknown} */ (null)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { redirect: 'follow', headers: authHeaders() })
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status} for ${url}`)
+      }
+      const file = createWriteStream(tmp)
+      await pipeline(Readable.fromWeb(res.body), file)
+      const size = statSync(tmp).size
+      if (size < MIN_ARCHIVE_BYTES) {
+        throw new Error(`Download too small (${size} bytes) for ${url}`)
+      }
+      rmSync(dest, { force: true })
+      renameSync(tmp, dest)
+      const mb = (size / 1024 / 1024).toFixed(1)
+      console.log(`  → ${dest} (${mb} MB)`)
+      return
+    } catch (e) {
+      lastErr = e
+      rmSync(tmp, { force: true })
+      console.warn(`  attempt ${attempt}/3 failed: ${e instanceof Error ? e.message : e}`)
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 1500 * attempt))
+    }
   }
-  const file = createWriteStream(dest)
-  await pipeline(Readable.fromWeb(res.body), file)
-  const mb = (statSync(dest).size / 1024 / 1024).toFixed(1)
-  console.log(`  → ${dest} (${mb} MB)`)
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 }
 
 function extractArchive(archivePath, outDir, kind) {
@@ -115,7 +159,7 @@ function findExtractedRoot(outDir) {
 async function fetchBuild(build, force) {
   const destDir = join(root, 'vendor', 'ffmpeg', build.id)
   const destBin = join(destDir, build.destName)
-  if (!force && existsSync(destBin)) {
+  if (!force && existsSync(destBin) && statSync(destBin).size > 1024 * 1024) {
     const mb = (statSync(destBin).size / 1024 / 1024).toFixed(1)
     console.log(`Skip ${build.id} (exists, ${mb} MB). Use --force to re-download.`)
     return
@@ -123,17 +167,32 @@ async function fetchBuild(build, force) {
 
   mkdirSync(cacheDir, { recursive: true })
   const archivePath = join(cacheDir, build.asset)
-  if (force || !existsSync(archivePath)) {
+  const needDownload = force || !archiveLooksValid(archivePath)
+  if (needDownload) {
+    if (existsSync(archivePath) && !archiveLooksValid(archivePath)) {
+      console.warn(`Discarding corrupt/partial cache ${archivePath}`)
+      rmSync(archivePath, { force: true })
+    }
     await download(`${RELEASE_BASE}/${build.asset}`, archivePath)
   } else {
-    console.log(`Using cache ${archivePath}`)
+    console.log(`Using cache ${archivePath} (${(statSync(archivePath).size / 1024 / 1024).toFixed(1)} MB)`)
   }
 
   const tmp = join(extractRoot, build.id)
   rmSync(tmp, { recursive: true, force: true })
   mkdirSync(tmp, { recursive: true })
   console.log(`Extracting ${build.asset}`)
-  extractArchive(archivePath, tmp, build.archive)
+  try {
+    extractArchive(archivePath, tmp, build.archive)
+  } catch (e) {
+    // Corrupt cache → wipe and retry once.
+    console.warn(`Extract failed for ${build.id}, re-downloading…`)
+    rmSync(archivePath, { force: true })
+    rmSync(tmp, { recursive: true, force: true })
+    mkdirSync(tmp, { recursive: true })
+    await download(`${RELEASE_BASE}/${build.asset}`, archivePath)
+    extractArchive(archivePath, tmp, build.archive)
+  }
 
   const packRoot = findExtractedRoot(tmp)
   const binSrc = join(packRoot, ...build.bin.split('/'))
@@ -175,6 +234,7 @@ async function main() {
 
   mkdirSync(join(root, 'vendor', 'ffmpeg'), { recursive: true })
   for (const id of selected) {
+    console.log(`--- FFmpeg ${id} ---`)
     await fetchBuild(BUILDS[id], force)
   }
   console.log('Done.')

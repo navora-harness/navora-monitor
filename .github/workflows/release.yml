@@ -81,17 +81,23 @@ jobs:
             exit 1
           fi
 
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y xz-utils
+
       - name: Cache FFmpeg downloads
         uses: actions/cache@v4
         with:
           path: |
             vendor/.ffmpeg-cache
             vendor/ffmpeg
-          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}
+          key: ffmpeg-v2-${{ runner.os }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}
           restore-keys: |
+            ffmpeg-v2-${{ runner.os }}-
             ffmpeg-${{ runner.os }}-
 
       - name: Fetch bundled FFmpeg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/fetch-ffmpeg.mjs win-x64 win-arm64 linux-x64 linux-arm64
 
       - name: Verify FFmpeg binaries
