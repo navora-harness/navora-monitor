@@ -57,6 +57,26 @@ cp portable/channels.example.json portable/channels.json     # Linux
 
 产物在 `release/`（如 `NavoraMonitor-<ver>-win-x64-portable.zip`）。打包前请先 `ffmpeg:fetch` / `ffmpeg:fetch:all`。Windows 安装包需要本机安装 [NSIS](https://nsis.sourceforge.io/Download)（`makensis`）。
 
+## GitHub Actions 自动发布
+
+仓库工作流 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 会在打标签或手动触发时：
+
+1. 拉取各平台 FFmpeg  
+2. 交叉编译 win/linux × x64/arm64 绿色版 zip  
+3. 创建（或更新）GitHub Release 并挂上产物  
+
+**打标签发布**（`package.json` / `server/internal/core/version.go` 版本需与标签一致）：
+
+```bash
+# 例如当前版本 0.3.36
+git tag v0.3.36
+git push origin v0.3.36
+```
+
+也可在 GitHub → Actions → **Release** → **Run workflow** 手动跑一遍（按 `package.json` 版本发 Release）。
+
+CI 在 Linux 上跳过 NSIS 安装包；需要 `.exe` 安装包时请在 Windows 本机执行 `npm run dist:go:setup`。
+
 ## 开源协议
 
 本仓库源代码采用 [MIT License](./LICENSE)。
