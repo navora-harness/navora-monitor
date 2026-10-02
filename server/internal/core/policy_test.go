@@ -132,9 +132,34 @@ func TestTimelineCapsCopiedMtime(t *testing.T) {
 	if deref(out[0].EndMs) != start+333_000 {
 		t.Fatalf("inflated end not capped: %d", deref(out[0].EndMs)-start)
 	}
-	gotStart, gotEnd := estimateSegmentBounds(&start, start+3_404_000, nil, 300, 65_000_000, start+7_000_000)
-	if gotEnd-gotStart > 400_000 {
-		t.Fatalf("copied mtime still stretches the bar: %d", gotEnd-gotStart)
+	// Tiny file with a much-later mtime (cross-volume copy): bitrate too low → no stretch.
+	_, gotEnd := estimateSegmentBounds(&start, start+3_404_000, nil, 300, 2_000_000, start+7_000_000)
+	if gotEnd-start > 400_000 {
+		t.Fatalf("copied mtime still stretches the bar: %d", gotEnd-start)
+	}
+}
+
+func TestEstimateSegmentBoundsLongRealFile(t *testing.T) {
+	start := int64(1_700_000_000_000)
+	// ~1.1 GiB written for ~85 minutes — typical when ffmpeg waits on keyframes.
+	mtime := start + 85*60_000
+	now := mtime + 3600_000
+	_, gotEnd := estimateSegmentBounds(&start, mtime, nil, 300, 1_200_000_000, now)
+	if gotEnd-start < 80*60_000 {
+		t.Fatalf("long real segment capped too aggressively: %d", gotEnd-start)
+	}
+}
+
+func TestRetentionCutoffLocal(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Date(2026, 10, 2, 21, 45, 0, 0, loc)
+	cut := retentionCutoffLocal(3, now)
+	want := time.Date(2026, 9, 30, 0, 0, 0, 0, loc)
+	if !cut.Equal(want) {
+		t.Fatalf("retention 3 days cut=%v want=%v", cut, want)
+	}
+	if !retentionCutoffLocal(1, now).Equal(time.Date(2026, 10, 2, 0, 0, 0, 0, loc)) {
+		t.Fatal("retention 1 day should be start of today")
 	}
 }
 
@@ -151,6 +176,14 @@ func TestEstimateSegmentBounds(t *testing.T) {
 	}
 	if !cachedRangePlausible(start, start+200_000, 2_000_000, 2_000_000, 300) {
 		t.Fatal("matching cache should hit")
+	}
+	// Short-capped cache on a huge file must miss so wall clock can re-estimate.
+	if cachedRangePlausible(start, start+300_000, 1_200_000_000, 1_200_000_000, 300) {
+		t.Fatal("short cache on huge file should miss")
+	}
+	// Long real-duration cache must remain usable.
+	if !cachedRangePlausible(start, start+85*60_000, 1_200_000_000, 1_200_000_000, 300) {
+		t.Fatal("long real cache should hit")
 	}
 }
 

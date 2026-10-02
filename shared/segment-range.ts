@@ -30,6 +30,7 @@ function durationFitsSize(durationMs: number, sizeBytes: number | null | undefin
   // Tiny files claiming multi-hour duration are also suspicious
   if (durationMs > 3600_000 && sizeBytes < 64_000) return false
   // Very long duration with tiny bitrate (< ~80 kbps) — typical bogus MPEG-TS probe
+  // or a short clip whose mtime was rewritten long after it closed.
   if (durationMs > 30 * 60_000 && bps < 10_000) return false
   return true
 }
@@ -83,7 +84,8 @@ export function estimateSegmentBounds(opts: {
       return { startMs, endMs: startMs + probed }
     }
 
-    // Fallback: wall clock (mtime − filename start)
+    // Fallback: wall clock (mtime − filename start).
+    // durationFitsSize rejects late-copy mtimes that imply absurd bitrates.
     if (wallMs != null && durationFitsSize(wallMs, size)) {
       return { startMs, endMs: startMs + wallMs }
     }

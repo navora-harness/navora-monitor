@@ -93,13 +93,24 @@ func (c *Core) computeDisk() DiskInfo {
 	}
 	var need *float64
 	fit := true
-	if rate > 0 && s.RetentionDays > 0 {
-		v := rate * float64(s.RetentionDays) * 86400
-		need = &v
-		if v > float64(free) {
-			fit = false
-			if level == "ok" {
-				level = "warn"
+	if s.RetentionDays > 0 {
+		var v float64
+		if rate > 0 {
+			v = rate * float64(s.RetentionDays) * 86400
+		}
+		// Short-window write rate underestimates when cameras idle or when
+		// already-retained footage is denser than the last few minutes.
+		// Floor against bytes currently on disk so capacity perception matches reality.
+		if float64(recBytes) > v {
+			v = float64(recBytes)
+		}
+		if v > 0 {
+			need = &v
+			if v > float64(free) {
+				fit = false
+				if level == "ok" {
+					level = "warn"
+				}
 			}
 		}
 	}
@@ -173,7 +184,7 @@ func (c *Core) maybeCleanup() {
 		c.cleanupUntil(cleanupTargetFreeBytes(s.DiskWarnFreeGb, s.DiskStopFreeGb))
 	}
 	if s.RetentionDays > 0 {
-		c.cleanupOlderThan(time.Duration(s.RetentionDays) * 24 * time.Hour)
+		c.cleanupOlderThanDays(s.RetentionDays)
 	}
 }
 
@@ -184,6 +195,7 @@ func (c *Core) cleanupUntil(target int64) {
 	files := c.loopFiles()
 	var deleted int
 	var freed uint64
+	nowMs := time.Now().UnixMilli()
 	for _, f := range files {
 		free, _, err := diskUsage(c.recordingsRoot())
 		if err != nil || int64(free) >= target {
@@ -191,6 +203,9 @@ func (c *Core) cleanupUntil(target int64) {
 		}
 		st, err := os.Stat(f)
 		if err != nil {
+			continue
+		}
+		if isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
 			continue
 		}
 		if os.Remove(f) == nil {
@@ -205,13 +220,25 @@ func (c *Core) cleanupUntil(target int64) {
 	}
 }
 
-func (c *Core) cleanupOlderThan(age time.Duration) {
-	cut := time.Now().Add(-age)
+func (c *Core) cleanupOlderThanDays(days int) {
+	cut := retentionCutoffLocal(days, time.Now())
+	if cut.IsZero() {
+		return
+	}
 	var deleted int
 	var freed uint64
+	nowMs := time.Now().UnixMilli()
 	for _, f := range c.loopFiles() {
 		st, err := os.Stat(f)
-		if err != nil || st.ModTime().After(cut) {
+		if err != nil {
+			continue
+		}
+		if isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
+			continue
+		}
+		// Match timeline perception: age by filename stamp (content start),
+		// not mtime — long segments and remux can keep mtime "fresh".
+		if !recordingContentTime(f, st.ModTime()).Before(cut) {
 			continue
 		}
 		if os.Remove(f) == nil {
@@ -279,7 +306,7 @@ func (c *Core) RunCleanup() DiskInfo {
 	s := c.Settings()
 	c.cleanupUntil(cleanupTargetFreeBytes(s.DiskWarnFreeGb, s.DiskStopFreeGb))
 	if s.RetentionDays > 0 {
-		c.cleanupOlderThan(time.Duration(s.RetentionDays) * 24 * time.Hour)
+		c.cleanupOlderThanDays(s.RetentionDays)
 	}
 	return c.Disk()
 }

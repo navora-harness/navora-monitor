@@ -59,6 +59,18 @@ describe('estimateSegmentBounds', () => {
     expect(r.endMs - r.startMs).toBe(2 * 3600_000)
   })
 
+  it('does not stretch a tiny copied file with a late mtime', () => {
+    const r = estimateSegmentBounds({
+      parsedStartMs: start,
+      mtimeMs: start + 3_404_000,
+      probedDurationMs: null,
+      segmentTimeSec: 300,
+      sizeBytes: 2_000_000,
+      nowMs: start + 7_000_000,
+    })
+    expect(r.endMs - r.startMs).toBeLessThanOrEqual(400_000)
+  })
+
   it('uses probed multi-hour duration when the file data says so', () => {
     const r = estimateSegmentBounds({
       parsedStartMs: start,

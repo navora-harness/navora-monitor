@@ -645,12 +645,13 @@ onUnmounted(() => document.removeEventListener('click', onDocClick))
         <span v-if="remoteMode" class="remote-tag no-drag">远程</span>
 
         <button
+          v-if="remoteMode"
           type="button"
           class="logout-btn no-drag"
-          :title="remoteMode ? '退出登录' : '退出程序'"
-          @click="remoteMode ? emit('logout') : emit('quitApp')"
+          title="退出登录"
+          @click="emit('logout')"
         >
-          退出
+          退出登录
         </button>
       </div>
     </template>

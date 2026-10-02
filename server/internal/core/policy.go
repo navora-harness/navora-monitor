@@ -428,6 +428,8 @@ func durationFitsSize(durationMs, sizeBytes int64) bool {
 	if durationMs > 3_600_000 && sizeBytes < 64_000 {
 		return false
 	}
+	// Very long duration with tiny bitrate (< ~80 kbps) — typical bogus MPEG-TS probe
+	// or a short clip whose mtime was rewritten long after it closed.
 	if durationMs > 30*60_000 && bps < 10_000 {
 		return false
 	}
@@ -466,9 +468,9 @@ func estimateSegmentBounds(parsedStart *int64, mtimeMs int64, probed *int64, seg
 		if hasProbe {
 			return start, start + probe
 		}
-		// A copy or remux long after the segment closed updates mtime and
-		// stretches the bar. Trust wall clock only within the segment window.
-		if hasWall && wall <= nominal*5/2 && durationFitsSize(wall, sizeBytes) {
+		// Fallback: wall clock (mtime − filename start), same as shared/segment-range.ts.
+		// durationFitsSize rejects late-copy mtimes that imply absurd bitrates.
+		if hasWall && durationFitsSize(wall, sizeBytes) {
 			return start, start + wall
 		}
 		end := start + nominal
@@ -520,13 +522,35 @@ func cachedRangePlausible(start, end, cachedSize, sizeBytes int64, segmentTimeSe
 	if rateFloor > floor {
 		floor = rateFloor
 	}
+	// Invalidate old "capped to ~segmentTime" entries for large files so
+	// ListRecordings re-estimates from wall clock / size.
 	if dur <= softMax && sizeBytes >= floor && dur <= nominal*115/100 {
 		return false
 	}
-	// Cross-volume copy and timestamp repair rewrite mtime, which used to
-	// cache a multi-hour end on a five-minute file.
-	if dur > softMax {
-		return false
-	}
 	return true
+}
+
+// retentionCutoffLocal is the earliest local wall time that may be kept when
+// RetentionDays = days. days=3 on Oct 2 keeps from Sep 30 00:00 local onward
+// (today + previous days-1 calendar days).
+func retentionCutoffLocal(days int, now time.Time) time.Time {
+	if days <= 0 {
+		return time.Time{}
+	}
+	loc := now.Location()
+	y, m, d := now.In(loc).Date()
+	startToday := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	if days == 1 {
+		return startToday
+	}
+	return startToday.AddDate(0, 0, -(days - 1))
+}
+
+// recordingContentTime returns the best-effort content timestamp for retention.
+// Prefer filename stamp (matches timeline), else mtime.
+func recordingContentTime(path string, mod time.Time) time.Time {
+	if start, ok := parseSegmentStartMs(filepath.Base(path)); ok && start > 0 {
+		return time.UnixMilli(start)
+	}
+	return mod
 }
