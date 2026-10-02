@@ -19,6 +19,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [id: string]
   enlarged: [index: number | null]
+  hevcUnsupported: []
 }>()
 
 const enlargedIndex = ref<number | null>(null)
@@ -201,7 +202,13 @@ onUnmounted(() => {
             </svg>
           </button>
         </div>
-        <MpegtsPlayer v-if="cell.src" :key="cell.src" :src="cell.src" :muted="true" />
+        <MpegtsPlayer
+          v-if="cell.src"
+          :key="cell.src"
+          :src="cell.src"
+          :muted="true"
+          @hevc-unsupported="emit('hevcUnsupported')"
+        />
         <div v-else class="ph">{{ cell.id ? '无预览地址' : '空位' }}</div>
       </div>
     </div>

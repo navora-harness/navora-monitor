@@ -225,6 +225,8 @@ export type NavoraMonitorApi = {
   startPreview: (id: string) => Promise<StartPreviewResult>
   stopPreview: (id: string) => Promise<ChannelRuntimeState>
   syncPreviews: (ids: string[]) => Promise<ChannelRuntimeState[]>
+  /** Tell the host this browser cannot play HEVC in MSE so preview is transcoded to H.264. */
+  reportClientCaps: (caps: { hevcMse: boolean }) => Promise<{ ok: boolean; previewTranscodeH264?: boolean }>
   listRecordings: (channelId?: string) => Promise<RecordingSegment[]>
   listSavedClips: (channelId?: string) => Promise<RecordingSegment[]>
   preparePlaybackMedia: (opts: {

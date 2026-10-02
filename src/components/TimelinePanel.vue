@@ -54,9 +54,13 @@ const emit = defineEmits<{
   exportRange: [payload: { channelId: string; startMs: number; endMs: number; pickPath?: boolean }]
 }>()
 
-const MIN_PX_PER_MS = 8 / (24 * 60 * 60 * 1000) // ~8px / day
-const MAX_PX_PER_MS = 120 / 1000 // 120px / second
+const MIN_PX_PER_MS = 4 / (24 * 60 * 60 * 1000) // ~4px / day (whole week on a phone)
+const MAX_PX_PER_MS = 240 / 1000 // 240px / second (fine scrub)
 const DEFAULT_PX_PER_MS = 48 / 60_000 // 48px / minute
+/** Minimum on-screen gap between labeled major ticks (px). */
+const MIN_TICK_LABEL_GAP_PX = 56
+/** Mobile: slightly wider so labels don't collide on narrow screens. */
+const MIN_TICK_LABEL_GAP_MOBILE_PX = 72
 
 const dayFilter = ref('')
 const autoNext = ref(true)
@@ -98,6 +102,8 @@ let gestureGuards = false
 let releasingCaptureForPinch = false
 /** Touch pan: capture at most once per gesture (re-calling setPointerCapture causes 断触 on mobile). */
 let touchPanCaptured = false
+/** True after a real finger/mouse up that should seek — cleared if a new gesture starts. */
+let scrubOnRelease = false
 let pendingPxPerMs = 0
 let zoomRaf = 0
 /** Structural viewport fit key — channel/source/day only (not drifting range ends). */
@@ -228,17 +234,18 @@ const centerLabel = computed(() => formatSegmentClock(centerMs.value, true))
 
 const zoomLabel = computed(() => {
   const ppm = pxPerMs.value
-  const pxPerMin = ppm * 60_000
-  if (pxPerMin >= 80) return `${Math.round(ppm * 1000)}px/s`
-  if (pxPerMin >= 8) return `${Math.round(pxPerMin)}px/分`
-  const pxPerHour = ppm * 3_600_000
-  if (pxPerHour >= 8) return `${Math.round(pxPerHour)}px/时`
-  return `${Math.round(ppm * 86_400_000)}px/天`
+  const span = viewSpanMs.value
+  if (span <= 15_000) return `约 ${Math.max(1, Math.round(span / 1000))} 秒`
+  if (span <= 90_000) return `约 ${Math.round(span / 1000)} 秒`
+  if (span <= 90 * 60_000) return `约 ${Math.round(span / 60_000)} 分钟`
+  if (span <= 36 * 60 * 60_000) return `约 ${(span / 3_600_000).toFixed(span < 6 * 3600_000 ? 1 : 0)} 小时`
+  return `约 ${(span / 86_400_000).toFixed(1)} 天`
 })
 
 type Tick = { ms: number; label: string; major: boolean; x: number }
 
 const TICK_STEPS_MS = [
+  500,
   1_000,
   2_000,
   5_000,
@@ -257,25 +264,63 @@ const TICK_STEPS_MS = [
   6 * 60 * 60_000,
   12 * 60 * 60_000,
   24 * 60 * 60_000,
+  2 * 24 * 60 * 60_000,
+  7 * 24 * 60 * 60_000,
 ]
 
 function pickTickStep(spanMs: number, widthPx: number): number {
-  const target = (spanMs / Math.max(widthPx, 1)) * 72
+  // Aim for readable spacing; mobile needs a bit more room for labels.
+  const targetPx = props.mobile ? 88 : 72
+  const target = (spanMs / Math.max(widthPx, 1)) * targetPx
   for (const step of TICK_STEPS_MS) {
     if (step >= target) return step
   }
   return TICK_STEPS_MS[TICK_STEPS_MS.length - 1]!
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+
+/** Tick label that adapts to the current step (and day boundaries). */
 function formatTickLabel(ms: number, stepMs: number): string {
   const d = new Date(ms)
-  const p = (n: number) => String(n).padStart(2, '0')
+  const month = pad2(d.getMonth() + 1)
+  const day = pad2(d.getDate())
+  const hh = pad2(d.getHours())
+  const mm = pad2(d.getMinutes())
+  const ss = pad2(d.getSeconds())
+  const atMidnight = d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0
+  const atHour = d.getMinutes() === 0 && d.getSeconds() === 0
+
   if (stepMs >= 24 * 60 * 60_000) {
-    return `${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    return `${month}-${day}`
   }
-  if (stepMs >= 60 * 60_000) return `${p(d.getHours())}:00`
-  if (stepMs >= 60_000) return `${p(d.getHours())}:${p(d.getMinutes())}`
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  if (stepMs >= 60 * 60_000) {
+    // Multi-hour span: show date on midnight, otherwise hour.
+    if (atMidnight) return `${month}-${day}`
+    return `${hh}:00`
+  }
+  if (stepMs >= 60_000) {
+    if (atMidnight) return `${month}-${day} ${hh}:${mm}`
+    if (atHour) return `${hh}:00`
+    return `${hh}:${mm}`
+  }
+  if (stepMs >= 10_000) {
+    // Tens of seconds: HH:mm:ss, but drop hour noise when zoomed into a minute.
+    if (atHour && d.getSeconds() === 0) return `${hh}:${mm}`
+    return `${hh}:${mm}:${ss}`
+  }
+  // Sub-10s: emphasize seconds; keep mm:ss for context.
+  if (d.getSeconds() === 0 && d.getMilliseconds() === 0) return `${hh}:${mm}:${ss}`
+  return `${mm}:${ss}`
+}
+
+function majorTickEvery(stepMs: number): number {
+  if (stepMs >= 60_000) return 1
+  if (stepMs >= 10_000) return 3
+  if (stepMs >= 1_000) return 5
+  return 4
 }
 
 type BlockView = {
@@ -316,16 +361,33 @@ const ticks = computed(() => {
   const end = range.end + pad
   const first = Math.floor(start / step) * step
   const out: Tick[] = []
-  const majorEvery = step >= 60_000 ? 1 : step >= 10_000 ? 6 : 5
+  const majorEvery = majorTickEvery(step)
+  const labelGap = props.mobile ? MIN_TICK_LABEL_GAP_MOBILE_PX : MIN_TICK_LABEL_GAP_PX
+  let lastLabelX = -Infinity
   let i = 0
   for (let t = first; t <= end + step; t += step, i++) {
+    const x = (t - origin) * ppm
+    const wantMajor = i % majorEvery === 0
+    // Promote day/hour boundaries to major when nearby minors would otherwise dominate.
+    const d = new Date(t)
+    const boundaryBoost =
+      step < 60 * 60_000 &&
+      d.getMinutes() === 0 &&
+      d.getSeconds() === 0 &&
+      (step >= 60_000 || d.getMilliseconds() === 0)
+    const major = wantMajor || boundaryBoost
+    let label = ''
+    if (major && x - lastLabelX >= labelGap) {
+      label = formatTickLabel(t, step)
+      lastLabelX = x
+    }
     out.push({
       ms: t,
-      label: formatTickLabel(t, step),
-      major: i % majorEvery === 0,
-      x: (t - origin) * ppm,
+      label,
+      major,
+      x,
     })
-    if (out.length > 240) break
+    if (out.length > 320) break
   }
   return out
 })
@@ -520,6 +582,10 @@ function segmentAt(ms: number): RecordingSegment | null {
 
 function emitScrub() {
   if (gestureInFlight()) return
+  // Only seek after an intentional release armed by pointerup — never from
+  // lostpointercapture / mid-drag state churn (common on mobile WebKit).
+  if (!scrubOnRelease) return
+  scrubOnRelease = false
   const at = liveCenterMs
   const seg = segmentAt(at)
   // Phone live mode: panning only browses the strip. Seek/load after entering 回放
@@ -557,20 +623,28 @@ function nearestSegmentAt(ms: number): RecordingSegment | null {
 function scheduleScrub(immediate = false) {
   if (scrubTimer) clearTimeout(scrubTimer)
   // Mobile: wait longer after finger-up so a continued swipe / pinch doesn't seek mid-gesture.
-  const delay = immediate ? (props.mobile ? 220 : 120) : props.mobile ? 480 : 280
+  const delay = immediate ? (props.mobile ? 280 : 120) : props.mobile ? 560 : 280
   scrubTimer = setTimeout(() => {
     scrubTimer = null
     // Gesture still running (lostcapture false-end recovered, or next finger down) → don't load.
-    if (panActive || pinching || activePointers.size > 0 || userGrabbing.value) return
-    if (props.scrubLocked) return
+    if (panActive || pinching || activePointers.size > 0 || userGrabbing.value) {
+      scrubOnRelease = false
+      return
+    }
+    if (props.scrubLocked) {
+      scrubOnRelease = false
+      return
+    }
     emitScrub()
   }, delay)
 }
 
 function cancelPendingScrub() {
-  if (!scrubTimer) return
-  clearTimeout(scrubTimer)
-  scrubTimer = null
+  if (scrubTimer) {
+    clearTimeout(scrubTimer)
+    scrubTimer = null
+  }
+  scrubOnRelease = false
 }
 
 function gestureInFlight(): boolean {
@@ -579,6 +653,7 @@ function gestureInFlight(): boolean {
 
 function setCenterAndScrub(ms: number, immediate = true) {
   followLockUntil = Date.now() + 1200
+  scrubOnRelease = true
   commitCenter(ms, immediate ? 'immediate' : 'debounce')
 }
 
@@ -706,7 +781,50 @@ function onActivateClick() {
 }
 
 function clampZoom(v: number) {
-  return Math.min(MAX_PX_PER_MS, Math.max(MIN_PX_PER_MS, v))
+  const w = Math.max(120, viewportW.value)
+  // Keep at least ~1.5s on screen at max zoom so fine scrub stays controllable.
+  const maxPpm = Math.max(MAX_PX_PER_MS, w / 1500)
+  return Math.min(maxPpm, Math.max(MIN_PX_PER_MS, v))
+}
+
+/** Prefer the calendar day that contains `ms` so live "now" isn't an empty filter. */
+function syncDayFilterToWall(ms: number) {
+  const key = formatSegmentDayKey(ms)
+  if (dayOptions.value.includes(key)) {
+    if (dayFilter.value !== key) dayFilter.value = key
+    return
+  }
+  // No clips that day — show every day so older bars still sit left of "now".
+  if (dayFilter.value) dayFilter.value = ''
+}
+
+/**
+ * Live strip: playhead = now, zoom so today's (or unfiltered) footage fills
+ * the left half. Switching back from playback used to keep a historical day
+ * filter + zoom, so the track looked empty.
+ */
+function enterLiveStrip() {
+  followLockUntil = 0
+  userAnchored = false
+  const now = Date.now()
+  syncDayFilterToWall(now)
+  void nextTick(() => {
+    measureViewport()
+    const range = dataRange.value
+    const w = Math.max(120, viewportW.value)
+    if (!range) {
+      pxPerMs.value = DEFAULT_PX_PER_MS
+      commitCenter(now, 'none')
+      viewFittedKey = structuralFitKey(false)
+    } else {
+      const past = Math.max(30 * 60_000, now - range.start)
+      pxPerMs.value = clampZoom(w / (past * 2.12))
+      commitCenter(now, 'none')
+      viewFittedKey = structuralFitKey(true)
+    }
+    if (!props.active && props.followLiveEdge) startLiveEdgeFollow()
+    else if (props.active || !props.followLiveEdge) stopLiveEdgeFollow()
+  })
 }
 
 function measureViewport() {
@@ -973,12 +1091,14 @@ function onWheel(e: WheelEvent) {
       panActive = false
       userGrabbing.value = false
       followLockUntil = Date.now() + 2500
-      commitCenter(liveCenterMs, 'debounce')
+      // Desktop trackpad pan: seek after scroll settles. Mobile rarely gets wheel.
+      scrubOnRelease = !props.mobile
+      commitCenter(liveCenterMs, props.mobile ? 'none' : 'debounce')
     }, 120)
     return
   }
   const zoomIn = e.deltaY < 0
-  const step = props.mobile ? 1.2 : 1.12
+  const step = props.mobile ? 1.28 : 1.18
   zoomAt(e.clientX, zoomIn ? step : 1 / step)
 }
 
@@ -999,8 +1119,9 @@ function onViewportPointerMove(e: PointerEvent) {
     const dist = pointerSpan()
     if (pinchBaseDist > 24 && dist > 24) {
       let factor = dist / pinchBaseDist
-      factor = Math.min(1.4, Math.max(1 / 1.4, factor))
-      if (Math.abs(factor - 1) > 0.01) {
+      // Allow a wider per-frame zoom step so pinch reaches the new limits faster.
+      factor = Math.min(1.55, Math.max(1 / 1.55, factor))
+      if (Math.abs(factor - 1) > 0.008) {
         zoomAt(e.clientX, factor)
         pinchBaseDist = dist
       }
@@ -1020,6 +1141,15 @@ function onViewportPointerMove(e: PointerEvent) {
 
   if (!panActive) return
   if (e.pointerType === 'touch' && activePointers.size === 1 && !touchPanCaptured) {
+    // Wait for a real drag before capture — capturing on the first pixel
+    // often fires lostpointercapture and used to arm a false scrub.
+    if (panDistance + Math.abs(e.clientX - panLastX) < 6) {
+      const dx0 = e.clientX - panLastX
+      panLastX = e.clientX
+      panDistance += Math.abs(dx0)
+      schedulePaint(liveCenterMs - dx0 / pxPerMs.value)
+      return
+    }
     try {
       viewportRef.value?.setPointerCapture(e.pointerId)
       touchPanCaptured = true
@@ -1061,6 +1191,7 @@ function onViewportPointerUp(e: PointerEvent) {
     panPointerId = null
     userGrabbing.value = false
     // Pinch only changes scale — never seek/load media on pinch end.
+    scrubOnRelease = false
     commitCenter(liveCenterMs, 'none')
     releaseGestureGuards()
     return
@@ -1091,7 +1222,9 @@ function onViewportPointerUp(e: PointerEvent) {
   }
   // Only scrub-seek after a real drag; taps on segments are handled by click.
   // Pinch→pan handoff already returned above; this is one-finger pan release.
-  commitCenter(liveCenterMs, wasPanning && moved && !selectMode.value ? 'debounce' : 'none')
+  const shouldScrub = wasPanning && moved && !selectMode.value
+  scrubOnRelease = shouldScrub
+  commitCenter(liveCenterMs, shouldScrub ? 'debounce' : 'none')
   releaseGestureGuards()
 }
 
@@ -1100,7 +1233,9 @@ function onViewportLostCapture(e: PointerEvent) {
   // Safari / Chrome often fire lostpointercapture mid-gesture (pinch handoff,
   // compositor, scroll parent). Do NOT treat that as finger-up — document
   // guards keep tracking until real pointerup/cancel.
-  if (pinching) {
+  // Mobile: always ignore lostcapture as release — it is the main cause of
+  // "drag without lifting already starts loading".
+  if (props.mobile || e.pointerType === 'touch' || pinching) {
     ensureGestureGuards()
     return
   }
@@ -1277,11 +1412,8 @@ watch(
       stopLiveEdgeFollow()
       return
     }
-    // Preview just started (or timeline shown again): snap to now and keep following.
-    followLockUntil = 0
-    userAnchored = false
-    commitCenter(Date.now(), 'none')
-    startLiveEdgeFollow()
+    // Preview just started (or timeline shown again): snap to today/now.
+    enterLiveStrip()
   },
 )
 
@@ -1292,15 +1424,10 @@ watch(
       stopLiveEdgeFollow()
       return
     }
-    // Leaving playback → live: always snap playhead to "now".
-    // (Previously we only resumed when already within 20s — scrubbing history
-    // then exiting left userAnchored=true and tickLiveEdge never caught up.)
+    // Leaving playback → live: restore today's strip under "now".
+    // Keeping the playback day filter + zoom left the track empty.
     if (was && !on) {
-      followLockUntil = 0
-      userAnchored = false
-      commitCenter(Date.now(), 'none')
-      if (props.followLiveEdge) startLiveEdgeFollow()
-      else stopLiveEdgeFollow()
+      enterLiveStrip()
       return
     }
     if (props.followLiveEdge) startLiveEdgeFollow()
@@ -1591,7 +1718,7 @@ onUnmounted(() => {
                 :style="{ left: `${t.x}px` }"
               >
                 <i class="mark" />
-                <span v-if="t.major" class="lab">{{ t.label }}</span>
+                <span v-if="t.label" class="lab">{{ t.label }}</span>
               </span>
             </div>
           </div>
@@ -1993,7 +2120,7 @@ onUnmounted(() => {
   overflow: hidden;
   flex-shrink: 0;
   will-change: transform;
-  contain: layout style;
+  contain: style;
 }
 .ruler {
   position: relative;
@@ -2028,6 +2155,10 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
   white-space: nowrap;
+  letter-spacing: 0.01em;
+  max-width: 7.5em;
+  overflow: hidden;
+  text-overflow: clip;
 }
 .track {
   position: relative;
@@ -2045,7 +2176,7 @@ onUnmounted(() => {
   left: 0;
   width: 0;
   will-change: transform;
-  contain: layout style;
+  contain: style;
   z-index: 2;
 }
 .grid-layer {
@@ -2054,7 +2185,7 @@ onUnmounted(() => {
   z-index: 1;
   will-change: transform;
   pointer-events: none;
-  contain: layout style;
+  contain: style;
 }
 .grid {
   position: absolute;

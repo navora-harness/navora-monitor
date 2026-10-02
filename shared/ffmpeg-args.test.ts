@@ -92,6 +92,16 @@ describe('buildMpegtsPreviewArgs', () => {
     expect(args).not.toContain('h264_mp4toannexb')
     expect(args.at(-1)).toBe('pipe:1')
   })
+
+  it('can transcode preview to H.264 for browsers without HEVC MSE', () => {
+    const args = buildMpegtsPreviewArgs({
+      inputUrl: 'rtsp://cam/stream',
+      transcodeH264: true,
+    })
+    expect(args).toContain('libx264')
+    expect(args).toContain('zerolatency')
+    expect(args).not.toContain('copy')
+  })
 })
 
 describe('buildFmp4PlaybackRemuxArgs', () => {

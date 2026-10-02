@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import mpegts from 'mpegts.js'
+import { isHevcMseError } from '@shared/hevc-mse'
 
 type LivePlayer = {
   attachMediaElement: (el: HTMLMediaElement) => void
@@ -21,6 +22,10 @@ const props = defineProps<{
   paused?: boolean
   /** Live low-latency vs VOD (recording playback). Default true. */
   isLive?: boolean
+}>()
+
+const emit = defineEmits<{
+  hevcUnsupported: []
 }>()
 
 defineExpose({
@@ -204,8 +209,12 @@ function attach(src: string | null) {
       errorBackoffMs = 800
       if (!props.paused) void player.play().catch(() => undefined)
 
-      player.on(mpegts.Events.ERROR, () => {
+      player.on(mpegts.Events.ERROR, (...args: unknown[]) => {
         if (!live || destroying) return
+        if (isHevcMseError(...args)) {
+          emit('hevcUnsupported')
+          return
+        }
         const url = props.src
         clearErrorTimer()
         const delay = errorBackoffMs

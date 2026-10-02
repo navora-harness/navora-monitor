@@ -44,6 +44,7 @@ const emit = defineEmits<{
   enlarged: [index: number | null]
   /** Mosaic cell HTML5 drag started / ended — parent shows remove dock over timeline. */
   slotDrag: [payload: { active: true; index: number } | { active: false }]
+  hevcUnsupported: []
 }>()
 
 const enlargedIndex = ref<number | null>(null)
@@ -707,12 +708,13 @@ onUnmounted(() => {
               :paused="isPaused(cell.channel.id) || !!playbackSuspended"
               :is-live="true"
               :style="digitalZoomEnabled ? digitalZoomStyle : undefined"
+              @hevc-unsupported="emit('hevcUnsupported')"
             />
             <div v-else class="placeholder">
               <p v-if="cell.state?.preview === 'error'">{{ cell.state.previewError || '预览失败' }}</p>
               <p v-else-if="remoteMode || liveSrcById">等待通道…</p>
               <p v-else>等待预览…</p>
-              <p class="hint">HLS 预览（H.264）。离开页面会释放播放器。H.265 在部分浏览器无法播放。</p>
+              <p class="hint">实时预览。H.265 在未安装 HEVC 扩展的 Windows 10 上会自动转成 H.264。</p>
             </div>
             <div v-if="digitalZoomEnabled && digitalZoom > 1" class="zoom-chip">
               {{ digitalZoom.toFixed(1) }}×

@@ -1,5 +1,6 @@
 import type { NavoraMonitorApi } from '@shared/ipc-types'
 import { sanitizeUiLayout } from '@shared/panel-sizes'
+import { browserSupportsHevcMse } from '@shared/hevc-mse'
 import { requestPick, requestReveal } from './dialogs'
 
 const LAYOUT_KEY = 'navora-web-layout-v1'
@@ -363,7 +364,13 @@ export function createMonitorApi(): NavoraMonitorApi {
     },
     async syncPreviews(ids) {
       previewIds = ids.slice(0, 16)
-      return post('/api/previews', { channelIds: previewIds })
+      return post('/api/previews', {
+        channelIds: previewIds,
+        hevcMse: browserSupportsHevcMse(),
+      })
+    },
+    async reportClientCaps(caps) {
+      return post('/api/client-caps', caps)
     },
     async listRecordings(channelId) {
       const q = channelId ? `?channelId=${encodeURIComponent(channelId)}` : ''

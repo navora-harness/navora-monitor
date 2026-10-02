@@ -295,7 +295,7 @@ func buildSegmentRecordArgs(inputURL, outputPattern, title, transport string, se
 	return args
 }
 
-func buildMpegtsPreviewArgs(inputURL, transport string) []string {
+func buildMpegtsPreviewArgs(inputURL, transport string, transcodeH264 bool) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
 		"-fflags", "nobuffer+genpts+discardcorrupt",
@@ -311,10 +311,27 @@ func buildMpegtsPreviewArgs(inputURL, transport string) []string {
 		}
 		args = append(args, "-rtsp_transport", transport)
 	}
+	args = append(args, "-i", inputURL, "-an")
+	if transcodeH264 {
+		args = append(args,
+			"-vf", `scale=w=min(1280\,iw):h=-2`,
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+			"-profile:v", "high",
+			"-pix_fmt", "yuv420p",
+			"-bf", "0",
+			"-g", "50",
+			"-keyint_min", "25",
+			"-sc_threshold", "0",
+			"-b:v", "2500k",
+			"-maxrate", "3000k",
+			"-bufsize", "1500k",
+		)
+	} else {
+		args = append(args, "-c:v", "copy")
+	}
 	args = append(args,
-		"-i", inputURL,
-		"-an",
-		"-c:v", "copy",
 		"-f", "mpegts",
 		"-mpegts_flags", "+resend_headers",
 		"-muxdelay", "0",

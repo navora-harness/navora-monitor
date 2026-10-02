@@ -12,6 +12,7 @@ import {
 } from '@shared/panel-sizes'
 import type { DiskSpaceInfo, StorageAction } from '@shared/ipc-types'
 import { formatDurationLabel, formatGbLabel } from '@shared/storage-policy'
+import { browserSupportsHevcMse } from '@shared/hevc-mse'
 import TitleBar from './components/TitleBar.vue'
 import DeviceTree from './components/DeviceTree.vue'
 import MosaicView from './components/MosaicView.vue'
@@ -1360,6 +1361,18 @@ async function onPreviewStop(id: string) {
   status.value = `已停止预览：${id}`
 }
 
+let hevcTranscodeRequested = false
+function onHevcUnsupported() {
+  if (hevcTranscodeRequested) return
+  hevcTranscodeRequested = true
+  void api()
+    .reportClientCaps({ hevcMse: false })
+    .then(() => scheduleSyncPreviews())
+    .catch(() => {
+      hevcTranscodeRequested = false
+    })
+}
+
 async function onSnapshot(channelId: string, dataUrl: string) {
   const res = await api().saveSnapshot(channelId, dataUrl)
   status.value = res.ok ? `截图已保存：${res.path}` : `截图失败：${res.error}`
@@ -1571,6 +1584,11 @@ async function bootApp() {
   await refreshStates()
   await refreshRecordings()
   await refreshDiskSpace()
+  try {
+    await api().reportClientCaps({ hevcMse: browserSupportsHevcMse() })
+  } catch {
+    /* preview still starts; player error path can request transcode */
+  }
   // Only sync live previews when the window is actually shown.
   if (windowVisible.value) scheduleSyncPreviews()
   else void api().syncPreviews([])
@@ -1924,6 +1942,7 @@ watch(selectedId, (id) => {
           @menu="onContextMenu"
           @enlarged="(index) => (enlargedSlot = index)"
           @slot-drag="onMosaicSlotDrag"
+          @hevc-unsupported="onHevcUnsupported"
         />
         <!-- While dragging a mosaic cell, cover the timeline with a remove dock. -->
         <div

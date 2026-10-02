@@ -71,11 +71,11 @@ cp portable/channels.example.json portable/channels.json     # Linux
 **打标签发布**（版本号三处一致：`package.json`、`version.go`、标签 `vX.Y.Z`）：
 
 ```bash
-# 例如当前版本 0.3.37（已在 main）
+# 例如当前版本 0.3.38（已在 main）
 git checkout main
 git pull
-git tag v0.3.37
-git push origin v0.3.37
+git tag v0.3.38
+git push origin v0.3.38
 ```
 
 也可在 GitHub → Actions → **Release** → **Run workflow**（仅 `main`）手动跑一遍。

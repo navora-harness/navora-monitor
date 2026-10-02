@@ -71,7 +71,7 @@ func TestScheduleOvernight(t *testing.T) {
 }
 
 func TestHlsAndRecordArgs(t *testing.T) {
-	live := strings.Join(buildMpegtsPreviewArgs("rtsp://cam/stream", "tcp"), " ")
+	live := strings.Join(buildMpegtsPreviewArgs("rtsp://cam/stream", "tcp", false), " ")
 	for _, want := range []string{"-f mpegts", "+resend_headers", "pipe:1", "-an", "-c:v copy"} {
 		if !strings.Contains(live, want) {
 			t.Fatalf("mpegts preview args missing %s\n%s", want, live)
@@ -92,6 +92,15 @@ func TestHlsAndRecordArgs(t *testing.T) {
 	norm := strings.Join(buildNormalizeTsArgs("a.ts", "b.ts", true), " ")
 	if !strings.Contains(norm, "setts=ts=PTS-STARTPTS") {
 		t.Fatal("normalize args")
+	}
+	x264 := strings.Join(buildMpegtsPreviewArgs("rtsp://cam/stream", "tcp", true), " ")
+	for _, want := range []string{"libx264", "zerolatency", "scale=w=min(1280"} {
+		if !strings.Contains(x264, want) {
+			t.Fatalf("h264 preview args missing %s\n%s", want, x264)
+		}
+	}
+	if strings.Contains(x264, "-c:v copy") {
+		t.Fatalf("h264 preview still copies:\n%s", x264)
 	}
 }
 

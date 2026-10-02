@@ -38,6 +38,9 @@ type Settings struct {
 	RemotePort            int     `json:"remotePort"`
 	RemoteUsername        string  `json:"remoteUsername"`
 	RemotePassword        string  `json:"remotePassword"`
+	// PreviewTranscodeH264 forces live preview through libx264 so browsers
+	// without HEVC MSE (Windows 10 Edge without the HEVC pack) can play.
+	PreviewTranscodeH264 bool `json:"previewTranscodeH264"`
 }
 
 func defaultSettings() Settings {
@@ -125,6 +128,9 @@ type Core struct {
 	remembered map[string]bool
 	listenPort int
 	listenURLs []string
+
+	// Set when any browser reports HEVC MSE is unavailable.
+	previewNeedH264 bool
 
 	shutdownOnce sync.Once
 	shutdownCh   chan struct{}
@@ -561,9 +567,13 @@ func (c *Core) UpdateSettings(next Settings) (Settings, error) {
 	c.settings = next
 	err := c.saveSettingsLocked()
 	s := c.settings
+	needRestart := prev.PreviewTranscodeH264 != next.PreviewTranscodeH264
 	c.mu.Unlock()
 	if err != nil {
 		return Settings{}, err
+	}
+	if needRestart {
+		c.prev.restartCodecMismatch()
 	}
 	if pw != "" {
 		if err = c.SetPassword(pw); err != nil {

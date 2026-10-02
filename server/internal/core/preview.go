@@ -158,6 +158,7 @@ type prevSession struct {
 	lastHit  time.Time
 	starting bool
 	live     *livePipe
+	h264     bool
 }
 
 type previewMgr struct {
@@ -168,6 +169,41 @@ type previewMgr struct {
 
 func newPreview(c *Core) *previewMgr {
 	return &previewMgr{c: c, sess: map[string]*prevSession{}}
+}
+
+func (c *Core) previewH264() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.settings.PreviewTranscodeH264 || c.previewNeedH264
+}
+
+func (c *Core) NoteNeedPreviewH264() {
+	c.mu.Lock()
+	already := c.previewNeedH264
+	c.previewNeedH264 = true
+	c.mu.Unlock()
+	if !already {
+		c.prev.restartCodecMismatch()
+	}
+}
+
+func (p *previewMgr) restartCodecMismatch() {
+	if p == nil {
+		return
+	}
+	want := p.c.previewH264()
+	p.mu.Lock()
+	var ids []string
+	for id, s := range p.sess {
+		if s != nil && s.h264 != want {
+			ids = append(ids, id)
+		}
+	}
+	p.mu.Unlock()
+	for _, id := range ids {
+		p.stop(id)
+		_ = p.start(id)
+	}
 }
 
 func (p *previewMgr) hit(id string) {
@@ -255,7 +291,8 @@ func (p *previewMgr) start(id string) error {
 		}
 	}
 	pipe := newLivePipe()
-	p.sess[id] = &prevSession{started: time.Now(), lastHit: time.Now(), starting: true, live: pipe}
+	h264 := p.c.previewH264()
+	p.sess[id] = &prevSession{started: time.Now(), lastHit: time.Now(), starting: true, live: pipe, h264: h264}
 	p.mu.Unlock()
 
 	failReserve := func(err error) error {
@@ -285,7 +322,7 @@ func (p *previewMgr) start(id string) error {
 	if ch.PreviewURL != "" {
 		input = ch.PreviewURL
 	}
-	args := buildMpegtsPreviewArgs(input, ch.RtspTransport)
+	args := buildMpegtsPreviewArgs(input, ch.RtspTransport, h264)
 	cmd := exec.Command(bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

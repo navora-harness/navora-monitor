@@ -110,10 +110,17 @@ export function fetchStates() {
   return request<{ states: ChannelRuntimeState[] }>('/api/states')
 }
 
-export function syncPreviews(channelIds: string[]) {
+export function syncPreviews(channelIds: string[], hevcMse?: boolean) {
   return request<{ ok: true; states: ChannelRuntimeState[] }>('/api/previews', {
     method: 'POST',
-    json: { channelIds },
+    json: { channelIds, hevcMse },
+  })
+}
+
+export function reportClientCaps(caps: { hevcMse: boolean }) {
+  return request<{ ok: true; previewTranscodeH264?: boolean }>('/api/client-caps', {
+    method: 'POST',
+    json: caps,
   })
 }
 

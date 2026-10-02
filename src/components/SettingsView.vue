@@ -657,6 +657,14 @@ onUnmounted(() => {
                   <button type="button" @click="pickFfmpeg">浏览</button>
                 </div>
               </div>
+              <label class="check block">
+                <input v-model="draft.previewTranscodeH264" type="checkbox" />
+                <span>预览转码为 H.264（兼容未安装 HEVC 扩展的 Windows 10 / 旧浏览器）</span>
+              </label>
+              <p class="hint">
+                摄像头若是 H.265，Edge 在 Windows 10 上通常无法直接硬解（需微软商店「HEVC 视频扩展」）。开启后由主机把预览转成
+                H.264，录像仍保持原始编码。会占用主机 CPU。浏览器若检测不到 HEVC 也会自动启用。
+              </p>
             </section>
 
             <section v-show="cat === 'remote'">

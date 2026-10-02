@@ -271,10 +271,20 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		c.ClearPreviewWant(body.ID)
 		c.prev.stop(body.ID)
 		writeJSON(w, 200, c.stateByID(body.ID))
+	case r.URL.Path == "/api/client-caps" && r.Method == http.MethodPost:
+		var caps struct {
+			HevcMse *bool `json:"hevcMse"`
+		}
+		_ = readJSON(r, &caps)
+		if caps.HevcMse != nil && !*caps.HevcMse {
+			c.NoteNeedPreviewH264()
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "previewTranscodeH264": c.previewH264()})
 	case r.URL.Path == "/api/previews" && r.Method == http.MethodPost:
 		s, _ := c.authRequest(r)
 		var body struct {
 			ChannelIDs []string `json:"channelIds"`
+			HevcMse    *bool    `json:"hevcMse"`
 		}
 		_ = readJSON(r, &body)
 		if len(body.ChannelIDs) > 16 {
@@ -283,6 +293,9 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		token := cookieToken(r)
 		_ = s
 		c.TouchPreviews(token, body.ChannelIDs)
+		if body.HevcMse != nil && !*body.HevcMse {
+			c.NoteNeedPreviewH264()
+		}
 		writeJSON(w, 200, c.States())
 	case r.URL.Path == "/api/recordings" && r.Method == http.MethodGet:
 		list := c.ListRecordings(r.URL.Query().Get("channelId"))

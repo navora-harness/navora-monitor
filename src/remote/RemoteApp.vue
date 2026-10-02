@@ -9,6 +9,7 @@ import {
   type UiLayoutState,
 } from '@shared/panel-sizes'
 import { REMOTE_USERNAME } from '@shared/password'
+import { browserSupportsHevcMse } from '@shared/hevc-mse'
 import TitleBar from '../components/TitleBar.vue'
 import DeviceTree from '../components/DeviceTree.vue'
 import RemoteLiveGrid from './RemoteLiveGrid.vue'
@@ -31,6 +32,7 @@ import {
   syncPreviews,
   withMediaAuth,
   withSegmentMediaAuth,
+  reportClientCaps,
   type RemoteAppMeta,
 } from './api'
 import { buildRemoteLivePreviewUrl } from '../media-url'
@@ -310,7 +312,7 @@ function replaceWallWithGroup(ids: string[]) {
 async function refreshPreviews() {
   if (!authed.value) return
   try {
-    const res = await syncPreviews(activeSlotIds())
+    const res = await syncPreviews(activeSlotIds(), browserSupportsHevcMse())
     applyStates(res.states)
     if (status.value.startsWith('同步失败')) status.value = '就绪'
   } catch (e) {
@@ -334,6 +336,17 @@ async function refreshStatesOnly() {
       return
     }
   }
+}
+
+let hevcTranscodeRequested = false
+function onHevcUnsupported() {
+  if (hevcTranscodeRequested) return
+  hevcTranscodeRequested = true
+  void reportClientCaps({ hevcMse: false })
+    .then(() => scheduleSync())
+    .catch(() => {
+      hevcTranscodeRequested = false
+    })
 }
 
 function scheduleSync() {
@@ -366,6 +379,11 @@ async function bootstrap() {
     }
     // Always (re)fill when wall has no live cells — remote must show video tags.
     if (activeSlotIds().length === 0) fillSlotsFromGroup()
+    try {
+      await reportClientCaps({ hevcMse: browserSupportsHevcMse() })
+    } catch {
+      /* player error path can still request transcode */
+    }
     scheduleSync()
     authed.value = true
     const n = activeSlotIds().length
@@ -995,6 +1013,7 @@ onUnmounted(() => {
           :mobile="mobile"
           :layout-mode="layoutMode"
           @select="onSelect"
+          @hevc-unsupported="onHevcUnsupported"
         />
         <template v-if="showTimelinePanel">
           <ResizeHandle

@@ -85,6 +85,11 @@ export type AppSettings = {
   remoteUsername: string
   /** Password for remote user (empty → auto-generate when enabling) */
   remotePassword: string
+  /**
+   * Live preview: transcode to H.264 instead of stream-copy.
+   * Required for browsers without HEVC MSE (Windows 10 Edge without HEVC extensions).
+   */
+  previewTranscodeH264: boolean
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -111,6 +116,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   remotePort: 8780,
   remoteUsername: 'navora',
   remotePassword: '',
+  previewTranscodeH264: false,
 }
 
 export function sanitizeSettings(raw: Partial<AppSettings> | null | undefined): AppSettings {
@@ -156,5 +162,6 @@ export function sanitizeSettings(raw: Partial<AppSettings> | null | undefined): 
         : base.remotePort,
     remoteUsername: sanitizeRemoteUsername(raw.remoteUsername),
     remotePassword: typeof raw.remotePassword === 'string' ? raw.remotePassword : base.remotePassword,
+    previewTranscodeH264: raw.previewTranscodeH264 === true,
   }
 }
