@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -26,13 +27,14 @@ func newWSHub() *wsHub {
 }
 
 type wsClient struct {
-	conn  net.Conn
-	br    *bufio.Reader
-	mu    sync.Mutex
-	out   chan []byte
-	done  chan struct{}
-	once  sync.Once
-	watch string
+	conn    net.Conn
+	br      *bufio.Reader
+	mu      sync.Mutex
+	writeMu sync.Mutex
+	out     chan []byte
+	done    chan struct{}
+	once    sync.Once
+	watch   string
 }
 
 func (h *wsHub) add(conn net.Conn, br *bufio.Reader) *wsClient {
@@ -49,11 +51,19 @@ func (h *wsHub) add(conn net.Conn, br *bufio.Reader) *wsClient {
 }
 
 func (h *wsHub) remove(cl *wsClient) {
-	cl.once.Do(func() { close(cl.done) })
+	cl.close()
 	h.mu.Lock()
 	delete(h.client, cl)
 	h.mu.Unlock()
-	_ = cl.conn.Close()
+}
+
+// Closing the transport wakes both loops and lets the browser reconnect and
+// request a fresh snapshot, including after an overflowing send queue.
+func (cl *wsClient) close() {
+	cl.once.Do(func() {
+		close(cl.done)
+		_ = cl.conn.Close()
+	})
 }
 
 func (h *wsHub) watchers() map[string][]*wsClient {
@@ -105,10 +115,21 @@ func (cl *wsClient) send(b []byte) {
 	case <-cl.done:
 	case cl.out <- b:
 	default:
+		cl.close()
 	}
 }
 
+func (cl *wsClient) write(opcode byte, payload []byte) error {
+	cl.writeMu.Lock()
+	defer cl.writeMu.Unlock()
+	if err := cl.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	return writeWSFrame(cl.conn, opcode, payload)
+}
+
 func (cl *wsClient) writeLoop() {
+	defer cl.close()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
@@ -119,16 +140,12 @@ func (cl *wsClient) writeLoop() {
 			if !ok {
 				return
 			}
-			cl.mu.Lock()
-			err := writeWSFrame(cl.conn, 1, msg)
-			cl.mu.Unlock()
+			err := cl.write(1, msg)
 			if err != nil {
 				return
 			}
 		case <-ping.C:
-			cl.mu.Lock()
-			err := writeWSFrame(cl.conn, 9, nil)
-			cl.mu.Unlock()
+			err := cl.write(9, nil)
 			if err != nil {
 				return
 			}
@@ -162,6 +179,7 @@ func (c *Core) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
+	go func() { <-r.Context().Done(); _ = conn.Close() }()
 	cl := c.ws.add(conn, bufrw.Reader)
 	defer c.ws.remove(cl)
 	go cl.writeLoop()
@@ -178,9 +196,9 @@ func (c *Core) readWS(cl *wsClient) {
 		case 8:
 			return
 		case 9:
-			cl.mu.Lock()
-			_ = writeWSFrame(cl.conn, 10, payload)
-			cl.mu.Unlock()
+			if err := cl.write(10, payload); err != nil {
+				return
+			}
 		case 10:
 		case 1:
 			var msg struct {
@@ -195,10 +213,7 @@ func (c *Core) readWS(cl *wsClient) {
 			cl.watch = id
 			cl.mu.Unlock()
 			if id != "" {
-				c.ws.mu.Lock()
-				delete(c.ws.fp, id)
-				c.ws.mu.Unlock()
-				c.pushTimeline(id)
+				c.pushTimelineTo(id, cl)
 			}
 		}
 	}
@@ -214,18 +229,26 @@ func (c *Core) pushTimelines() {
 }
 
 func (c *Core) pushTimeline(id string) {
+	c.pushTimelineTo(id, nil)
+}
+
+// A new subscription always receives its own snapshot, independently of the
+// shared fingerprint and concurrent updates to other subscribers.
+func (c *Core) pushTimelineTo(id string, subscriber *wsClient) {
 	if c.ws == nil || id == "" || !safeChannelID(id) {
 		return
 	}
 	// Cheap dir fingerprint first — skip ListRecordings when nothing on disk changed.
 	dirFP := c.timelineDirFP(id)
-	if c.ws.sameFP(id, dirFP) {
+	if subscriber == nil && c.ws.sameFP(id, dirFP) {
 		return
 	}
 	segs := c.ListRecordings(id)
 	saved := c.ListSaved(id)
-	c.ws.setFP(id, dirFP)
 	clients := c.ws.watchers()[id]
+	if subscriber != nil {
+		clients = []*wsClient{subscriber}
+	}
 	if len(clients) == 0 {
 		return
 	}
@@ -240,6 +263,9 @@ func (c *Core) pushTimeline(id string) {
 	if err != nil {
 		return
 	}
+	if subscriber == nil {
+		c.ws.setFP(id, dirFP)
+	}
 	for _, cl := range clients {
 		cl.send(msg)
 	}
@@ -248,6 +274,9 @@ func (c *Core) pushTimeline(id string) {
 // timelineDirFP is a lightweight name:size:mtime digest of recording/saved dirs.
 func (c *Core) timelineDirFP(id string) string {
 	var b strings.Builder
+	if c.rec.running(id) {
+		b.WriteString("recording|")
+	}
 	roots := []string{c.channelRecordDir(id), c.channelSavedDir(id)}
 	if cache := c.channelCacheDir(id); cache != "" {
 		roots = append(roots, cache)
@@ -260,7 +289,7 @@ func (c *Core) timelineDirFP(id string) string {
 		b.WriteString(dir)
 		b.WriteByte('|')
 		for _, e := range entries {
-			if e.IsDir() || !isRecordingMediaFile(e.Name()) {
+			if e.IsDir() || (!isRecordingMediaFile(e.Name()) && e.Name() != "index.json") {
 				continue
 			}
 			info, err := e.Info()
@@ -271,7 +300,7 @@ func (c *Core) timelineDirFP(id string) string {
 			b.WriteByte(':')
 			b.WriteString(itoa64(info.Size()))
 			b.WriteByte(':')
-			b.WriteString(itoa64(info.ModTime().UnixMilli()))
+			b.WriteString(itoa64(info.ModTime().UnixNano()))
 			b.WriteByte(';')
 		}
 	}
@@ -373,14 +402,29 @@ func writeWSFrame(w io.Writer, opcode byte, payload []byte) error {
 	case n < 65536:
 		hdr = []byte{0x80 | opcode, 126, byte(n >> 8), byte(n)}
 	default:
-		return errors.New("frame too large")
+		hdr = make([]byte, 10)
+		hdr[0], hdr[1] = 0x80|opcode, 127
+		binary.BigEndian.PutUint64(hdr[2:], uint64(n))
 	}
-	if _, err := w.Write(hdr); err != nil {
+	if err := writeWSBytes(w, hdr); err != nil {
 		return err
 	}
 	if n == 0 {
 		return nil
 	}
-	_, err := w.Write(payload)
-	return err
+	return writeWSBytes(w, payload)
+}
+
+func writeWSBytes(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(b) {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
 }

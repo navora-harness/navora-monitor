@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useEnlargementGrace } from '../ui/enlargement-grace'
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { pushEscapeLayer } from '../ui/escape-stack'
 import type { ChannelConfig, ChannelRuntimeState } from '@shared/types'
@@ -9,7 +10,8 @@ import { openContextMenu } from '../composables/useContextMenu'
 import { buildRemoteLivePreviewUrl } from '../media-url'
 
 const props = defineProps<{
-  mosaic: 1 | 4 | 9 | 16
+  mosaic: 1 | 4 | 6 | 8 | 9 | 13 | 16
+  featuredLayout?: boolean
   channels: ChannelConfig[]
   states: Record<string, ChannelRuntimeState>
   selectedId: string | null
@@ -42,12 +44,15 @@ const emit = defineEmits<{
   enterPlayback: []
   menu: [action: string, payload?: { channelId?: string; slotIndex?: number }]
   enlarged: [index: number | null]
+  previewScope: [index: number | null]
   /** Mosaic cell HTML5 drag started / ended — parent shows remove dock over timeline. */
   slotDrag: [payload: { active: true; index: number } | { active: false }]
   hevcUnsupported: []
 }>()
 
 const enlargedIndex = ref<number | null>(null)
+const releasedSlot = useEnlargementGrace(enlargedIndex)
+watch(releasedSlot, (index) => emit('previewScope', index), { immediate: true })
 const playerRefs = ref<Record<number, InstanceType<typeof MpegtsPlayer> | null>>({})
 const mosaicShellRef = ref<HTMLElement | null>(null)
 const dragFromIndex = ref<number | null>(null)
@@ -63,6 +68,7 @@ const mutedMap = reactive<Record<string, boolean>>({})
 const volumeMap = reactive<Record<string, number>>({})
 const flippedMap = reactive<Record<string, boolean>>({})
 const pausedMap = reactive<Record<string, boolean>>({})
+const playbackStates = reactive<Record<string, 'loading' | 'live' | 'reconnecting'>>({})
 
 const MIN_DIGITAL_ZOOM = 1
 const MAX_DIGITAL_ZOOM = 8
@@ -211,6 +217,16 @@ const visibleCells = computed(() => {
   return list
 })
 
+// Enlargement hides siblings without unmounting their stream players.
+const mountedCells = computed(() => {
+  if (releasedSlot.value != null) return cells.value.filter((cell) => cell.index === releasedSlot.value)
+  if (props.layoutMode === 'scroll') {
+    const filled = cells.value.filter((cell) => cell.channel)
+    if (filled.length) return filled
+  }
+  return cells.value
+})
+
 const gridCols = computed(() => (enlargedIndex.value == null ? cols.value : 1))
 
 watch(
@@ -344,9 +360,12 @@ function onDragLeave(e: DragEvent, index: number) {
   if (dropTargetIndex.value === index) dropTargetIndex.value = null
 }
 
-function previewLabel(state: ChannelRuntimeState | null): string {
+function previewLabel(state: ChannelRuntimeState | null, channelId: string): string {
   if (!state) return ''
-  if (state.preview === 'live' && state.previewUrl) return 'LIVE'
+  if (state.preview === 'live' && state.previewUrl) {
+    const playback = playbackStates[channelId]
+    return playback === 'live' ? 'LIVE' : playback === 'reconnecting' ? '重连中' : '连接中'
+  }
   if (state.preview === 'starting' && state.previewUrl) return '连接中'
   if (state.preview === 'error') return '预览失败'
   // starting/live without URL = host still preparing; do not imply a media request is in flight
@@ -504,6 +523,7 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
     const previewing = cell.state?.preview === 'live' || cell.state?.preview === 'starting'
     const items: CtxMenuItem[] = [
       { id: 'props', label: '属性…' },
+      ...(props.featuredLayout && cell.index !== 0 ? [{ id: 'makeMain', label: '设为主画面' }] : []),
       { id: 'enlarge', label: enlargedIndex.value === cell.index ? '还原画面' : '放大画面（一路独占）' },
       {
         id: 'fullscreen',
@@ -515,12 +535,21 @@ function onCellCtx(e: MouseEvent, cell: { index: number; channel: ChannelConfig 
       { id: recording ? 'stop' : 'start', label: recording ? '停止录像' : '开始录像', shortcut: 'Ctrl+Alt+R' },
       { id: previewing ? 'previewStop' : 'previewStart', label: previewing ? '停止预览' : '开始预览' },
       { id: 'repairChannel', label: '修复此通道预览' },
+      { id: 'reloadPreview', label: '重新加载画面', disabled: !previewing },
       { separator: true },
       { id: 'clearSlot', label: '移出宫格' },
       { id: 'reveal', label: '打开录像目录' },
       { id: 'revealSaved', label: '打开已保存目录' },
     ]
     openContextMenu(e, items, (id) => {
+      if (id === 'makeMain') {
+        emit('swap', cell.index, 0)
+        return
+      }
+      if (id === 'reloadPreview') {
+        playerRefs.value[cell.index]?.reload()
+        return
+      }
       if (id === 'enlarge') {
         onDblClick(cell.index, cell.channel)
         return
@@ -621,10 +650,11 @@ onUnmounted(() => {
     <div
       class="mosaic"
       :style="{ '--cols': gridCols }"
-      :class="{ enlarged: enlargedIndex != null, scroll: layoutMode === 'scroll' }"
+      :class="{ enlarged: enlargedIndex != null, scroll: layoutMode === 'scroll', featured: featuredLayout && enlargedIndex == null && layoutMode !== 'scroll', [`featured-${mosaic}`]: featuredLayout }"
     >
       <div
-        v-for="cell in visibleCells"
+        v-for="cell in mountedCells"
+        v-show="enlargedIndex == null || enlargedIndex === cell.index"
         :key="cell.index"
         class="cell"
         :class="{
@@ -652,11 +682,11 @@ onUnmounted(() => {
             </span>
             <span v-if="cell.state?.recording === 'recording'" class="badge rec">REC</span>
             <span
-              v-if="previewLabel(cell.state)"
+              v-if="previewLabel(cell.state, cell.channel.id)"
               class="badge"
-              :class="{ live: cell.state?.preview === 'live', warn: cell.state?.preview !== 'live' }"
+              :class="{ live: playbackStates[cell.channel.id] === 'live', warn: playbackStates[cell.channel.id] !== 'live' }"
             >
-              {{ previewLabel(cell.state) }}
+              {{ previewLabel(cell.state, cell.channel.id) }}
             </span>
             <div class="osd-actions">
               <button
@@ -689,7 +719,7 @@ onUnmounted(() => {
           <div
             class="zoom-hit"
             :class="{ active: digitalZoomEnabled, zoomed: digitalZoomEnabled && digitalZoom > 1 }"
-            :ref="(el) => setZoomHit(el, digitalZoomEnabled)"
+            :ref="(el) => setZoomHit(el, digitalZoomEnabled && (enlargedIndex == null || enlargedIndex === cell.index))"
             @wheel.prevent="onDigitalWheel"
             @mousedown="onDigitalMouseDown"
             @pointerdown="onDigitalPointerDown"
@@ -709,6 +739,7 @@ onUnmounted(() => {
               :is-live="true"
               :style="digitalZoomEnabled ? digitalZoomStyle : undefined"
               @hevc-unsupported="emit('hevcUnsupported')"
+              @playback-state="playbackStates[cell.channel.id] = $event"
             />
             <div v-else class="placeholder">
               <p v-if="cell.state?.preview === 'error'">{{ cell.state.previewError || '预览失败' }}</p>
@@ -979,6 +1010,35 @@ onUnmounted(() => {
 .mosaic.enlarged {
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
+}
+.mosaic.featured {
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+.mosaic.featured-4.featured .cell:first-child {
+  grid-column: 1;
+  grid-row: 1 / 4;
+}
+.mosaic.featured-4.featured .cell:not(:first-child) {
+  grid-column: 2;
+}
+.mosaic.featured-6.featured {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+.mosaic.featured-8.featured,
+.mosaic.featured-13.featured {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(4, minmax(0, 1fr));
+}
+.mosaic.featured-6.featured .cell:first-child,
+.mosaic.featured-13.featured .cell:first-child {
+  grid-column: 1 / 3;
+  grid-row: 1 / 3;
+}
+.mosaic.featured-8.featured .cell:first-child {
+  grid-column: 1 / 4;
+  grid-row: 1 / 4;
 }
 .mosaic.scroll {
   display: flex;

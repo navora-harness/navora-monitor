@@ -34,7 +34,7 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     '-loglevel',
     'warning',
     '-y',
-    // Bound demuxer queues — long RTSP sessions otherwise grow RSS over hours.
+    // Keep RTSP input buffering low; single-input pipelines use FFmpeg defaults.
     '-fflags',
     '+nobuffer+discardcorrupt',
     '-flags',
@@ -45,8 +45,6 @@ export function buildSegmentRecordArgs(opts: SegmentRecordOptions): string[] {
     '1000000',
     '-analyzeduration',
     '1000000',
-    '-thread_queue_size',
-    '64',
   ]
 
   if (opts.inputUrl.toLowerCase().startsWith('rtsp://')) {
@@ -170,8 +168,6 @@ export function buildMpegtsPreviewArgs(opts: MpegtsPreviewOptions): string[] {
     '500000',
     '-analyzeduration',
     '500000',
-    '-thread_queue_size',
-    '32',
   ]
 
   if (opts.inputUrl.toLowerCase().startsWith('rtsp://')) {

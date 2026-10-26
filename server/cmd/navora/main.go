@@ -23,17 +23,55 @@ func main() {
 
 	data := flag.String("data", "", "配置目录（默认 portable/ 或 NAVORA_MONITOR_DATA_ROOT）")
 	port := flag.Int("port", 0, "监听端口，0 表示使用设置中的端口")
-	addr := flag.String("addr", "0.0.0.0", "监听地址")
+	addr := flag.String("addr", "", "远程启用时的监听地址")
 	reset := flag.Bool("reset-password", false, "重新生成管理员密码并打印")
+	initialize := flag.Bool("init-only", false, "仅初始化配置与管理员账户，然后退出")
 	flag.Parse()
+	if *initialize {
+		if err := initializeData(*data, *reset); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if err := runConsole(*data, *addr, *port, *reset); err != nil {
 		log.Fatal(err)
 	}
 }
 
+func initializeData(dataFlag string, reset bool) error {
+	root := resolveData(dataFlag)
+	release, err := acquireDataLock(root)
+	if err != nil {
+		return err
+	}
+	defer release()
+	app, err := core.Open(root)
+	if err != nil {
+		return err
+	}
+	pw, created, migrated, err := app.EnsurePassword(reset)
+	if err != nil {
+		return err
+	}
+	fmt.Println("管理员账户:", app.Settings().RemoteUsername)
+	if created || reset {
+		fmt.Println("初始密码（仅显示一次）:", pw)
+	} else if migrated {
+		fmt.Println("已保留原管理员密码")
+	} else {
+		fmt.Println("账户已初始化，保留现有密码")
+	}
+	return nil
+}
+
 func runConsole(dataFlag, addr string, port int, reset bool) error {
 	root := resolveData(dataFlag)
+	release, err := acquireDataLock(root)
+	if err != nil {
+		return err
+	}
+	defer release()
 	app, err := core.Open(root)
 	if err != nil {
 		return fmt.Errorf("无法打开数据目录 %s: %w", root, err)
@@ -47,13 +85,12 @@ func runConsole(dataFlag, addr string, port int, reset bool) error {
 	if port != 0 {
 		listenPort = port
 	}
-	host := addr
-	if host == "" {
-		host = "0.0.0.0"
+	host := core.ListenHost(addr, true)
+	urls := []string{}
+	if settings.RemoteEnabled {
+		urls = lanURLs(listenPort)
 	}
-	urls := lanURLs(listenPort)
 	app.SetListen(listenPort, urls)
-	go app.RunLoops()
 
 	fmt.Println("========================================")
 	fmt.Println("Navora Monitor", core.Version)
@@ -82,27 +119,55 @@ func runConsole(dataFlag, addr string, port int, reset bool) error {
 }
 
 func serveHTTP(app *core.Core, host string, listenPort int) error {
-	ln, err := net.Listen("tcp", core.ListenAddr(host, listenPort))
+	return serveHTTPReady(app, host, listenPort, nil)
+}
+
+func serveHTTPReady(app *core.Core, host string, listenPort int, ready chan<- struct{}) error {
+	ln, err := net.Listen("tcp", core.ListenAddr(core.ListenHost(host, app.Settings().RemoteEnabled), listenPort))
 	if err != nil {
 		return fmt.Errorf("监听失败: %w", err)
 	}
+	switchable := &switchListener{current: ln}
+	app.SetListenAddress(func() string { return switchable.Addr().String() })
+	app.SetRemoteSwitch(func(enabled bool) error {
+		return switchable.replace(core.ListenAddr(core.ListenHost(host, enabled), listenPort))
+	})
+	app.SetListen(listenPort, lanURLs(listenPort))
 	srv := &http.Server{
 		Handler:           app.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	// Do not adopt/resume recorders until this instance owns its HTTP port.
+	go app.RunLoops()
+	log.Printf("listening on %s", ln.Addr())
+	if ready != nil {
+		close(ready)
+	}
+	return serveHTTPServer(app, switchable, srv)
+}
+
+func serveHTTPServer(app *core.Core, ln net.Listener, srv *http.Server) error {
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		<-app.ShutdownNotify()
 		app.ShutdownGrace(400 * time.Millisecond)
 		app.StopAllMedia()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		if err := srv.Shutdown(ctx); err != nil {
+			_ = srv.Close()
+		}
 		log.Printf("exited")
 		// Do not os.Exit here: Windows service Execute must return to SCM,
 		// and console main exits cleanly once Serve returns.
 	}()
-	log.Printf("listening on %s", ln.Addr())
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	err := srv.Serve(ln)
+	app.RequestShutdown()
+	// Serve returns as soon as Shutdown closes the listener, before active
+	// handlers finish. Keep the process alive until cleanup actually completes.
+	<-stopped
+	if err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil

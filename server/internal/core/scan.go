@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -77,56 +79,93 @@ func virtualIface(name string) bool {
 	return false
 }
 
-var scanMu sync.Mutex
-var scanCancel context.CancelFunc
-
 func (c *Core) CancelScan() {
-	scanMu.Lock()
-	if scanCancel != nil {
-		scanCancel()
+	c.scanMu.Lock()
+	defer c.scanMu.Unlock()
+	if c.scanCancel != nil {
+		c.scanCancel()
 	}
-	scanMu.Unlock()
 }
 
 func (c *Core) Scan(mode, cidr, user, pass, preset string) ([]Camera, int, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	scanMu.Lock()
-	if scanCancel != nil {
-		scanCancel()
-	}
-	scanCancel = cancel
-	scanMu.Unlock()
-	defer cancel()
+	return c.ScanContext(context.Background(), mode, cidr, user, pass, preset)
+}
 
+func (c *Core) ScanContext(parent context.Context, mode, cidr, user, pass, preset string) ([]Camera, int, error) {
+	if mode != "auto" && mode != "lan" && mode != "onvif" {
+		return nil, 0, fmt.Errorf("无效扫描方式")
+	}
 	var subnets []string
 	if strings.TrimSpace(cidr) != "" {
 		subnets = []string{strings.TrimSpace(cidr)}
 	} else {
 		for _, s := range c.Subnets() {
-			if mode == "auto" && !s.Recommended && s.Virtual {
+			if mode == "auto" && s.Virtual {
 				continue
 			}
 			subnets = append(subnets, s.CIDR)
 		}
 	}
+	var all []string
+	seen := map[string]bool{}
+	if mode != "onvif" {
+		for _, subnet := range subnets {
+			hosts, err := scanHosts(subnet)
+			if err != nil {
+				return nil, 0, err
+			}
+			for _, host := range hosts {
+				if !seen[host] {
+					seen[host] = true
+					all = append(all, host)
+				}
+			}
+		}
+		if len(all) > 4096 {
+			return nil, 0, fmt.Errorf("扫描范围过大，请指定一个 /23 或更小的 IPv4 网段")
+		}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	c.scanMu.Lock()
+	if c.scanCancel != nil {
+		c.scanCancel()
+	}
+	c.scanID++
+	id := c.scanID
+	c.scanCancel = cancel
+	c.scanMu.Unlock()
+	defer func() {
+		cancel()
+		c.scanMu.Lock()
+		if c.scanID == id {
+			c.scanCancel = nil
+		}
+		c.scanMu.Unlock()
+	}()
+	select {
+	case <-c.shutdownCh:
+		cancel()
+	default:
+	}
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
 	found := map[string]*Camera{}
 	if mode != "lan" {
 		c.discoverONVIF(ctx, found, user, pass, preset)
 	}
-	hosts := 0
-	if mode != "onvif" {
-		var all []string
-		for _, s := range subnets {
-			all = append(all, hostsInCIDR(s)...)
-		}
-		hosts = len(all)
+	if mode != "onvif" && ctx.Err() == nil {
 		c.scanLAN(ctx, all, found, user, pass, preset)
+	}
+	if ctx.Err() != nil {
+		return nil, len(all), ctx.Err()
 	}
 	var list []Camera
 	for _, cam := range found {
 		list = append(list, *cam)
 	}
-	return list, hosts, nil
+	sort.Slice(list, func(i, j int) bool { return list[i].Host < list[j].Host })
+	return list, len(all), nil
 }
 
 func (c *Core) publishScan(done, total int, msg string) {
@@ -140,6 +179,8 @@ func (c *Core) discoverONVIF(ctx context.Context, found map[string]*Camera, user
 		return
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	msg := `<?xml version="1.0" encoding="UTF-8"?>
 <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
 <e:Header><w:MessageID>uuid:navora-scan</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header>
@@ -203,27 +244,33 @@ func hostFromURL(raw string) string {
 }
 
 func hostsInCIDR(cidr string) []string {
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		// allow 192.168.1.0/24 already parsed; also "192.168.1.10" -> /24
-		if parsed := net.ParseIP(cidr); parsed != nil && parsed.To4() != nil {
-			p := parsed.To4()
-			base := fmt.Sprintf("%d.%d.%d.0/24", p[0], p[1], p[2])
-			return hostsInCIDR(base)
-		}
-		return nil
-	}
-	var hosts []string
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incIP(ip) {
-		if ip[len(ip)-1] == 0 || ip[len(ip)-1] == 255 {
-			continue
-		}
-		hosts = append(hosts, ip.String())
-		if len(hosts) >= 512 {
-			break
-		}
-	}
+	hosts, _ := scanHosts(cidr)
 	return hosts
+}
+
+func scanHosts(cidr string) ([]string, error) {
+	if ip := net.ParseIP(cidr); ip != nil && ip.To4() != nil {
+		v := ip.To4()
+		cidr = fmt.Sprintf("%d.%d.%d.0/24", v[0], v[1], v[2])
+	}
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil || ip.To4() == nil {
+		return nil, fmt.Errorf("请输入有效的 IPv4 网段，例如 192.168.1.0/24")
+	}
+	prefix, bits := network.Mask.Size()
+	if bits != 32 || prefix < 23 {
+		return nil, fmt.Errorf("每次扫描支持 /23 或更小的 IPv4 网段，请缩小范围；不会截断扫描结果")
+	}
+	base := ip.To4().Mask(network.Mask)
+	count := 1 << uint(32-prefix)
+	hosts := make([]string, 0, count)
+	for n := 0; n < count; n++ {
+		if prefix >= 31 || (n != 0 && n != count-1) {
+			hosts = append(hosts, base.String())
+		}
+		incIP(base)
+	}
+	return hosts, nil
 }
 
 func incIP(ip net.IP) {
@@ -251,8 +298,13 @@ func (c *Core) scanLAN(ctx context.Context, hosts []string, found map[string]*Ca
 			break
 		}
 		host := host
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -287,7 +339,9 @@ func (c *Core) scanLAN(ctx context.Context, hosts []string, found map[string]*Ca
 		}()
 	}
 	wg.Wait()
-	c.publishScan(total, total, "扫描完成")
+	if ctx.Err() == nil {
+		c.publishScan(total, total, "扫描完成")
+	}
 }
 
 func guessPreset(ports []int, preferred string) string {
@@ -317,9 +371,9 @@ func rtspPair(preset, host string, port int, user, pass string, ch int) (string,
 	}
 	auth := ""
 	if user != "" {
-		auth = user
+		auth = url.User(user).String()
 		if pass != "" {
-			auth += ":" + pass
+			auth = url.UserPassword(user, pass).String()
 		}
 		auth += "@"
 	}

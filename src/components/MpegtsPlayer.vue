@@ -26,12 +26,14 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   hevcUnsupported: []
+  playbackState: [state: 'loading' | 'live' | 'reconnecting']
 }>()
 
 defineExpose({
   captureFrame,
   playLocal,
   pauseLocal,
+  reload: () => { attachedAbs = null; attach(props.src) },
 })
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -43,6 +45,48 @@ let attachGen = 0
 let attachedAbs: string | null = null
 let errorTimer: ReturnType<typeof setTimeout> | null = null
 let errorBackoffMs = 800
+let healthTimer: ReturnType<typeof setInterval> | null = null
+let lastProgressAt = 0
+let lastFrames = -1
+let lastTime = -1
+let sawFrame = false
+let localPaused = false
+
+function reconnect(gen: number) {
+  if (destroying || gen !== attachGen || errorTimer || !props.src) return
+  emit('playbackState', 'reconnecting')
+  const url = props.src
+  const delay = errorBackoffMs
+  errorBackoffMs = Math.min(8_000, Math.round(errorBackoffMs * 1.6))
+  errorTimer = setTimeout(() => {
+    errorTimer = null
+    if (destroying || gen !== attachGen || props.src !== url) return
+    attachedAbs = null
+    attach(url)
+  }, delay)
+}
+
+function checkHealth(gen: number) {
+  if (destroying || gen !== attachGen) return
+  const v = videoRef.value
+  const now = performance.now()
+  if (!v || props.paused || localPaused || document.hidden) {
+    lastProgressAt = now
+    return
+  }
+  const frames = v.getVideoPlaybackQuality?.().totalVideoFrames ?? 0
+  const progressed = v.videoWidth > 0 && v.readyState >= 2 &&
+    (frames > lastFrames || v.currentTime > lastTime + 0.01)
+  if (progressed) {
+    lastProgressAt = now
+    sawFrame = true
+    errorBackoffMs = 800
+    emit('playbackState', 'live')
+  }
+  lastFrames = frames
+  lastTime = v.currentTime
+  if (now - lastProgressAt > (sawFrame ? 8_000 : 15_000)) reconnect(gen)
+}
 
 function toAbsoluteUrl(src: string): string {
   try {
@@ -63,6 +107,8 @@ function destroy() {
   destroying = true
   attachGen += 1
   clearErrorTimer()
+  if (healthTimer) clearInterval(healthTimer)
+  healthTimer = null
   attachedAbs = null
   const p = player
   player = null
@@ -119,7 +165,7 @@ function applyAudio() {
 function applyPaused() {
   const v = videoRef.value
   if (!v) return
-  if (props.paused) {
+  if (props.paused || localPaused) {
     try {
       player?.pause()
     } catch {
@@ -149,6 +195,11 @@ function attach(src: string | null) {
   destroy()
   destroying = false
   const gen = ++attachGen
+  lastProgressAt = performance.now()
+  lastFrames = -1
+  lastTime = -1
+  sawFrame = false
+  emit('playbackState', 'loading')
   const wanted = src
 
   void nextTick(() => {
@@ -184,7 +235,7 @@ function attach(src: string | null) {
         },
         live
           ? {
-              enableWorker: false,
+              enableWorker: true,
               enableStashBuffer: false,
               stashInitialSize: 128,
               liveBufferLatencyChasing: true,
@@ -193,9 +244,11 @@ function attach(src: string | null) {
               lazyLoad: false,
               deferLoadAfterSourceOpen: false,
               autoCleanupSourceBuffer: true,
+              autoCleanupMaxBackwardDuration: 20,
+              autoCleanupMinBackwardDuration: 10,
             }
           : {
-              enableWorker: false,
+              enableWorker: true,
               enableStashBuffer: true,
               stashInitialSize: 384,
               lazyLoad: false,
@@ -206,29 +259,21 @@ function attach(src: string | null) {
       player.attachMediaElement(v)
       player.load()
       attachedAbs = abs
-      errorBackoffMs = 800
-      if (!props.paused) void player.play().catch(() => undefined)
+      if (live) healthTimer = setInterval(() => checkHealth(gen), 1000)
+      if (!props.paused && !localPaused) void player.play().catch(() => undefined)
 
       player.on(mpegts.Events.ERROR, (...args: unknown[]) => {
-        if (!live || destroying) return
+        if (!live || destroying || gen !== attachGen) return
         if (isHevcMseError(...args)) {
           emit('hevcUnsupported')
           return
         }
-        const url = props.src
-        clearErrorTimer()
-        const delay = errorBackoffMs
-        errorBackoffMs = Math.min(8_000, Math.round(errorBackoffMs * 1.6))
-        errorTimer = setTimeout(() => {
-          errorTimer = null
-          if (destroying || props.src !== url) return
-          attachedAbs = null
-          attach(url)
-        }, delay)
+        reconnect(gen)
       })
     } catch (err) {
       console.error('[mpegts] createPlayer/load failed', err)
       attachedAbs = null
+      if (live) reconnect(gen)
     }
   })
 }
@@ -250,10 +295,13 @@ function captureFrame(): string | null {
 }
 
 function playLocal() {
+  localPaused = false
+  lastProgressAt = performance.now()
   void (player?.play() ?? videoRef.value?.play())?.catch(() => undefined)
 }
 
 function pauseLocal() {
+  localPaused = true
   try {
     player?.pause()
   } catch {
@@ -262,7 +310,17 @@ function pauseLocal() {
   videoRef.value?.pause()
 }
 
-onMounted(() => attach(props.src))
+function onVisibilityChange() {
+  // Browsers may suspend frame callbacks in hidden tabs. Reset the watchdog
+  // without rebuilding the player or reopening its stream on return.
+  lastProgressAt = performance.now()
+  if (!document.hidden) applyPaused()
+}
+
+onMounted(() => {
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  attach(props.src)
+})
 watch(
   () => props.src,
   (src) => attach(src),
@@ -275,7 +333,10 @@ watch(
   () => props.paused,
   () => applyPaused(),
 )
-onBeforeUnmount(destroy)
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  destroy()
+})
 </script>
 
 <template>

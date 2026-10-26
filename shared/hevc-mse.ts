@@ -21,6 +21,12 @@ export function browserSupportsHevcMse(): boolean {
   })
 }
 
+export function browserSupportsHevcNative(): boolean {
+  if (typeof document === 'undefined') return false
+  const video = document.createElement('video')
+  return HEVC_MSE_TYPES.some(type => { try { return video.canPlayType(type) !== '' } catch { return false } })
+}
+
 export function isHevcMseError(...args: unknown[]): boolean {
   const text = args
     .map((a) => {

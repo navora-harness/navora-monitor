@@ -3,10 +3,14 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -27,26 +31,32 @@ func processAlive(pid int) bool {
 	return true
 }
 
-func scanRecordingFfmpeg() map[string][]int {
-	script := `Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | ForEach-Object { $c = $_.CommandLine; if ($c -like '*record-cache*' -or $c -like '*recordings*') { if ($c -match 'cam-[a-z0-9]+') { '{0} {1}' -f $_.ProcessId, $Matches[0] } } }`
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+func scanRecordingFfmpeg() []recordingProcess {
+	script := `[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Select-Object ProcessId,CommandLine)`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script)
 	hideWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
-		return map[string][]int{}
+		return nil
 	}
-	found := map[string][]int{}
-	for _, line := range strings.FieldsFunc(string(out), func(r rune) bool { return r == '\n' || r == '\r' }) {
-		line = strings.TrimSpace(line)
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
+	var processes []struct {
+		ProcessID   int    `json:"ProcessId"`
+		CommandLine string `json:"CommandLine"`
+	}
+	if json.Unmarshal([]byte(strings.TrimPrefix(string(out), "\ufeff")), &processes) != nil {
+		return nil
+	}
+	var found []recordingProcess
+	for _, process := range processes {
+		args, err := windows.DecomposeCommandLine(process.CommandLine)
+		if err != nil {
 			continue
 		}
-		pid, err := strconv.Atoi(parts[0])
-		if err != nil || !safeChannelID(parts[1]) {
-			continue
+		if output := recordingOutput(args); output != "" {
+			found = append(found, recordingProcess{PID: process.ProcessID, Output: output})
 		}
-		found[parts[1]] = append(found[parts[1]], pid)
 	}
 	return found
 }

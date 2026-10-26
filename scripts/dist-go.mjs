@@ -15,6 +15,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSyn
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
@@ -99,10 +100,12 @@ function run(cmd, args, opts = {}) {
 
 function findMakensis() {
   const candidates = [
+    process.env.NAVORA_MAKENSIS,
     'makensis',
     'C:\\Program Files (x86)\\NSIS\\makensis.exe',
     'C:\\Program Files\\NSIS\\makensis.exe',
-  ]
+    join(process.env.LOCALAPPDATA || '', 'electron-builder', 'Cache', 'nsis', 'nsis-3.0.4.1', 'makensis.exe'),
+  ].filter(Boolean)
   for (const c of candidates) {
     const res = spawnSync(c, ['/VERSION'], { encoding: 'utf8', shell: false })
     if (res.status === 0) return c
@@ -116,7 +119,7 @@ function ensureFfmpeg(ffmpegId, { optional = false } = {}) {
   for (const dir of aliases) {
     for (const name of names) {
       const p = join(root, 'vendor', 'ffmpeg', dir, name)
-      if (existsSync(p)) return { exe: p, dir: join(root, 'vendor', 'ffmpeg', dir) }
+      if (existsSync(p) && existsSync(join(root, 'vendor', 'ffmpeg', dir, name.replace('ffmpeg', 'ffprobe')))) return { exe: p, dir: join(root, 'vendor', 'ffmpeg', dir) }
     }
   }
   if (optional) {
@@ -132,13 +135,13 @@ function ensureFfmpeg(ffmpegId, { optional = false } = {}) {
   for (const dir of aliases) {
     for (const name of names) {
       const p = join(root, 'vendor', 'ffmpeg', dir, name)
-      if (existsSync(p)) return { exe: p, dir: join(root, 'vendor', 'ffmpeg', dir) }
+      if (existsSync(p) && existsSync(join(root, 'vendor', 'ffmpeg', dir, name.replace('ffmpeg', 'ffprobe')))) return { exe: p, dir: join(root, 'vendor', 'ffmpeg', dir) }
     }
   }
   if (fetch.status !== 0) {
-    console.warn(`[dist-go] FFmpeg ${ffmpegId} fetch failed; packaging without bundled binary`)
+    console.warn(`[dist-go] FFmpeg ${ffmpegId} fetch failed`)
   }
-  return null
+  throw new Error(`FFmpeg/ffprobe ${ffmpegId} unavailable; refusing incomplete release`)
 }
 
 function stageDir(target) {
@@ -173,6 +176,7 @@ function buildTarget(target, mode) {
   if (ff) {
     mkdirSync(join(stage, 'ffmpeg'), { recursive: true })
     copyFileSync(ff.exe, join(stage, 'ffmpeg', target.ffmpegBin))
+    copyFileSync(join(ff.dir, target.ffmpegBin.replace('ffmpeg', 'ffprobe')), join(stage, 'ffmpeg', target.ffmpegBin.replace('ffmpeg', 'ffprobe')))
     const lic = join(ff.dir, 'LICENSE.txt')
     if (existsSync(lic)) copyFileSync(lic, join(stage, 'ffmpeg', 'LICENSE.txt'))
   } else {
@@ -198,6 +202,26 @@ Bundled FFmpeg is under ./ffmpeg/ (GPLv3).
 `
   writeFileSync(join(stage, '使用说明.txt'), readme, 'utf8')
   writeFileSync(join(stage, 'README.txt'), readme, 'utf8')
+  copyFileSync(join(root, 'LICENSE'), join(stage, 'LICENSE'))
+  const canExecute = (target.goos === 'windows' ? process.platform === 'win32' : process.platform === target.goos) && process.arch === (target.goarch === 'amd64' ? 'x64' : target.goarch)
+  writeFileSync(join(stage, 'MEDIA-BUILDINFO.json'), JSON.stringify({
+    version, target: target.id,
+    ffmpeg: ff && canExecute ? spawnSync(ff.exe, ['-version'], {encoding:'utf8',windowsHide:true}).stdout?.split(/\r?\n/)[0] : null,
+    ffprobe: ff && canExecute ? spawnSync(join(ff.dir,target.ffmpegBin.replace('ffmpeg','ffprobe')), ['-version'], {encoding:'utf8',windowsHide:true}).stdout?.split(/\r?\n/)[0] : null,
+    buildProject: 'https://github.com/BtbN/FFmpeg-Builds',
+    mediaSource: 'https://github.com/FFmpeg/FFmpeg',
+    license: 'ffmpeg/LICENSE.txt',
+  }, null, 2))
+  if (target.goos === 'windows') {
+    const deploy = readFileSync(join(root, 'scripts', 'windows-deploy.ps1'), 'utf8')
+    writeFileSync(join(stage, 'windows-deploy.ps1'), '\ufeff' + deploy.replace(/^\ufeff/, ''), 'utf8')
+    copyFileSync(join(root, 'docs', 'windows-install-update.md'), join(stage, '安装更新说明.md'))
+  }
+  const manifest = {}
+  for (const name of [target.exe, 'README.txt', 'LICENSE', 'MEDIA-BUILDINFO.json', ...(target.goos === 'windows' ? ['windows-deploy.ps1', '安装更新说明.md'] : []), ...(ff ? ['ffmpeg/' + target.ffmpegBin, 'ffmpeg/' + target.ffmpegBin.replace('ffmpeg','ffprobe'), 'ffmpeg/LICENSE.txt'] : [])]) {
+    manifest[name] = createHash('sha256').update(readFileSync(join(stage,name))).digest('hex')
+  }
+  writeFileSync(join(stage,'manifest.json'), JSON.stringify({version,target:target.id,sha256:manifest}, null, 2))
 
   /** @type {string[]} */
   const outs = []
@@ -230,14 +254,11 @@ Bundled FFmpeg is under ./ffmpeg/ (GPLv3).
       const makensis = findMakensis()
       const out = join(releaseDir, `NavoraMonitor-${version}-${target.id}-setup.exe`)
       if (!makensis) {
-        console.warn('[dist-go] 未找到 makensis，已跳过安装包。安装 NSIS 后重新执行 npm run dist:go:setup')
-        console.warn('[dist-go] https://nsis.sourceforge.io/Download')
-        if (mode === 'setup') process.exit(1)
+        throw new Error('未找到 makensis：请设置 NAVORA_MAKENSIS 或安装 NSIS，未完成安装包生成')
       } else {
-        const q = (p) => p.replace(/\\/g, '\\\\')
         run(
           makensis,
-          [`/DVERSION=${version}`, `/DSTAGEDIR=${q(stage)}`, `/DOUTFILE=${q(out)}`, join(root, 'build', 'navora.nsi')],
+          [`/DVERSION=${version}`, `/DSTAGEDIR=${stage}`, `/DOUTFILE=${out}`, join(root, 'build', 'navora.nsi')],
           { shell: false },
         )
         console.log(`[dist-go] setup ${out}`)
@@ -265,3 +286,4 @@ for (const id of ids) {
 
 console.log('[dist-go] done:')
 for (const p of allOuts) console.log(`  ${p}`)
+writeFileSync(join(releaseDir, `SHA256SUMS-${version}.txt`), allOuts.map(p => `${createHash('sha256').update(readFileSync(p)).digest('hex')}  ${p.split(/[\\/]/).pop()}`).join('\n')+'\n')

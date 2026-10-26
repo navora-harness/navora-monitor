@@ -22,6 +22,7 @@ const props = withDefaults(
     scrubNonce?: number
     playId?: string | null
     playNonce?: number
+    playStartSec?: number
     suspended?: boolean
     /** Remote auth token for HLS segment fetches */
     authToken?: string | null
@@ -36,6 +37,7 @@ const props = withDefaults(
     scrubNonce: 0,
     playId: null,
     playNonce: 0,
+    playStartSec: 0,
     suspended: false,
     authToken: null,
     mediaBaseUrl: null,
@@ -45,6 +47,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   exit: []
   'update:rate': [rate: number]
+  'update:continuous': [enabled: boolean]
   follow: [wallMs: number]
   segment: [seg: RecordingSegment | null]
   playlistEnded: []
@@ -54,6 +57,82 @@ const emit = defineEmits<{
 
 const rootRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const stageRef = ref<HTMLElement | null>(null)
+const zoom = ref(1)
+const panX = ref(0)
+const panY = ref(0)
+let zoomDrag: { id: number; x: number; y: number; px: number; py: number } | null = null
+let suppressStageClick = false
+const zoomStyle = computed(() => ({ transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`, transformOrigin: 'center' }))
+
+function resetZoom() {
+  zoom.value = 1
+  panX.value = panY.value = 0
+  zoomDrag = null
+}
+
+function clampPan(x: number, y: number, scale: number) {
+  const el = stageRef.value
+  const maxX = (el?.clientWidth ?? 0) * (scale - 1) / 2
+  const maxY = (el?.clientHeight ?? 0) * (scale - 1) / 2
+  return { x: Math.max(-maxX, Math.min(maxX, x)), y: Math.max(-maxY, Math.min(maxY, y)) }
+}
+
+function changeZoom(scale: number, clientX?: number, clientY?: number) {
+  if (!segment.value || liveRecording.value) return
+  const next = Math.max(1, Math.min(8, scale))
+  if (next < 1.02) { resetZoom(); return }
+  const rect = stageRef.value?.getBoundingClientRect()
+  const x = rect && clientX != null ? clientX - rect.left - rect.width / 2 : 0
+  const y = rect && clientY != null ? clientY - rect.top - rect.height / 2 : 0
+  const ratio = next / zoom.value
+  const pan = clampPan(x - (x - panX.value) * ratio, y - (y - panY.value) * ratio, next)
+  zoom.value = next
+  panX.value = pan.x
+  panY.value = pan.y
+  bumpChrome()
+}
+
+function onZoomWheel(event: WheelEvent) {
+  if (!segment.value || liveRecording.value) return
+  if ((event.target as HTMLElement).closest('.playback-feedback, .debug, .empty')) return
+  event.preventDefault()
+  event.stopPropagation()
+  const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? (stageRef.value?.clientHeight ?? 500) : 1)
+  changeZoom(zoom.value * Math.exp(-delta * 0.0018), event.clientX, event.clientY)
+}
+
+function onZoomDown(event: PointerEvent) {
+  suppressStageClick = false
+  if ((event.target as HTMLElement).closest('button, .playback-feedback, .debug, .empty')) return
+  if (event.button !== 0 || zoom.value <= 1) return
+  zoomDrag = { id: event.pointerId, x: event.clientX, y: event.clientY, px: panX.value, py: panY.value }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  event.preventDefault()
+}
+
+function onZoomMove(event: PointerEvent) {
+  if (!zoomDrag || zoomDrag.id !== event.pointerId) return
+  const dx = event.clientX - zoomDrag.x, dy = event.clientY - zoomDrag.y
+  if (Math.hypot(dx, dy) > 3) suppressStageClick = true
+  const pan = clampPan(zoomDrag.px + dx, zoomDrag.py + dy, zoom.value)
+  panX.value = pan.x
+  panY.value = pan.y
+}
+
+function onZoomUp(event: PointerEvent) {
+  if (zoomDrag?.id !== event.pointerId) return
+  const el = event.currentTarget as HTMLElement
+  if (el.hasPointerCapture(event.pointerId)) el.releasePointerCapture(event.pointerId)
+  zoomDrag = null
+}
+
+function onStageClick() {
+  if (suppressStageClick) { suppressStageClick = false; return }
+  if (segment.value && !liveRecording.value && !coarsePointer.value) togglePlay()
+}
+
+watch(() => [props.channelId, props.source], resetZoom)
 const playError = ref('')
 const playing = ref(false)
 const muted = ref(false)
@@ -129,8 +208,8 @@ function armBufferingWatch() {
         })
     } else if (!ready) {
       // Still no data after wait — drop spinner so user can tap play
-      buffering.value = false
-      loadPhase.value = 'ready'
+      loadPhase.value = 'buffering'
+      statusHint.value = '仍在准备画面，可选择其他时间或取消等待'
     }
   }, 3500)
 }
@@ -138,7 +217,7 @@ function armBufferingWatch() {
 function pushDebug(msg: string) {
   const line = `${new Date().toLocaleTimeString()}  ${msg}`
   debugLines.value = [...debugLines.value.slice(-40), line]
-  console.info('[playback]', msg)
+  if (import.meta.env.DEV) console.info('[playback]', msg)
 }
 
 const title = computed(() => {
@@ -160,10 +239,12 @@ const isTs = computed(() => {
 
 const engineLabel = computed(() => {
   if (playMode.value === 'stream') {
-    return isTs.value ? 'mpegts HTTP Range' : 'progressive HTTP'
+    return viaRemux.value ? 'MP4 HTTP Range' : '原生 HTTP'
   }
   return isTs.value ? 'HLS VOD' : 'HLS / progressive'
 })
+
+const playbackStateLabel = computed(() => playError.value ? '播放失败' : liveRecording.value ? '仍在录制' : buffering.value ? '准备中' : playing.value ? '播放中' : segment.value ? '已暂停' : '等待选择')
 
 const bufferingHint = computed(() => {
   if (statusHint.value) return statusHint.value
@@ -228,6 +309,8 @@ function bindController() {
   })
   controller.on('segment', (seg) => {
     segment.value = seg
+    playError.value = ''
+    statusHint.value = ''
     emit('segment', seg)
     syncPlayMode()
     if (!seg) {
@@ -279,6 +362,11 @@ function bindController() {
   })
   controller.on('error', (msg) => {
     playError.value = msg
+    buffering.value = false
+    playing.value = false
+    clearBufferingWatch()
+    emit('busy', false)
+    loadPhase.value = 'error'
     pushDebug(`error: ${msg}`)
   })
   controller.on('relativeTime', (sec, dur) => {
@@ -310,6 +398,11 @@ function bindController() {
     syncPlayMode()
     pushDebug(message)
   })
+}
+
+function retryPlayback() {
+  playError.value = ''
+  if (segment.value) void controller.playSegment(segment.value, currentSec.value)
 }
 
 function togglePlay() {
@@ -412,7 +505,7 @@ function bumpChrome() {
   chromeVisible.value = true
   if (hideTimer) clearTimeout(hideTimer)
   hideTimer = setTimeout(() => {
-    if (playing.value && segment.value) chromeVisible.value = false
+    if (playing.value && segment.value && !rootRef.value?.contains(document.activeElement)) chromeVisible.value = false
   }, 2800)
 }
 
@@ -424,7 +517,7 @@ function ratioFromEvent(e: PointerEvent): number {
 }
 
 function onProgressDown(e: PointerEvent) {
-  if (liveRecording.value || buffering.value) return
+  if (liveRecording.value) return
   const el = e.currentTarget as HTMLElement
   el.setPointerCapture(e.pointerId)
   scrubbing.value = true
@@ -458,6 +551,10 @@ function onProgressUp(e: PointerEvent) {
 
 function onKey(e: KeyboardEvent) {
   const tag = (e.target as HTMLElement | null)?.tagName
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return
+  const target = e.target as HTMLElement | null
+  if (target?.isContentEditable || target?.closest('button, [role=slider], [role=dialog], [aria-modal=true]')) return
+  if (document.querySelector('[aria-modal=true]')) return
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
   if (e.key === ' ' || e.code === 'Space') {
     e.preventDefault()
@@ -543,7 +640,7 @@ watch(
     playError.value = ''
     loadPhase.value = 'load'
     pushDebug(`play ${seg.fileName}`)
-    void controller.playSegment(seg, 0)
+    void controller.playSegment(seg, props.playStartSec)
   },
 )
 
@@ -561,7 +658,7 @@ onMounted(async () => {
   // Watches may have fired before attach — apply pending play/scrub once ready
   if (props.playId) {
     const seg = props.playlist.find((s) => s.id === props.playId)
-    if (seg) void controller.playSegment(seg, 0)
+    if (seg) void controller.playSegment(seg, props.playStartSec)
   } else if (props.scrubWallMs != null && Number.isFinite(props.scrubWallMs)) {
     void controller.scrubToWall(props.scrubWallMs)
   }
@@ -595,10 +692,11 @@ onBeforeUnmount(() => {
     :class="{ 'chrome-hidden': segment && !chromeVisible && playing, 'bar-peek': barPeek }"
     @mousemove="onStageMove"
     @mouseleave="onPlaybackLeave"
+    @focusin="bumpChrome"
   >
     <header class="top" @mousemove.stop>
       <div class="mode">
-        <span class="pill">回放</span>
+        <span class="pill">回放</span><span class="play-state" :class="{ failed: playError }" role="status" aria-live="polite">{{ playbackStateLabel }}</span>
         <span class="ch">{{ channelName || '未选择通道' }}</span>
         <span v-if="segment" class="file" :title="segment.fileName">
           <span v-if="segment.protected">★ </span>
@@ -608,29 +706,40 @@ onBeforeUnmount(() => {
         <span v-else class="file muted">拖动时间轴中线定位回放</span>
       </div>
       <div class="top-actions">
+        <div v-if="segment && !liveRecording" class="zoom-controls" @click.stop>
+          <button type="button" class="exit ghost" aria-label="缩小回放画面" :disabled="zoom <= 1" @click="changeZoom(zoom / 1.25)">−</button>
+          <button type="button" class="exit ghost" title="还原画面；也可滚轮缩放、放大后拖动" @click="resetZoom">{{ zoom.toFixed(1) }}× · 还原</button>
+          <button type="button" class="exit ghost" aria-label="放大回放画面" :disabled="zoom >= 8" @click="changeZoom(zoom * 1.25)">＋</button>
+        </div>
         <button
           type="button"
           class="exit ghost"
           :class="{ on: showDebug }"
-          title="加载调试"
+          title="查看播放诊断"
           @click="showDebug = !showDebug"
         >
-          调试
+          诊断
         </button>
         <button type="button" class="exit" @click="emit('exit')">返回实时</button>
       </div>
     </header>
 
     <div
+      ref="stageRef"
       class="stage"
-      @click="
-        segment && !liveRecording && !coarsePointer ? togglePlay() : undefined
-      "
+      :class="{ zoomed: zoom > 1 }"
+      @click="onStageClick"
+      @wheel="onZoomWheel"
+      @pointerdown="onZoomDown"
+      @pointermove="onZoomMove"
+      @pointerup="onZoomUp"
+      @pointercancel="onZoomUp"
     >
       <video
         ref="videoRef"
         class="video"
-        :class="{ idle: !segment || liveRecording }"
+        :style="zoomStyle"
+        :class="{ idle: !segment || liveRecording || playError || (buffering && !playing) }"
         playsinline
         preload="auto"
       />
@@ -645,7 +754,14 @@ onBeforeUnmount(() => {
         <p class="hint">有录像的色块滚到中线即开始播放</p>
       </div>
 
-      <p v-if="playError && !liveRecording" class="err">{{ playError }}</p>
+      <div v-if="buffering && !playError && !liveRecording" class="playback-feedback" role="status" aria-live="polite" @click.stop>
+        <strong>{{ bufferingHint }}</strong><span>可以继续选择其他时间</span>
+        <button type="button" @click="controller.stop()">取消等待</button>
+      </div>
+      <div v-if="playError && !liveRecording" class="playback-feedback error-feedback" role="alert" @click.stop>
+        <strong>暂时无法播放</strong><span>请重新加载，或选择相邻录像片段。</span><details class="failure-details"><summary>查看原因</summary><p>{{ playError }}</p></details>
+        <div><button type="button" @click="retryPlayback">重新加载</button><button type="button" @click="emit('exit')">返回实时</button></div>
+      </div>
 
       <aside v-if="showDebug" class="debug" @click.stop>
         <div class="debug-head">
@@ -683,13 +799,16 @@ onBeforeUnmount(() => {
       <div
         class="scrub"
         role="slider"
+        tabindex="0"
+        @keydown.left.prevent.stop="skipBy(-5)"
+        @keydown.right.prevent.stop="skipBy(5)"
         :aria-valuemin="0"
         :aria-valuemax="Math.round(effectiveDuration)"
         :aria-valuenow="Math.round(scrubbing ? scrubPreview : currentSec)"
         :aria-label="`进度 ${wallNowLabel}`"
-        :aria-disabled="liveRecording || buffering"
-        :class="{ locked: buffering || liveRecording }"
-        @pointerdown="liveRecording || buffering ? undefined : onProgressDown($event)"
+        :aria-disabled="liveRecording"
+        :class="{ locked: liveRecording }"
+        @pointerdown="liveRecording ? undefined : onProgressDown($event)"
         @pointermove="onProgressMove"
         @pointerup="onProgressUp"
         @pointercancel="onProgressUp"
@@ -826,6 +945,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
+          <label class="continuous-play"><input type="checkbox" :checked="continuous" @change="emit('update:continuous', ($event.target as HTMLInputElement).checked)" />连续播放</label>
           <button
             type="button"
             class="icon"
@@ -859,6 +979,16 @@ onBeforeUnmount(() => {
 
 
 <style scoped>
+.playback-feedback { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: grid; gap: 10px; width: min(420px, 90%); padding: 20px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); text-align: center; z-index: 5; }
+.playback-feedback span { font-size: 12px; overflow-wrap: anywhere; }
+.playback-feedback button { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; color: var(--text); cursor: pointer; }
+.play-state { font-size: 12px; color: #b7c6d4; white-space: nowrap; }
+.play-state.failed { color: #ff9e99; }
+.failure-details { max-width: min(560px, 100%); text-align: left; overflow-wrap: anywhere; }
+.failure-details p { max-height: 120px; overflow: auto; margin: 8px 0; }
+.error-feedback strong { color: var(--danger); }
+.playback:focus-within .top, .playback:focus-within .bar { opacity: 1; pointer-events: auto; }
+
 .playback {
   flex: 1 1 0;
   min-width: 0;
@@ -881,7 +1011,8 @@ onBeforeUnmount(() => {
   background: linear-gradient(180deg, #161e2a, #121923);
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
-.playback.chrome-hidden .top {
+.playback:fullscreen.chrome-hidden .top,
+.playback:-webkit-full-screen.chrome-hidden .top {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-6px);
@@ -957,6 +1088,7 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 .stage {
+  overflow: hidden;
   flex: 1;
   min-height: 0;
   position: relative;
@@ -966,6 +1098,9 @@ onBeforeUnmount(() => {
   background: #05070b;
   cursor: pointer;
 }
+.stage.zoomed .video { cursor: grab; touch-action: none; }
+.stage.zoomed .video:active { cursor: grabbing; }
+.zoom-controls { display: flex; align-items: center; gap: 4px; }
 .video {
   width: 100%;
   height: 100%;
@@ -1131,7 +1266,8 @@ onBeforeUnmount(() => {
   border-top: 1px solid rgb(255 255 255 / 8%);
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
-.playback.chrome-hidden .bar {
+.playback:fullscreen.chrome-hidden .bar,
+.playback:-webkit-full-screen.chrome-hidden .bar {
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
@@ -1359,8 +1495,8 @@ onBeforeUnmount(() => {
     justify-content: space-between;
   }
   .icon {
-    width: 42px;
-    height: 42px;
+    width: 44px;
+    height: 44px;
   }
   .icon svg {
     width: 20px;
@@ -1384,10 +1520,21 @@ onBeforeUnmount(() => {
   }
   .rate {
     flex: 1;
-    height: 34px;
+    height: 44px;
   }
   .err {
     bottom: 120px;
   }
+}
+.continuous-play { display: inline-flex; align-items: center; gap: 6px; color: #d5dee8; font-size: 12px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .top { height: auto; min-height: 42px; flex-wrap: wrap; padding: 8px; gap: 6px; }
+  .top-actions { width: 100%; flex-wrap: wrap; justify-content: flex-end; }
+  .zoom-controls .exit { min-width: 36px; min-height: 36px; padding: 0 8px; }
+  .right { display: grid; grid-template-columns: minmax(0, 1fr) 80px; gap: 4px 8px; }
+  .vol { grid-row: 1; grid-column: 1; }
+  .continuous-play { grid-row: 1; grid-column: 2; min-height: 44px; justify-content: center; }
+  .rates { grid-row: 2; grid-column: 1; }
+  .right > .icon { grid-row: 2; grid-column: 2; justify-self: center; }
 }
 </style>

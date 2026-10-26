@@ -4,14 +4,59 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 func (c *Core) videosRoot() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return filepath.Join(c.root, "media")
+	return filepath.Join(c.root, "media")
+}
+
+func windowsSystemPath(p string) bool {
+	if runtime.GOOS != "windows" {
+		return false
 	}
-	return filepath.Join(home, "Videos", "Navora Monitor")
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		return false
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+	return samePath(abs, root) || strings.HasPrefix(strings.ToLower(abs), strings.ToLower(filepath.Clean(root)+string(os.PathSeparator)))
+}
+
+// Pin legacy defaults only when there is existing content. Never move files or
+// silently lose access to recordings written under the former service account.
+func (c *Core) storageDefaults(s Settings, legacy bool) Settings {
+	if s.RecordCachePath == "" {
+		s.RecordCachePath = filepath.Join(c.root, "record-cache")
+	}
+	if !filepath.IsAbs(s.RecordCachePath) {
+		s.RecordCachePath = filepath.Join(c.root, s.RecordCachePath)
+	}
+	home, _ := os.UserHomeDir()
+	for _, item := range []struct {
+		path *string
+		leaf string
+	}{
+		{&s.RecordingsPath, "recordings"}, {&s.SavedClipsPath, "saved"}, {&s.SnapshotsPath, "snapshots"},
+	} {
+		if *item.path != "" {
+			if !filepath.IsAbs(*item.path) {
+				*item.path = filepath.Join(c.root, *item.path)
+			}
+			continue
+		}
+		*item.path = filepath.Join(c.videosRoot(), item.leaf)
+		if legacy && home != "" {
+			old := filepath.Join(home, "Videos", "Navora Monitor", item.leaf)
+			if entries, err := os.ReadDir(old); err == nil && len(entries) > 0 {
+				*item.path = old
+			}
+		}
+	}
+	return s
 }
 
 func (c *Core) recordingsRoot() string {

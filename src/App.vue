@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import type { AppInfo, ChannelConfig, ChannelRuntimeState, RecordingSegment } from '@shared/types'
 import { DEFAULT_GROUP, channelGroup, listGroups, normalizeGroupName } from '@shared/groups'
 import {
@@ -16,21 +16,22 @@ import { browserSupportsHevcMse } from '@shared/hevc-mse'
 import TitleBar from './components/TitleBar.vue'
 import DeviceTree from './components/DeviceTree.vue'
 import MosaicView from './components/MosaicView.vue'
-import PlaybackView from './components/PlaybackView.vue'
-import GroupsDialog from './components/GroupsDialog.vue'
-import DeviceScanDialog from './components/DeviceScanDialog.vue'
-import ConfigTransferDialog from './components/ConfigTransferDialog.vue'
-import ChannelDialog from './components/ChannelDialog.vue'
+const PlaybackView = defineAsyncComponent(() => import('./components/PlaybackView.vue'))
 import TimelinePanel from './components/TimelinePanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import ResizeHandle from './components/ResizeHandle.vue'
-import SettingsView from './components/SettingsView.vue'
 import ContextMenuHost from './components/ContextMenuHost.vue'
 import ServerDialogs from './components/ServerDialogs.vue'
 import { login as apiLogin, logout as apiLogout, probeSession, startEvents, uploadConfigFile } from './api/bridge'
 import type { AppSettings } from '@shared/settings'
 import { DEFAULT_SETTINGS } from '@shared/settings'
 import { applyUiTheme, type UiTheme } from './theme'
+
+const GroupsDialog = defineAsyncComponent(() => import('./components/GroupsDialog.vue'))
+const DeviceScanDialog = defineAsyncComponent(() => import('./components/DeviceScanDialog.vue'))
+const ConfigTransferDialog = defineAsyncComponent(() => import('./components/ConfigTransferDialog.vue'))
+const ChannelDialog = defineAsyncComponent(() => import('./components/ChannelDialog.vue'))
+const SettingsView = defineAsyncComponent(() => import('./components/SettingsView.vue'))
 
 function api() {
   return window.navoraMonitor
@@ -70,10 +71,16 @@ const appSettings = ref<AppSettings>({ ...DEFAULT_SETTINGS })
 const viewMode = ref<'live' | 'playback'>('live')
 const playbackSeg = ref<RecordingSegment | null>(null)
 const exportBusy = ref(false)
+const exportFeedback = ref<{ kind: 'success' | 'error'; text: string } | null>(null)
+let exportAbort: AbortController | null = null
+function cancelExport() {
+  exportAbort?.abort()
+}
 const playbackScrubWallMs = ref<number | null>(null)
 const playbackScrubNonce = ref(0)
 const playbackPlayId = ref<string | null>(null)
 const playbackPlayNonce = ref(0)
+const playbackPlayStartSec = ref(0)
 const playbackFollowMs = ref<number | null>(null)
 const playbackRate = ref(1)
 const playbackContinuous = ref(true)
@@ -125,7 +132,7 @@ const layoutMode = computed<'grid' | 'scroll'>(() => (mobile.value ? 'scroll' : 
 const mobileTimelineHeight = computed(() => {
   if (typeof window === 'undefined') return 196
   const vh = window.innerHeight || 700
-  const base = Math.min(220, Math.max(168, vh * 0.27))
+  const base = Math.min(300, Math.max(260, vh * 0.35))
   return Math.round(base + 28)
 })
 const selected = computed(() => channels.value.find((c) => c.id === selectedId.value) ?? null)
@@ -142,11 +149,7 @@ const timelineFollowLiveEdge = computed(() => {
   if (viewMode.value !== 'live') return false
   if (!layout.showTimeline) return false
   if (!windowVisible.value) return false
-  const ids = slotIds.value.slice(0, layout.mosaic).filter((x): x is string => !!x)
-  return ids.some((id) => {
-    const st = states.value[id]
-    return st?.preview === 'live' || st?.preview === 'starting'
-  })
+  return selectedId.value !== null
 })
 const groups = computed(() => listGroups(channels.value, groupOrder.value))
 
@@ -182,7 +185,10 @@ async function refreshInfo() {
   info.value = await api().getAppInfo()
 }
 
+let recordingsGeneration = 0
 async function refreshRecordings(opts?: { silent?: boolean }) {
+  const generation = ++recordingsGeneration
+  const requestedChannel = selectedId.value
   if (!opts?.silent) segmentsLoading.value = true
   try {
     const id = selectedId.value ?? undefined
@@ -190,10 +196,11 @@ async function refreshRecordings(opts?: { silent?: boolean }) {
       api().listRecordings(id),
       api().listSavedClips(id),
     ])
+    if (generation !== recordingsGeneration || requestedChannel !== selectedId.value) return
     segments.value = loop
     savedClips.value = saved
   } finally {
-    if (!opts?.silent) segmentsLoading.value = false
+    if (generation === recordingsGeneration) segmentsLoading.value = false
   }
 }
 
@@ -229,6 +236,7 @@ function setSlotIds(next: (string | null)[]) {
 
 /** Which cell is the exclusive single picture, if the user enlarged one pane. */
 const enlargedSlot = ref<number | null>(null)
+const previewScope = ref<number | null>(null)
 
 function ensureSlot(id: string) {
   if (slotIds.value.includes(id)) return
@@ -253,7 +261,7 @@ function placeOnSlot(id: string, slotIndex: number) {
   setSlotIds(next)
 }
 
-function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
+function mosaicForCount(n: number): 1 | 4 | 6 | 8 | 9 | 13 | 16 {
   if (n <= 1) return 1
   if (n <= 4) return 4
   if (n <= 9) return 9
@@ -419,7 +427,8 @@ function setPanelSize(key: keyof PanelSizes, value: number) {
   scheduleSaveLayout()
 }
 
-function setMosaic(n: 1 | 4 | 9 | 16) {
+function setMosaic(n: 1 | 4 | 6 | 8 | 9 | 13 | 16) {
+  layout.featuredLayout = false
   layout.mosaic = n
   if (mobile.value) {
     const kept = slotIds.value.slice(0, n).filter((x): x is string => !!x)
@@ -562,12 +571,15 @@ function exitPlayback() {
   scheduleSyncPreviews()
 }
 
-function onPlaybackPlay(seg: RecordingSegment) {
+function onPlaybackPlay(seg: RecordingSegment, startSec = 0) {
+  status.value = `正在播放 · ${seg.protected ? '已保存片段' : '循环录像'}`
   if (seg.protected) timelineSource.value = 'saved'
   else timelineSource.value = 'loop'
+  playbackPlayStartSec.value = Math.max(0, startSec)
+  playbackScrubWallMs.value = null
   playbackPlayId.value = seg.id
   playbackPlayNonce.value += 1
-  playbackFollowMs.value = seg.startMs ?? seg.mtimeMs
+  playbackFollowMs.value = (seg.startMs ?? seg.mtimeMs) + playbackPlayStartSec.value * 1000
   if (viewMode.value !== 'playback') viewMode.value = 'playback'
   if (!layout.showTimeline) setShowTimeline(true)
 }
@@ -577,9 +589,9 @@ function onTimelineScrub(payload: {
   segment: RecordingSegment | null
   seekSec: number
 }) {
-  if (playbackBusy.value) return
   if (viewMode.value !== 'playback') viewMode.value = 'playback'
   if (!layout.showTimeline) setShowTimeline(true)
+  if (payload.segment?.protected) { onPlaybackPlay(payload.segment, payload.seekSec); return }
   // Do not write followMs here — avoids fighting the player follow throttle during seek
   playbackScrubWallMs.value = payload.atMs
   playbackScrubNonce.value += 1
@@ -611,7 +623,9 @@ function activeSlotIds(): string[] {
 
 /** Mosaic slots minus channels the user explicitly paused/stopped. */
 function activePreviewIds(): string[] {
-  return activeSlotIds().filter((id) => !pausedPreviews.has(id))
+  if (viewMode.value !== 'live') return []
+  const ids = previewScope.value == null ? activeSlotIds() : [slotIds.value[previewScope.value]].filter((id): id is string => !!id)
+  return [...new Set(ids)].filter((id) => !pausedPreviews.has(id))
 }
 
 function scheduleSyncPreviews() {
@@ -624,7 +638,7 @@ function scheduleSyncPreviews() {
       .catch(() => undefined)
       .then(async () => {
         if (gen !== syncGen) return
-        const want = !windowVisible.value || !playersEnabled.value ? [] : activePreviewIds()
+        const want = !playersEnabled.value ? [] : activePreviewIds()
         // Ensure UI already dropped players for anything not in `want`.
         const drop: string[] = []
         for (const id of Object.keys(states.value)) {
@@ -683,28 +697,13 @@ async function onWindowVisibility(p: { visible: boolean }) {
   if (windowVisible.value === next && playersEnabled.value === next) return
   windowVisible.value = next
   if (!next) {
-    if (syncTimer) clearTimeout(syncTimer)
-    playersEnabled.value = false
-    try {
-      // Same order as removing mosaic cells: drop players, then stop FFmpeg.
-      for (const id of Object.keys(states.value)) {
-        const st = states.value[id]
-        if (!st) continue
-        if (st.preview === 'idle' && !st.previewUrl) continue
-        states.value[id] = { ...st, preview: 'idle', previewUrl: null, previewError: null }
-      }
-      await nextTick()
-      await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
-      await api().syncPreviews([])
-      await refreshStates()
-    } catch {
-      /* ignore */
-    }
-    status.value = '窗口已隐藏 · 预览已暂停（录像仍继续）'
+    // Keep mounted players and the shared upstream preview alive across tab
+    // switches. Only page dismissal or explicit removal releases previews.
+    status.value = '页面在后台 · 保持预览连接（录像继续）'
   } else {
     playersEnabled.value = true
     scheduleSyncPreviews()
-    status.value = '窗口已恢复 · 正在恢复预览'
+    status.value = '页面已恢复 · 继续预览'
   }
 }
 
@@ -1379,6 +1378,7 @@ async function onSnapshot(channelId: string, dataUrl: string) {
 }
 
 async function onSaveClip(channelId?: string) {
+  exportFeedback.value = null
   const id = channelId ?? selectedId.value
   if (!id) {
     status.value = '请先选择通道'
@@ -1408,11 +1408,15 @@ async function onExportRange(payload: {
 }) {
   if (exportBusy.value) return
   exportBusy.value = true
+  exportFeedback.value = null
+  const abort = new AbortController()
+  exportAbort = abort
   status.value = '正在裁切拼接片段…'
   try {
-    const res = await api().exportClipRange(payload)
+    const res = await api().exportClipRange({ ...payload, signal: abort.signal })
     if (res.ok) {
       status.value = res.message
+      exportFeedback.value = { kind: 'success', text: '片段已保存，可在“已保存”中查看。' }
       timelineRef.value?.clearSelection?.()
       timelineRef.value?.setSelectMode?.(false)
       timelineRef.value?.setSource?.('saved')
@@ -1420,10 +1424,15 @@ async function onExportRange(payload: {
       await refreshDiskSpace()
     } else if (!res.canceled) {
       status.value = res.error
+      exportFeedback.value = { kind: 'error', text: res.error }
     } else {
       status.value = '已取消导出'
     }
+  } catch (error) {
+    status.value = abort.signal.aborted ? '已取消等待导出；若文件已完成发布，可在已保存中查看' : error instanceof Error ? error.message : '导出失败，请重试'
+    if (!abort.signal.aborted) exportFeedback.value = { kind: 'error', text: status.value }
   } finally {
+    if (exportAbort === abort) exportAbort = null
     exportBusy.value = false
   }
 }
@@ -1435,6 +1444,16 @@ async function onDeleteSaved(seg: RecordingSegment) {
   status.value = res.ok ? `已删除受保护片段：${seg.fileName}` : res.error
   await refreshRecordings()
   await refreshDiskSpace()
+}
+
+function onDownloadSegment(seg: RecordingSegment) {
+  const link = document.createElement('a')
+  link.href = `/media/files/${seg.protected ? 'saved' : 'recordings'}/${encodeURIComponent(seg.channelId)}/${encodeURIComponent(seg.fileName)}?download=1`
+  link.download = seg.fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  status.value = `已发起下载：${seg.fileName}，请在浏览器下载列表查看`
 }
 
 async function onSettingsSaved(s: AppSettings) {
@@ -1671,6 +1690,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  exportAbort?.abort()
   if (pollTimer) clearInterval(pollTimer)
   if (diskTimer) clearInterval(diskTimer)
   if (layoutTimer) clearTimeout(layoutTimer)
@@ -1746,6 +1766,7 @@ watch(selectedId, (id) => {
     <TitleBar
       :title="selected?.name ?? '未选择通道'"
       :mosaic="layout.mosaic"
+      :featured-layout="layout.featuredLayout"
       :recording-count="recordingCount"
       :ffmpeg-ok="!!info?.ffmpegOk"
       :groups="groups"
@@ -1756,6 +1777,7 @@ watch(selectedId, (id) => {
       :ui-theme="appSettings.uiTheme"
       :compact="mobile"
       @mosaic="setMosaic"
+      @featured-layout="n => { setMosaic(n); layout.featuredLayout = true; scheduleSaveLayout() }"
       @update:active-group="(g) => (activeGroup = g)"
       @update:show-explorer="setShowExplorer"
       @update:show-timeline="setShowTimeline"
@@ -1793,7 +1815,6 @@ watch(selectedId, (id) => {
       @maximize="() => api().windowMaximize()"
       @close="() => api().windowClose()"
       @logout="onLogout"
-      @quit-app="onQuitApp"
     />
 
     <SettingsView
@@ -1913,24 +1934,25 @@ watch(selectedId, (id) => {
           :scrub-nonce="playbackScrubNonce"
           :play-id="playbackPlayId"
           :play-nonce="playbackPlayNonce"
-          :suspended="!windowVisible"
+          :play-start-sec="playbackPlayStartSec"
           :media-base-url="info?.mediaBaseUrl ?? null"
           @exit="exitPlayback"
           @follow="onPlaybackFollow"
           @segment="onPlaybackSegment"
           @playlist-ended="onPlaylistEnded"
           @busy="(on) => (playbackBusy = on)"
+          @update:continuous="(enabled) => (playbackContinuous = enabled)"
           @update:rate="(r) => (playbackRate = r)"
         />
         <MosaicView
           v-else
           :mosaic="layout.mosaic"
+          :featured-layout="layout.featuredLayout"
           :channels="channels"
           :states="states"
           :selected-id="selectedId"
           :slot-ids="slotIds"
-          :playback-suspended="!windowVisible"
-          :players-enabled="playersEnabled && windowVisible"
+          :players-enabled="playersEnabled"
           :layout-mode="layoutMode"
           @select="onSelect"
           @assign="onAssignSlot"
@@ -1940,7 +1962,8 @@ watch(selectedId, (id) => {
           @save-clip="onSaveClip"
           @enter-playback="() => enterPlayback()"
           @menu="onContextMenu"
-          @enlarged="(index) => (enlargedSlot = index)"
+          @enlarged="(index) => { enlargedSlot = index }"
+          @preview-scope="(index) => { previewScope = index; scheduleSyncPreviews() }"
           @slot-drag="onMosaicSlotDrag"
           @hevc-unsupported="onHevcUnsupported"
         />
@@ -1988,18 +2011,24 @@ watch(selectedId, (id) => {
             @update:value="(v) => setPanelSize('timeline', v)"
           />
           <TimelinePanel
+            :rate="playbackRate"
+            :continuous="playbackContinuous"
             ref="timelineRef"
             :height="mobile ? mobileTimelineHeight : layout.panelSizes.timeline"
             :channel-id="selectedId"
             :channel-name="selected?.name ?? null"
             :segments="segments"
             :saved-clips="savedClips"
+            :source="timelineSource"
             :loading="segmentsLoading"
-            :scrub-locked="viewMode === 'playback' && playbackBusy"
+            :scrub-locked="false"
             :saved-clip-minutes="Math.round((appSettings.savedClipDurationSec || 600) / 60)"
             :playing-id="playbackSeg?.id ?? null"
             :active="viewMode === 'playback'"
             :export-busy="exportBusy"
+            :export-feedback="exportFeedback"
+            @dismiss-export-feedback="exportFeedback = null"
+            @cancel-export="cancelExport"
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
             :follow-live-edge="timelineFollowLiveEdge"
             :channel-recording="!!selectedId && states[selectedId]?.recording === 'recording'"
@@ -2007,6 +2036,7 @@ watch(selectedId, (id) => {
             @refresh="refreshRecordings"
             @save-clip="() => onSaveClip()"
             @delete-saved="onDeleteSaved"
+            @download="onDownloadSegment"
             @activate="() => enterPlayback()"
             @play="onPlaybackPlay"
             @scrub="onTimelineScrub"
@@ -2021,7 +2051,7 @@ watch(selectedId, (id) => {
     </div>
 
     <!-- Mobile drawer: shell-level overlay so video/timeline cannot paint above it. -->
-    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true">
+    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true" role="dialog" aria-label="设备列表">
       <div class="scrim" @click="setShowExplorer(false)" />
       <div
         class="drawer-panel"
@@ -2062,7 +2092,11 @@ watch(selectedId, (id) => {
     </div>
 
     <StatusBar
+      :disk-space="diskSpace"
+      :settings="appSettings"
+      @refresh-storage="refreshDiskSpace().catch(() => {})"
       :message="status"
+      :storage-warning="info?.storageWarning"
       :channel-count="channels.length"
       :recording-count="recordingCount"
       :data-root="info?.recordingsPath ?? info?.dataRoot ?? ''"

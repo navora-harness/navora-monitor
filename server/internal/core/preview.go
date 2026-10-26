@@ -18,11 +18,60 @@ const livePreambleMax = 512 * 1024
 // Bytes are written in order. A slow client is disconnected instead of
 // skipping packets, which would break the stream and surface as stutter.
 type liveClient struct {
-	mu   sync.Mutex
-	w    http.ResponseWriter
-	rc   *http.ResponseController
-	done chan struct{}
-	once sync.Once
+	mu         sync.Mutex
+	w          http.ResponseWriter
+	rc         *http.ResponseController
+	done       chan struct{}
+	once       sync.Once
+	queue      chan []byte
+	writerDone chan struct{}
+}
+
+// Each HTTP viewer has a bounded ordered queue. Network writes never hold up
+// the shared producer; disconnecting an overloaded viewer preserves TS packets.
+func (c *liveClient) enqueue(b []byte) bool {
+	if c.queue == nil {
+		if c.write(b) == nil {
+			return true
+		}
+		c.finish()
+		return false
+	}
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.queue <- b:
+		return true
+	default:
+		c.finish()
+		return false
+	}
+}
+
+func (c *liveClient) startWriter() {
+	c.writerDone = make(chan struct{})
+	go func() {
+		defer close(c.writerDone)
+		for {
+			select {
+			case <-c.done:
+				return
+			default:
+			}
+			select {
+			case <-c.done:
+				return
+			case b := <-c.queue:
+				if c.write(b) != nil {
+					c.finish()
+					return
+				}
+			}
+		}
+	}()
 }
 
 func (c *liveClient) write(b []byte) (err error) {
@@ -95,7 +144,7 @@ func (l *livePipe) publish(chunk []byte) {
 	l.mu.Unlock()
 	var dead []*liveClient
 	for _, c := range clients {
-		if err := c.write(b); err != nil {
+		if !c.enqueue(b) {
 			dead = append(dead, c)
 		}
 	}
@@ -107,6 +156,19 @@ func (l *livePipe) publish(chunk []byte) {
 		delete(l.subs, c)
 	}
 	l.mu.Unlock()
+}
+
+// Snapshot and subscription are atomic so joining cannot miss stream packets
+// between the preamble and the first queued live chunk.
+func (l *livePipe) subscribe(c *liveClient) ([][]byte, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		c.finish()
+		return nil, false
+	}
+	l.subs[c] = struct{}{}
+	return append([][]byte(nil), l.pre...), true
 }
 
 func (l *livePipe) preamble() [][]byte {
@@ -152,6 +214,8 @@ func (l *livePipe) close() {
 }
 
 type prevSession struct {
+	exited   bool
+	released bool
 	cmd      *exec.Cmd
 	started  time.Time
 	errBuf   *limitedBuf
@@ -222,12 +286,12 @@ func (p *previewMgr) state(id string) (status string, url *string, errp *string)
 	if s == nil {
 		return "idle", nil, nil
 	}
-	if s.cmd != nil && s.cmd.ProcessState != nil && s.cmd.ProcessState.Exited() {
+	if s.exited {
 		msg := s.errBuf.String()
 		if msg == "" {
 			msg = "预览进程已退出"
 		}
-		return "error", nil, strPtr(msg)
+		return "error", nil, strPtr(redactSecrets(msg))
 	}
 	if s.starting {
 		return "starting", &u, nil
@@ -239,7 +303,10 @@ func (p *previewMgr) reconcile() {
 	want := p.c.wantedPreviews()
 	p.mu.Lock()
 	for id, s := range p.sess {
-		hit := time.Since(s.lastHit) < 20*time.Second
+		if want[id] {
+			s.released = false
+		}
+		hit := !s.released && time.Since(s.lastHit) < 20*time.Second
 		viewers := 0
 		if s.live != nil {
 			viewers = s.live.count()
@@ -247,7 +314,7 @@ func (p *previewMgr) reconcile() {
 		if want[id] || hit || viewers > 0 {
 			continue
 		}
-		if time.Since(s.started) < 8*time.Second {
+		if !s.released && time.Since(s.started) < 8*time.Second {
 			continue
 		}
 		delete(p.sess, id)
@@ -256,7 +323,7 @@ func (p *previewMgr) reconcile() {
 	var missing []string
 	for id := range want {
 		s := p.sess[id]
-		dead := s == nil || (s.cmd != nil && s.cmd.ProcessState != nil && s.cmd.ProcessState.Exited())
+		dead := s == nil || (s.exited)
 		if dead {
 			missing = append(missing, id)
 		}
@@ -265,6 +332,18 @@ func (p *previewMgr) reconcile() {
 	for _, id := range missing {
 		_ = p.start(id)
 	}
+}
+
+// Explicitly hidden/removed cells need no reconnect grace period. Other
+// sessions' wants and active HTTP viewers are still checked by reconcile.
+func (p *previewMgr) releaseWanted(ids []string) {
+	p.mu.Lock()
+	for _, id := range ids {
+		if session := p.sess[id]; session != nil {
+			session.released = true
+		}
+	}
+	p.mu.Unlock()
 }
 
 func killPreview(s *prevSession) {
@@ -283,7 +362,7 @@ func killPreview(s *prevSession) {
 func (p *previewMgr) start(id string) error {
 	p.mu.Lock()
 	if s := p.sess[id]; s != nil {
-		alive := s.cmd != nil && s.cmd.Process != nil && (s.cmd.ProcessState == nil || !s.cmd.ProcessState.Exited())
+		alive := s.cmd != nil && s.cmd.Process != nil && !s.exited
 		// starting+nil cmd = reserved by an in-flight start (avoids double FFmpeg).
 		if alive || (s.starting && s.cmd == nil) {
 			p.mu.Unlock()
@@ -335,12 +414,12 @@ func (p *previewMgr) start(id string) error {
 		return failReserve(err)
 	}
 	trackMediaChild(cmd)
-	go func() { _ = cmd.Wait() }()
 	p.mu.Lock()
 	cur := p.sess[id]
 	if cur == nil || cur.live != pipe {
 		p.mu.Unlock()
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		pipe.close()
 		return nil
 	}
@@ -348,6 +427,16 @@ func (p *previewMgr) start(id string) error {
 	cur.errBuf = eb
 	p.mu.Unlock()
 	go func() {
+		defer func() {
+			_ = cmd.Wait()
+			p.mu.Lock()
+			if s := p.sess[id]; s != nil && s.cmd == cmd {
+				s.exited = true
+				s.starting = false
+			}
+			p.mu.Unlock()
+			pipe.close()
+		}()
 		buf := make([]byte, 32*1024)
 		saw := false
 		for {
@@ -411,12 +500,17 @@ func (p *previewMgr) serveStream(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	client := &liveClient{
-		w:    w,
-		rc:   http.NewResponseController(w),
-		done: make(chan struct{}),
+		w:     w,
+		rc:    http.NewResponseController(w),
+		done:  make(chan struct{}),
+		queue: make(chan []byte, 16),
 	}
 	defer func() {
+		client.finish()
 		client.detach()
+		if client.writerDone != nil {
+			<-client.writerDone
+		}
 		pipe.remove(client)
 	}()
 	w.Header().Set("Content-Type", "video/mp2t")
@@ -425,16 +519,17 @@ func (p *previewMgr) serveStream(w http.ResponseWriter, r *http.Request, id stri
 	w.WriteHeader(200)
 	// Join after the status line so publish cannot write the body first,
 	// and drop the writer before this handler returns.
-	pre := pipe.preamble()
+	pre, subscribed := pipe.subscribe(client)
+	if !subscribed {
+		return
+	}
 	for _, b := range pre {
 		if err := client.write(b); err != nil {
 			return
 		}
 	}
-	if !pipe.add(client) {
-		return
-	}
 	flusher.Flush()
+	client.startWriter()
 	select {
 	case <-r.Context().Done():
 	case <-client.done:

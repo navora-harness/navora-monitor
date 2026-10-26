@@ -1,11 +1,14 @@
 package core
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,11 +20,25 @@ import (
 )
 
 type mediaKit struct {
-	c          *Core
-	sem        chan struct{}
-	mu         sync.Mutex
-	disk       diskSnap
-	lastAction map[string]any
+	work          mediaScheduler
+	diskCompute   sync.Mutex
+	rateAt        time.Time
+	rateSizes     map[string]int64
+	rateValue     float64
+	jobsMu        sync.Mutex
+	jobs          map[string]*playbackJob
+	c             *Core
+	sem           chan struct{}
+	exportSem     chan struct{}
+	exportSlots   chan struct{}
+	leases        fileLeases
+	indexMu       sync.Mutex
+	indexCache    map[string]cachedMediaIndex
+	indexRecords  int
+	metadataRetry map[string]time.Time
+	mu            sync.Mutex
+	disk          diskSnap
+	lastAction    map[string]any
 }
 
 type diskSnap struct {
@@ -30,6 +47,8 @@ type diskSnap struct {
 }
 
 type DiskInfo struct {
+	CacheFreeBytes     *uint64  `json:"cacheFreeBytes,omitempty"`
+	CacheLevel         string   `json:"cacheLevel,omitempty"`
 	Path               string   `json:"path"`
 	FreeBytes          uint64   `json:"freeBytes"`
 	TotalBytes         uint64   `json:"totalBytes"`
@@ -50,7 +69,7 @@ type DiskInfo struct {
 }
 
 func newMedia(c *Core) *mediaKit {
-	return &mediaKit{c: c, sem: make(chan struct{}, 1)}
+	return &mediaKit{c: c, sem: make(chan struct{}, 1), exportSem: make(chan struct{}, 1), exportSlots: make(chan struct{}, 4)}
 }
 
 func (m *mediaKit) withExclusive(fn func()) {
@@ -60,6 +79,8 @@ func (m *mediaKit) withExclusive(fn func()) {
 }
 
 func (c *Core) Disk() DiskInfo {
+	c.media.diskCompute.Lock()
+	defer c.media.diskCompute.Unlock()
 	c.media.mu.Lock()
 	if time.Since(c.media.disk.at) < 8*time.Second {
 		info := c.media.disk.info
@@ -85,10 +106,29 @@ func (c *Core) computeDisk() DiskInfo {
 	if derr == nil && total > 0 {
 		level = evaluateStorageLevel(free, s.DiskWarnFreeGb, s.DiskStopFreeGb)
 	}
+	var cacheFree *uint64
+	cacheLevel := ""
+	limitingFree := free
+	if cache := c.cacheRoot(); cache != "" {
+		available, _, cacheErr := diskUsage(cache)
+		if cacheErr == nil {
+			cacheFree = &available
+			cacheLevel = evaluateStorageLevel(available, s.DiskWarnFreeGb, s.DiskStopFreeGb)
+			if available < limitingFree {
+				limitingFree = available
+			}
+			if cacheLevel == "critical" || cacheLevel == "warn" && level == "ok" {
+				level = cacheLevel
+			}
+		} else {
+			cacheLevel = "critical"
+			level = "critical"
+		}
+	}
 	rate := c.writeRate()
 	var remain *float64
 	if rate > 0 && free > 0 {
-		v := float64(free) / rate
+		v := float64(limitingFree) / rate
 		remain = &v
 	}
 	var need *float64
@@ -119,6 +159,7 @@ func (c *Core) computeDisk() DiskInfo {
 		ratio = float64(free) / float64(total)
 	}
 	return DiskInfo{
+		CacheFreeBytes: cacheFree, CacheLevel: cacheLevel,
 		Path:               root,
 		FreeBytes:          free,
 		TotalBytes:         total,
@@ -139,25 +180,61 @@ func (c *Core) computeDisk() DiskInfo {
 }
 
 func (c *Core) writeRate() float64 {
-	type sample struct {
-		dir string
-		el  float64
-	}
 	c.rec.mu.Lock()
-	var samples []sample
-	for _, s := range c.rec.sess {
-		el := time.Since(s.started).Seconds()
-		if el < 15 || s.dir == "" {
-			continue
-		}
-		samples = append(samples, sample{s.dir, el})
+	dirs := map[string]string{}
+	for id, session := range c.rec.sess {
+		dirs[id] = session.dir
 	}
 	c.rec.mu.Unlock()
-	var rate float64
-	for _, s := range samples {
-		rate += float64(dirSize(s.dir)) / s.el
+	sizes := map[string]int64{}
+	modified := map[string]time.Time{}
+	for id, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		// Names include a sortable wall-clock suffix. Keep a few recent files;
+		// historical storage size must never be counted as newly-written bytes.
+		count := 0
+		for i := len(entries) - 1; i >= 0 && count < 4; i-- {
+			entry := entries[i]
+			if entry.IsDir() || !isRecordingMediaFile(entry.Name()) {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			sizes[id+"/"+entry.Name()] = info.Size()
+			modified[id+"/"+entry.Name()] = info.ModTime()
+			count++
+		}
 	}
-	return rate
+	now := time.Now()
+	c.media.mu.Lock()
+	defer c.media.mu.Unlock()
+	var delta int64
+	if !c.media.rateAt.IsZero() {
+		for key, size := range sizes {
+			old, known := c.media.rateSizes[key]
+			if !known && modified[key].Before(c.media.rateAt) {
+				continue
+			}
+			if size > old {
+				delta += size - old
+			}
+		}
+		seconds := now.Sub(c.media.rateAt).Seconds()
+		if seconds > 0 {
+			c.media.rateValue = float64(delta) / seconds
+		}
+	}
+	if len(dirs) == 0 {
+		c.media.rateValue = 0
+	}
+	c.media.rateSizes = sizes
+	c.media.rateAt = now
+	return c.media.rateValue
 }
 
 func dirSize(root string) uint64 {
@@ -205,10 +282,10 @@ func (c *Core) cleanupUntil(target int64) {
 		if err != nil {
 			continue
 		}
-		if isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
+		if c.sourceWriting(f) || isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
 			continue
 		}
-		if os.Remove(f) == nil {
+		if c.removeMedia(f) == nil {
 			deleted++
 			freed += uint64(st.Size())
 		}
@@ -233,7 +310,7 @@ func (c *Core) cleanupOlderThanDays(days int) {
 		if err != nil {
 			continue
 		}
-		if isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
+		if c.sourceWriting(f) || isSegmentWriting(st.ModTime().UnixMilli(), nowMs) {
 			continue
 		}
 		// Match timeline perception: age by filename stamp (content start),
@@ -241,7 +318,7 @@ func (c *Core) cleanupOlderThanDays(days int) {
 		if !recordingContentTime(f, st.ModTime()).Before(cut) {
 			continue
 		}
-		if os.Remove(f) == nil {
+		if c.removeMedia(f) == nil {
 			deleted++
 			freed += uint64(st.Size())
 		}
@@ -263,23 +340,21 @@ func (c *Core) noteAction(a map[string]any) {
 }
 
 func (c *Core) loopFiles() []string {
-	var files []string
-	root := c.recordingsRoot()
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		if isRecordingMediaFile(info.Name()) {
-			files = append(files, path)
+	type candidate struct {
+		path string
+		mod  time.Time
+	}
+	var items []candidate
+	_ = filepath.Walk(c.recordingsRoot(), func(path string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() && isRecordingMediaFile(info.Name()) {
+			items = append(items, candidate{path, info.ModTime()})
 		}
 		return nil
 	})
-	for i := 1; i < len(files); i++ {
-		j := i
-		for j > 0 && olderFile(files[j], files[j-1]) {
-			files[j], files[j-1] = files[j-1], files[j]
-			j--
-		}
+	sort.Slice(items, func(i, j int) bool { return items[i].mod.Before(items[j].mod) })
+	files := make([]string, len(items))
+	for i, item := range items {
+		files[i] = item.path
 	}
 	return files
 }
@@ -296,7 +371,7 @@ func olderFile(a, b string) bool {
 func (c *Core) ClearLoop() DiskInfo {
 	c.rec.stopAll()
 	for _, f := range c.loopFiles() {
-		_ = os.Remove(f)
+		_ = c.removeMedia(f)
 	}
 	c.noteAction(map[string]any{"type": "cleanup", "message": "已清空循环录像", "at": time.Now().UnixMilli()})
 	return c.Disk()
@@ -312,18 +387,21 @@ func (c *Core) RunCleanup() DiskInfo {
 }
 
 type Segment struct {
-	ID          string  `json:"id"`
-	ChannelID   string  `json:"channelId"`
-	FileName    string  `json:"fileName"`
-	Path        string  `json:"path"`
-	URL         string  `json:"url"`
-	PlaybackURL *string `json:"playbackUrl"`
-	SizeBytes   int64   `json:"sizeBytes"`
-	MtimeMs     int64   `json:"mtimeMs"`
-	StartMs     *int64  `json:"startMs"`
-	EndMs       *int64  `json:"endMs"`
-	Protected   bool    `json:"protected,omitempty"`
-	SavedAt     *int64  `json:"savedAt,omitempty"`
+	ID            string  `json:"id"`
+	ChannelID     string  `json:"channelId"`
+	FileName      string  `json:"fileName"`
+	Path          string  `json:"path"`
+	URL           string  `json:"url"`
+	PlaybackURL   *string `json:"playbackUrl"`
+	SizeBytes     int64   `json:"sizeBytes"`
+	MtimeMs       int64   `json:"mtimeMs"`
+	StartMs       *int64  `json:"startMs"`
+	EndMs         *int64  `json:"endMs"`
+	State         string  `json:"state,omitempty"`
+	SourceVersion string  `json:"sourceVersion,omitempty"`
+	TimeMeasured  bool    `json:"timeMeasured"`
+	Protected     bool    `json:"protected,omitempty"`
+	SavedAt       *int64  `json:"savedAt,omitempty"`
 }
 
 func (c *Core) ListRecordings(channelID string) []Segment {
@@ -344,20 +422,33 @@ func (c *Core) listKind(kind, channelID string, protected bool) []Segment {
 			ids = append(ids, ch.ID)
 		}
 	}
-	segSec := c.Settings().DefaultSegmentTimeSec
+	defaultSegSec := c.Settings().DefaultSegmentTimeSec
+	segSec := defaultSegSec
 	if segSec < 10 {
 		segSec = 300
 	}
 	out := []Segment{}
 	now := time.Now().UnixMilli()
 	for _, id := range ids {
+		segSec = defaultSegSec
+		for _, ch := range channels {
+			if ch.ID == id && ch.SegmentTimeSec >= 10 {
+				segSec = ch.SegmentTimeSec
+				break
+			}
+		}
 		if !safeChannelID(id) {
 			continue
 		}
+		if segSec < 10 {
+			segSec = 300
+		}
+		activePath := c.activeRecordingPath(id)
 		var dirs []string
 		indexPath := ""
 		if kind == "saved" {
 			dirs = []string{filepath.Join(c.savedRoot(), id)}
+			indexPath = filepath.Join(c.savedRoot(), id, "index.json")
 		} else {
 			rec := filepath.Join(c.recordingsRoot(), id)
 			dirs = []string{rec}
@@ -366,7 +457,11 @@ func (c *Core) listKind(kind, channelID string, protected bool) []Segment {
 				dirs = append(dirs, filepath.Join(cache, id))
 			}
 		}
-		index := readIndex(indexPath)
+		c.media.indexMu.Lock()
+		index := c.media.readIndex(indexPath)
+		c.media.indexMu.Unlock()
+		updates := map[string]indexEntry{}
+		var removals []string
 		seen := map[string]bool{}
 		var channelSegs []Segment
 		dirty := false
@@ -388,29 +483,46 @@ func (c *Core) listKind(kind, channelID string, protected bool) []Segment {
 				// A segment file is created empty and may stay under a flush
 				// for a while. Keep a recently touched file so the live bar can draw.
 				mtime := info.ModTime().UnixMilli()
+				if info.Size() < 64 && !samePath(filepath.Join(dir, name), activePath) {
+					if preferred, resolveErr := c.resolveMedia(kind, id, name); resolveErr == nil && !samePath(preferred, filepath.Join(dir, name)) {
+						continue
+					}
+				}
 				if info.Size() < 64 && now-mtime > 180_000 {
 					continue
 				}
 				seen[name] = true
 				start, end, updated := segmentBounds(name, info, index[name], segSec, now)
-				if updated != nil && !protected {
-					index[name] = *updated
+				state := "ready"
+				if activePath != "" && samePath(filepath.Join(dir, name), activePath) {
+					state = "writing"
+				}
+				if info.Size() < 64 && state != "writing" {
+					state = "invalid"
+				}
+				measured := index[name].Measured
+				if updated != nil {
+					updates[name] = *updated
+					measured = updated.Measured
 					dirty = true
 				}
 				fileURL := "/media/files/" + kind + "/" + id + "/" + name
 				pb := fileURL
 				seg := Segment{
-					ID:          id + "/" + name,
-					ChannelID:   id,
-					FileName:    name,
-					Path:        filepath.Join(dir, name),
-					URL:         fileURL,
-					PlaybackURL: &pb,
-					SizeBytes:   info.Size(),
-					MtimeMs:     mtime,
-					StartMs:     i64ptr(start),
-					EndMs:       i64ptr(end),
-					Protected:   protected,
+					State:         state,
+					SourceVersion: strconv.FormatInt(info.Size(), 10) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 10),
+					TimeMeasured:  measured,
+					ID:            id + "/" + name,
+					ChannelID:     id,
+					FileName:      name,
+					Path:          filepath.Join(dir, name),
+					URL:           fileURL,
+					PlaybackURL:   &pb,
+					SizeBytes:     info.Size(),
+					MtimeMs:       mtime,
+					StartMs:       i64ptr(start),
+					EndMs:         i64ptr(end),
+					Protected:     protected,
 				}
 				if protected {
 					seg.SavedAt = i64ptr(mtime)
@@ -429,13 +541,25 @@ func (c *Core) listKind(kind, channelID string, protected bool) []Segment {
 			}
 			for name := range index {
 				if !alive[name] {
-					delete(index, name)
+					removals = append(removals, name)
 					dirty = true
 				}
 			}
-			if dirty && indexPath != "" {
-				writeIndex(indexPath, index)
+		}
+		if protected {
+			alive := map[string]bool{}
+			for _, s := range channelSegs {
+				alive[s.FileName] = true
 			}
+			for name := range index {
+				if !alive[name] {
+					removals = append(removals, name)
+					dirty = true
+				}
+			}
+		}
+		if dirty && indexPath != "" {
+			c.media.mergeIndexChanges(indexPath, index, updates, removals)
 		}
 		out = append(out, channelSegs...)
 	}
@@ -457,6 +581,9 @@ func deref(v *int64) int64 {
 func extendOpenSegment(segs []Segment, now int64) {
 	var latest *Segment
 	for i := range segs {
+		if segs[i].State != "writing" {
+			continue
+		}
 		start := deref(segs[i].StartMs)
 		if start > now || now-start > 20*60_000 {
 			continue
@@ -471,12 +598,14 @@ func extendOpenSegment(segs []Segment, now int64) {
 }
 
 type indexEntry struct {
-	FileName   string `json:"fileName"`
-	StartMs    int64  `json:"startMs"`
-	EndMs      int64  `json:"endMs"`
-	DurationMs int64  `json:"durationMs"`
-	SizeBytes  int64  `json:"sizeBytes"`
-	IndexedAt  int64  `json:"indexedAt"`
+	SourceVersion string `json:"sourceVersion,omitempty"`
+	Measured      bool   `json:"measured,omitempty"`
+	FileName      string `json:"fileName"`
+	StartMs       int64  `json:"startMs"`
+	EndMs         int64  `json:"endMs"`
+	DurationMs    int64  `json:"durationMs"`
+	SizeBytes     int64  `json:"sizeBytes"`
+	IndexedAt     int64  `json:"indexedAt"`
 }
 
 func readIndex(path string) map[string]indexEntry {
@@ -500,6 +629,16 @@ func readIndex(path string) map[string]indexEntry {
 func segmentBounds(name string, info os.FileInfo, idx indexEntry, segSec int, now int64) (int64, int64, *indexEntry) {
 	size := info.Size()
 	mtime := info.ModTime().UnixMilli()
+	version := strconv.FormatInt(size, 10) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	if idx.Measured && !measuredBoundsPlausible(idx, info, now) {
+		idx = indexEntry{}
+	}
+	if idx.Measured && idx.SourceVersion == version && idx.DurationMs > 0 {
+		return idx.StartMs, idx.StartMs + idx.DurationMs, nil
+	}
+	if idx.SourceVersion != "" && idx.SourceVersion != version {
+		idx = indexEntry{}
+	}
 	if idx.FileName != "" && cachedRangePlausible(idx.StartMs, idx.EndMs, idx.SizeBytes, size, segSec) {
 		return idx.StartMs, idx.EndMs, nil
 	}
@@ -529,7 +668,7 @@ func segmentBounds(name string, info os.FileInfo, idx indexEntry, segSec int, no
 	start, end := estimateSegmentBounds(parsed, mtime, probed, segSec, size, now)
 	entry := indexEntry{
 		FileName: name, StartMs: start, EndMs: end,
-		DurationMs: end - start, SizeBytes: size, IndexedAt: now,
+		DurationMs: end - start, SizeBytes: size, IndexedAt: now, SourceVersion: version,
 	}
 	return start, end, &entry
 }
@@ -554,18 +693,15 @@ func trimSegmentEnds(segs []Segment) []Segment {
 			segs[i].EndMs = i64ptr(nextStart)
 		}
 	}
-	for i := 0; i < len(segs)-1; i++ {
-		curEnd := deref(segs[i].EndMs)
-		nextStart := deref(segs[i+1].StartMs)
-		gap := nextStart - curEnd
-		if gap > 0 && gap <= 90_000 && nextStart > deref(segs[i].StartMs) {
-			segs[i].EndMs = i64ptr(nextStart)
-		}
-	}
 	return segs
 }
 
-func writeIndex(path string, index map[string]indexEntry) {
+func writeIndex(path string, index map[string]indexEntry) (err error) {
+	defer func() {
+		if err != nil {
+			log.Printf("media index update failed: %v", err)
+		}
+	}()
 	segs := make([]indexEntry, 0, len(index))
 	for _, s := range index {
 		segs = append(segs, s)
@@ -574,16 +710,27 @@ func writeIndex(path string, index map[string]indexEntry) {
 	doc := struct {
 		Version  int          `json:"version"`
 		Segments []indexEntry `json:"segments"`
-	}{Version: 1, Segments: segs}
+	}{Version: 2, Segments: segs}
 	b, err := json.Marshal(doc)
 	if err != nil {
-		return
+		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return
+	file, err := os.CreateTemp(filepath.Dir(path), ".navora-index-*")
+	if err != nil {
+		return err
 	}
-	_ = os.Rename(tmp, path)
+	defer os.Remove(file.Name())
+	if _, err = file.Write(b); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(file.Name(), path)
 }
 
 func (c *Core) resolveMedia(kind, id, name string) (string, error) {
@@ -606,15 +753,25 @@ func (c *Core) resolveMedia(kind, id, name string) (string, error) {
 		return "", errStr("路径无效")
 	}
 	var last error
+	var emptyCandidate string
 	for _, dir := range dirs {
 		p := filepath.Join(dir, name)
 		st, err := os.Stat(p)
 		if err == nil && !st.IsDir() {
+			if st.Size() < 64 {
+				if emptyCandidate == "" {
+					emptyCandidate = p
+				}
+				continue
+			}
 			return p, nil
 		}
 		if err != nil {
 			last = err
 		}
+	}
+	if emptyCandidate != "" {
+		return emptyCandidate, nil
 	}
 	if last == nil {
 		last = os.ErrNotExist
@@ -623,73 +780,118 @@ func (c *Core) resolveMedia(kind, id, name string) (string, error) {
 }
 
 func (c *Core) EnsurePlayable(kind, id, name string) (string, error) {
+	return c.EnsurePlayableContext(context.Background(), kind, id, name)
+}
+
+func (c *Core) EnsurePlayableContext(parent context.Context, kind, id, name string) (string, error) {
+	return c.prepareShared(parent, kind, id, name)
+}
+
+func (c *Core) ensurePlayableContext(parent context.Context, kind, id, name string) (string, error) {
+	h264, _ := parent.Value(playbackH264Key{}).(bool)
+	ctx, cancel := c.mediaContext(parent)
+	defer cancel()
 	src, err := c.resolveMedia(kind, id, name)
 	if err != nil {
 		return "", err
 	}
-	if strings.HasSuffix(strings.ToLower(name), ".mp4") {
-		return src, nil
+	release, err := c.media.leases.acquireContext(ctx, src)
+	if err != nil {
+		return "", err
 	}
+	defer release()
 	st, err := os.Stat(src)
 	if err != nil {
 		return "", err
 	}
+	if c.sourceWriting(src) {
+		return "", errStr("该片段仍在写入，请稍后重试")
+	}
+	if strings.HasSuffix(strings.ToLower(name), ".mp4") && !h264 {
+		return src, nil
+	}
 	sum := sha1.Sum([]byte(src))
-	key := hex.EncodeToString(sum[:8]) + "-" + strconv.FormatInt(st.Size(), 10) + "-" + strconv.FormatInt(st.ModTime().Unix(), 10) + ".mp4"
+	key := hex.EncodeToString(sum[:8]) + "-" + strconv.FormatInt(st.Size(), 10) + "-" + strconv.FormatInt(st.ModTime().UnixNano(), 10) + "-v2.mp4"
+	if h264 {
+		key = strings.TrimSuffix(key, ".mp4") + "-h264.mp4"
+	}
 	dst := filepath.Join(c.playCacheDir(), key)
-	if st2, err := os.Stat(dst); err == nil && st2.Size() > 64 {
-		c.trimPlayCache()
+	if cached, err := os.Stat(dst); err == nil && cached.Size() > 64 {
+		_ = os.Chtimes(dst, time.Now(), time.Now())
 		return dst, nil
 	}
-	var outErr error
-	c.media.withExclusive(func() {
-		if st2, err := os.Stat(dst); err == nil && st2.Size() > 64 {
-			return
+	err = c.media.work.run(ctx, func() error {
+		if cached, err := os.Stat(dst); err == nil && cached.Size() > 64 {
+			return nil
 		}
 		bin := c.ffmpegPath()
 		if bin == "" {
-			outErr = errStr("未找到 FFmpeg")
-			return
+			return errStr("未找到 FFmpeg")
 		}
-		tmp := dst + ".part.mp4"
-		_ = os.Remove(tmp)
-		var last string
-		ok := false
-		for _, mid := range faststartAttempts() {
-			_ = os.Remove(tmp)
-			buf := tailBuf(2048)
-			cmd := exec.Command(bin, faststartAttemptArgs(src, tmp, mid)...)
-			hideWindow(cmd)
-			cmd.Stderr = buf
-			err := cmd.Run()
-			stOut, stErr := os.Stat(tmp)
-			if err == nil && stErr == nil && stOut.Size() >= 64 {
-				ok = true
+		probe, err := c.probeMedia(ctx, src)
+		if err != nil {
+			return errStr("录像校验失败：" + err.Error())
+		}
+		transcode := false
+		for _, stream := range probe.Streams {
+			if stream.CodecType == "video" {
+				transcode = h264 && stream.CodecName != "h264"
 				break
 			}
-			last = buf.String()
-			if last == "" && err != nil {
-				last = err.Error()
-			}
-			if last == "" {
-				last = "转封装产物过小"
-			}
 		}
-		if !ok {
-			_ = os.Remove(tmp)
-			if len(last) > 180 {
-				last = last[len(last)-180:]
+		if !transcode && strings.HasSuffix(strings.ToLower(name), ".mp4") {
+			dst = src
+			return nil
+		}
+		tmpFile, err := os.CreateTemp(c.playCacheDir(), ".prepare-*.mp4")
+		if err != nil {
+			return err
+		}
+		tmp := tmpFile.Name()
+		if err = tmpFile.Close(); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		defer os.Remove(tmp)
+		stderr := tailBuf(2048)
+		args := playbackRemuxArgs(src, tmp, probe)
+		if transcode {
+			for i := 0; i+1 < len(args); {
+				if args[i] == "-c:v" || args[i] == "-tag:v" || args[i] == "-bsf:v" {
+					args = append(args[:i], args[i+2:]...)
+				} else {
+					i++
+				}
 			}
-			outErr = errStr("无法封装为 MP4：" + last)
-			return
+			options := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-vf", "scale=w='min(1920,iw)':h=-2,setpts=PTS-STARTPTS", "-fps_mode", "passthrough", "-threads", "2", "-tag:v", "avc1"}
+			args = append(args[:len(args)-1], append(options, tmp)...)
 		}
-		if err := os.Rename(tmp, dst); err != nil {
-			outErr = err
+		cmd := exec.CommandContext(ctx, bin, args...)
+		hideWindow(cmd)
+		cmd.Stderr = stderr
+		if err = cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return errStr("准备回放失败：" + redactSecrets(stderr.String()))
 		}
+		if _, err = c.probeMedia(ctx, tmp); err != nil {
+			return errStr("播放副本校验失败：" + err.Error())
+		}
+		after, err := os.Stat(src)
+		if err != nil || after.Size() != st.Size() || !after.ModTime().Equal(st.ModTime()) {
+			return errStr("录像发生变化，请重新加载")
+		}
+		return os.Rename(tmp, dst)
 	})
-	if outErr != nil {
-		return "", outErr
+	if err != nil {
+		return "", err
 	}
+	releaseCache, err := c.media.leases.acquireContext(ctx, dst)
+	if err != nil {
+		return "", err
+	}
+	defer releaseCache()
 	c.trimPlayCache()
 	return dst, nil
 }
@@ -712,7 +914,7 @@ func (c *Core) trimPlayCache() {
 			continue
 		}
 		info, err := e.Info()
-		if err != nil {
+		if err != nil || !strings.HasSuffix(e.Name(), ".mp4") {
 			continue
 		}
 		total += info.Size()
@@ -730,10 +932,13 @@ func (c *Core) trimPlayCache() {
 		}
 	}
 	for _, f := range files {
+		if time.Since(f.mod) < 5*time.Minute {
+			continue
+		}
 		if total <= capBytes {
 			break
 		}
-		if os.Remove(f.path) == nil {
+		if c.removeMedia(f.path) == nil {
 			total -= f.size
 		}
 	}
@@ -787,43 +992,20 @@ func (c *Core) tsNeedsRepair(path string) bool {
 	return a-v >= skewSec
 }
 
+// Repair produces a separate playable copy. Never replace an original recording.
 func (c *Core) normalizeTS(path string) bool {
 	if !strings.HasSuffix(strings.ToLower(path), ".ts") {
 		return false
 	}
-	bin := c.ffmpegPath()
-	if bin == "" {
-		return false
-	}
-	before, err := os.Stat(path)
-	if err != nil || before.Size() < 64 {
-		return false
-	}
-	tmp := path + ".norm.ts"
-	run := func(audio bool) error {
-		_ = os.Remove(tmp)
-		cmd := exec.Command(bin, buildNormalizeTsArgs(path, tmp, audio)...)
-		hideWindow(cmd)
-		return cmd.Run()
-	}
-	if err := run(true); err != nil {
-		if err2 := run(false); err2 != nil {
-			_ = os.Remove(tmp)
-			return false
+	id := filepath.Base(filepath.Dir(path))
+	for _, kind := range []string{"recordings", "saved"} {
+		resolved, err := c.resolveMedia(kind, id, filepath.Base(path))
+		if err == nil && samePath(resolved, path) {
+			_, err = c.EnsurePlayable(kind, id, filepath.Base(path))
+			return err == nil
 		}
 	}
-	after, err := os.Stat(tmp)
-	if err != nil || after.Size() < 64 || after.Size() < before.Size()/2 {
-		_ = os.Remove(tmp)
-		return false
-	}
-	_ = os.Remove(path)
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	_ = os.Chtimes(path, before.ModTime(), before.ModTime())
-	return true
+	return false
 }
 
 type RepairResult struct {
@@ -864,7 +1046,7 @@ func (c *Core) RepairTimestamps(channelID string, force bool) RepairResult {
 			continue
 		}
 		res.Scanned++
-		if isSegmentWriting(st.ModTime().UnixMilli(), time.Now().UnixMilli()) {
+		if c.sourceWriting(path) || isSegmentWriting(st.ModTime().UnixMilli(), time.Now().UnixMilli()) {
 			res.Skipped++
 			continue
 		}
@@ -874,7 +1056,7 @@ func (c *Core) RepairTimestamps(channelID string, force bool) RepairResult {
 		}
 		res.Needed++
 		ok := false
-		c.media.withExclusive(func() { ok = c.normalizeTS(path) })
+		ok = c.normalizeTS(path)
 		if ok {
 			res.Repaired++
 			_ = os.WriteFile(path+".normed", []byte("ok"), 0o644)
@@ -944,6 +1126,24 @@ func (c *Core) collectTS(channelID string) []string {
 }
 
 func (c *Core) ExportRange(channelID string, startMs, endMs int64, dest string) (string, int, error) {
+	return c.ExportRangeContext(context.Background(), channelID, startMs, endMs, dest)
+}
+
+func (c *Core) ExportRangeContext(parent context.Context, channelID string, startMs, endMs int64, dest string) (string, int, error) {
+	ctx, cancel := c.mediaContext(parent)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	select {
+	case c.media.exportSlots <- struct{}{}:
+		defer func() { <-c.media.exportSlots }()
+	default:
+		return "", 0, errStr("导出任务较多，请等待当前任务完成")
+	}
+	if startMs > endMs {
+		startMs, endMs = endMs, startMs
+	}
 	if !safeChannelID(channelID) {
 		return "", 0, errStr("通道无效")
 	}
@@ -954,18 +1154,70 @@ func (c *Core) ExportRange(channelID string, startMs, endMs int64, dest string) 
 	}
 	if dest == "" {
 		stamp := time.UnixMilli(startMs).Format("20060102-150405")
-		dest = filepath.Join(c.channelSavedDir(channelID), "clip-"+stamp+".mp4")
+		nonce := make([]byte, 8)
+		if _, err := rand.Read(nonce); err != nil {
+			return "", 0, err
+		}
+		dest = filepath.Join(c.channelSavedDir(channelID), "clip-"+stamp+"-"+hex.EncodeToString(nonce)+".mp4")
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return "", 0, err
 	}
-	list := filepath.Join(os.TempDir(), "navora-concat-"+channelID+".txt")
+	releases := make([]func(), 0, len(hit))
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	for _, seg := range hit {
+		release, err := c.media.leases.acquireContext(ctx, seg.Path)
+		if err != nil {
+			return "", 0, err
+		}
+		releases = append(releases, release)
+	}
+	lf, err := os.CreateTemp("", "navora-concat-*.txt")
+	if err != nil {
+		return "", 0, err
+	}
+	list := lf.Name()
+	if err = lf.Close(); err != nil {
+		os.Remove(list)
+		return "", 0, err
+	}
+	defer os.Remove(list)
+	output, err := os.CreateTemp(filepath.Dir(dest), ".navora-export-*.mp4")
+	if err != nil {
+		return "", 0, err
+	}
+	tmpOutput := output.Name()
+	if err = output.Close(); err != nil {
+		os.Remove(tmpOutput)
+		return "", 0, err
+	}
+	defer os.Remove(tmpOutput)
 	var b strings.Builder
-	for _, s := range hit {
+	var outputProbe mediaProbe
+	for i, s := range hit {
+		probe, err := c.probeMedia(ctx, s.Path)
+		if err != nil {
+			return "", 0, err
+		}
+		if i == 0 {
+			outputProbe = probe
+		}
+		origin, _ := strconv.ParseFloat(probe.Format.StartTime, 64)
 		p := strings.ReplaceAll(filepath.ToSlash(s.Path), "'", `'\''`)
 		b.WriteString("file '")
 		b.WriteString(p)
 		b.WriteString("'\n")
+		from := max(startMs, s.StartMs)
+		to := min(endMs, s.EndMs)
+		if from > s.StartMs {
+			b.WriteString("inpoint " + strconv.FormatFloat(origin+float64(from-s.StartMs)/1000, 'f', 6, 64) + "\n")
+		}
+		b.WriteString("outpoint " + strconv.FormatFloat(origin+float64(to-s.StartMs)/1000, 'f', 6, 64) + "\n")
+		b.WriteString("duration " + strconv.FormatFloat(float64(to-from)/1000, 'f', 6, 64) + "\n")
 	}
 	if err := os.WriteFile(list, []byte(b.String()), 0o644); err != nil {
 		return "", 0, err
@@ -975,28 +1227,55 @@ func (c *Core) ExportRange(channelID string, startMs, endMs int64, dest string) 
 	if bin == "" {
 		return "", 0, errStr("未找到 FFmpeg")
 	}
-	seek := 0.0
-	if startMs > hit[0].StartMs {
-		seek = float64(startMs-hit[0].StartMs) / 1000
-	}
-	dur := float64(abs64(endMs-startMs)) / 1000
-	if dur < 0.2 {
-		dur = 0.2
-	}
 	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", list}
-	if seek > 0.05 {
-		args = append(args, "-ss", strconv.FormatFloat(seek, 'f', 3, 64))
-	}
-	args = append(args, "-t", strconv.FormatFloat(dur, 'f', 3, 64), "-c", "copy", "-movflags", "+faststart", dest)
-	var runErr error
-	c.media.withExclusive(func() {
-		cmd := exec.Command(bin, args...)
+	args = append(args, mp4StreamArgs(outputProbe)...)
+	args = append(args, "-movflags", "+faststart", tmpOutput)
+	runErr := c.media.work.run(backgroundMediaContext(ctx, 1), func() error {
+		cmd := exec.CommandContext(ctx, bin, args...)
 		hideWindow(cmd)
-		runErr = cmd.Run()
+		stderr := tailBuf(2048)
+		cmd.Stderr = stderr
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%w：%s", err, redactSecrets(stderr.String()))
+		}
+		finalProbe, err := c.probeMedia(ctx, tmpOutput)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := publishNew(tmpOutput, dest); err != nil {
+			return err
+		}
+		if samePath(filepath.Dir(dest), filepath.Join(c.savedRoot(), channelID)) {
+			seconds, parseErr := strconv.ParseFloat(finalProbe.Format.Duration, 64)
+			info, statErr := os.Stat(dest)
+			if parseErr == nil && statErr == nil && seconds > 0 {
+				actualStart := endMs
+				for _, segment := range hit {
+					actualStart = min(actualStart, max(startMs, segment.StartMs))
+				}
+				c.media.indexMu.Lock()
+				path := filepath.Join(filepath.Dir(dest), "index.json")
+				index := c.media.readIndex(path)
+				duration := int64(seconds * 1000)
+				index[filepath.Base(dest)] = indexEntry{FileName: filepath.Base(dest), StartMs: actualStart, EndMs: actualStart + duration,
+					DurationMs: duration, SizeBytes: info.Size(), IndexedAt: time.Now().UnixMilli(), Measured: true,
+					SourceVersion: strconv.FormatInt(info.Size(), 10) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 10)}
+				c.media.writeIndex(path, index)
+				c.media.indexMu.Unlock()
+			}
+		}
+		return nil
 	})
 	if runErr != nil {
-		return "", 0, errStr("导出失败")
+		return "", 0, errStr("导出失败：" + runErr.Error())
 	}
+
 	return dest, len(hit), nil
 }
 
@@ -1010,6 +1289,9 @@ func abs64(n int64) int64 {
 func (c *Core) timed(channelID string) []timedSeg {
 	var out []timedSeg
 	for _, s := range c.ListRecordings(channelID) {
+		if s.State != "ready" {
+			continue
+		}
 		if s.StartMs == nil || s.EndMs == nil {
 			continue
 		}
@@ -1042,7 +1324,7 @@ func (c *Core) DeleteSaved(segmentID string) error {
 	if err != nil {
 		return errStr("找不到片段")
 	}
-	return os.Remove(p)
+	return c.removeMedia(p)
 }
 
 func (c *Core) SaveSnapshot(channelID, dataURL string) (string, error) {

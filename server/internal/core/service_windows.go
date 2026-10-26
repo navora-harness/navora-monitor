@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,7 +36,10 @@ func querySystemService() (serviceState, error) {
 	defer m.Disconnect()
 	s, err := m.OpenService(SystemServiceName)
 	if err != nil {
-		return serviceState{}, nil // not installed
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return serviceState{}, nil
+		}
+		return serviceState{}, err
 	}
 	defer s.Close()
 	cfg, err := s.Config()
@@ -75,6 +79,19 @@ func serviceImagePath(exe string, args []string) string {
 }
 
 func installSystemService(exe string, args []string) error {
+	trusted := false
+	for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramW6432"), os.Getenv("ProgramFiles(x86)")} {
+		if root == "" {
+			continue
+		}
+		relative, err := filepath.Rel(root, exe)
+		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
+			trusted = true
+		}
+	}
+	if !trusted {
+		return errStr("注册系统服务前，请使用正式安装程序将程序安装到 Program Files")
+	}
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("无法连接服务控制管理器：%w（请以管理员身份运行）", err)
@@ -92,9 +109,10 @@ func installSystemService(exe string, args []string) error {
 		SystemServiceName,
 		exe,
 		mgr.Config{
-			StartType:   mgr.StartAutomatic,
-			DisplayName: SystemServiceDisplayName,
-			Description: SystemServiceDescription,
+			ServiceStartName: `NT AUTHORITY\LocalService`,
+			StartType:        mgr.StartAutomatic,
+			DisplayName:      SystemServiceDisplayName,
+			Description:      SystemServiceDescription,
 		},
 		args...,
 	)
@@ -130,15 +148,27 @@ func uninstallSystemService() error {
 		return errStr("服务未安装")
 	}
 	defer s.Close()
-	_, _ = s.Control(svc.Stop)
-	waitServiceState(s, svc.Stopped, 12*time.Second)
+	state, err := s.Query()
+	if err != nil {
+		return err
+	}
+	if state.State != svc.Stopped {
+		if state.State != svc.StopPending {
+			if _, err := s.Control(svc.Stop); err != nil {
+				return err
+			}
+		}
+		if err := waitServiceState(s, svc.Stopped, 40*time.Second); err != nil {
+			return err
+		}
+	}
 	if err := s.Delete(); err != nil {
 		return fmt.Errorf("移除失败：%w", err)
 	}
 	return nil
 }
 
-func startSystemService(exe string, args []string) error {
+func startSystemService(_ string, _ []string) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("无法连接服务控制管理器：%w", err)
@@ -162,28 +192,19 @@ func startSystemService(exe string, args []string) error {
 		}
 	}
 
-	// Heal broken ImagePath from older builds (DisplayName / double-quoted cmdline).
-	if exe != "" {
-		if cfg, err := s.Config(); err == nil {
-			want := serviceImagePath(exe, args)
-			if cfg.BinaryPathName != want || !serviceImageLooksValid(cfg.BinaryPathName) {
-				_ = updateServiceImage(s, exe, args)
-			}
-		}
+	// Starting an installed service must preserve its executable and data root.
+	// A separate foreground/portable instance is not a source of repair settings.
+	cfg, err := s.Config()
+	if err != nil {
+		return err
+	}
+	if !serviceImageLooksValid(cfg.BinaryPathName) {
+		return errStr("服务镜像路径无效，请使用正式安装程序修复后再启动")
 	}
 
 	if err := s.Start(); err != nil {
-		if isFileNotFound(err) && exe != "" {
-			if uerr := updateServiceImage(s, exe, args); uerr == nil {
-				if err2 := s.Start(); err2 == nil {
-					return waitServiceState(s, svc.Running, 20*time.Second)
-				} else {
-					err = err2
-				}
-			}
-		}
 		if isFileNotFound(err) {
-			return errStr("启动失败：服务镜像路径无效。请先「移除」再「注册」，或确认可执行文件仍在原路径（" + exe + "）")
+			return errStr("启动失败：服务镜像路径无效，请使用正式安装程序修复")
 		}
 		return fmt.Errorf("启动失败：%w（若命令行实例仍在运行，请先退出程序）", err)
 	}

@@ -243,7 +243,12 @@ async function startScan() {
 }
 
 async function cancelScan() {
-  await api().cancelDeviceScan()
+  try {
+    await api().cancelDeviceScan()
+    progress.value = { ...progress.value, message: '正在停止扫描…' }
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  }
 }
 
 function makeId(host: string, channel: number, used: Set<string>): string {
@@ -475,7 +480,7 @@ onUnmounted(() => {
         <div class="body">
           <template v-if="step === 'scan'">
           <p class="hint">
-            一键扫描：优先 ONVIF；无结果时扫指定网段（默认本机主网段），并对 554 做 RTSP 校验。
+            一键扫描：通过 ONVIF 和常用摄像头端口发现设备。支持 /23 或更小的 IPv4 网段；添加后可测试实际视频连接。
           </p>
 
           <div class="grid">

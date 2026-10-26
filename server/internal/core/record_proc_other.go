@@ -11,4 +11,4 @@ func processAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-func scanRecordingFfmpeg() map[string][]int { return map[string][]int{} }
+func scanRecordingFfmpeg() []recordingProcess { return nil }

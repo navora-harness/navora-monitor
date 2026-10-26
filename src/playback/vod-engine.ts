@@ -2,7 +2,7 @@
  * HLS VOD engine (hls.js) — windowed playlist, start-at-position, lean buffer.
  */
 
-import Hls from 'hls.js'
+import type Hls from 'hls.js'
 
 export type VodEngineEvents = {
   ready: () => void
@@ -48,6 +48,7 @@ export class VodEngine {
   }
 
   detach() {
+    this.loadGen += 1
     const v = this.video
     if (v) {
       v.removeEventListener('timeupdate', this.onTimeUpdate)
@@ -109,8 +110,19 @@ export class VodEngine {
 
     const startMediaSec = Math.max(0, opts.startMediaSec ?? 0)
 
-    if (Hls.isSupported()) {
-      await this.loadWithHls(opts.url, gen, startMediaSec)
+    let HlsConstructor: typeof import('hls.js').default
+    try {
+      HlsConstructor = (await import('hls.js')).default
+    } catch {
+      if (gen === this.loadGen) {
+        this.emit('error', '回放组件加载失败，请重试或刷新页面')
+        this.emit('buffering', false)
+      }
+      return
+    }
+    if (gen !== this.loadGen || this.video !== v) return
+    if (HlsConstructor.isSupported()) {
+      await this.loadWithHls(HlsConstructor, opts.url, gen, startMediaSec)
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
       await this.loadNativeHls(opts.url, gen, startMediaSec)
     } else {
@@ -258,7 +270,7 @@ export class VodEngine {
     this.emit('buffering', false)
   }
 
-  private async loadWithHls(url: string, gen: number, startMediaSec: number) {
+  private async loadWithHls(Hls: typeof import('hls.js').default, url: string, gen: number, startMediaSec: number) {
     const v = this.video
     if (!v) return
     const token = this.authToken
@@ -411,13 +423,6 @@ export class VodEngine {
 
   private destroyHls() {
     if (this.hls) {
-      if (this.errorHandler) {
-        try {
-          this.hls.off(Hls.Events.ERROR, this.errorHandler)
-        } catch {
-          /* ignore */
-        }
-      }
       try {
         this.hls.destroy()
       } catch {

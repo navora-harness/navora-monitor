@@ -4,7 +4,8 @@ import { listGroups } from '@shared/groups'
 
 const props = defineProps<{
   title: string
-  mosaic: 1 | 4 | 9 | 16
+  mosaic: 1 | 4 | 6 | 8 | 9 | 13 | 16
+  featuredLayout?: boolean
   recordingCount: number
   ffmpegOk: boolean
   groups: string[]
@@ -20,7 +21,8 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  mosaic: [n: 1 | 4 | 9 | 16]
+  mosaic: [n: 1 | 4 | 6 | 8 | 9 | 13 | 16]
+  featuredLayout: [count: 4 | 6 | 8 | 13]
   'update:activeGroup': [group: string]
   'update:showExplorer': [v: boolean]
   'update:showTimeline': [v: boolean]
@@ -47,7 +49,6 @@ const emit = defineEmits<{
   maximize: []
   close: []
   logout: []
-  quitApp: []
   displayGroup: []
 }>()
 
@@ -115,9 +116,10 @@ const menus = computed<MenuDef[]>(() => {
           { id: 'theme:system', label: '跟随系统', checked: props.uiTheme === 'system' },
           { separator: true, label: '' },
           { id: 'mosaic:1', label: '1 画面', checked: props.mosaic === 1, shortcut: 'Ctrl+1' },
-          { id: 'mosaic:4', label: '4 画面', checked: props.mosaic === 4, shortcut: 'Ctrl+2' },
+          { id: 'mosaic:4', label: '4 画面', checked: props.mosaic === 4 && !props.featuredLayout, shortcut: 'Ctrl+2' },
           { id: 'mosaic:9', label: '9 画面', checked: props.mosaic === 9, shortcut: 'Ctrl+3' },
           { id: 'mosaic:16', label: '16 画面', checked: props.mosaic === 16, shortcut: 'Ctrl+4' },
+          ...featuredOptions(),
         ],
       },
       {
@@ -164,7 +166,6 @@ const menus = computed<MenuDef[]>(() => {
       { id: 'openAbout', label: '关于…' },
       { separator: true, label: '' },
       { id: 'logout', label: '退出登录' },
-      { id: 'quitApp', label: '退出程序…', danger: true },
     ],
   },
   {
@@ -181,9 +182,10 @@ const menus = computed<MenuDef[]>(() => {
       { id: 'theme:system', label: '跟随系统', checked: props.uiTheme === 'system' },
       { separator: true, label: '' },
       { id: 'mosaic:1', label: '1 画面', checked: props.mosaic === 1, shortcut: 'Ctrl+1' },
-      { id: 'mosaic:4', label: '4 画面', checked: props.mosaic === 4, shortcut: 'Ctrl+2' },
+      { id: 'mosaic:4', label: '4 画面', checked: props.mosaic === 4 && !props.featuredLayout, shortcut: 'Ctrl+2' },
       { id: 'mosaic:9', label: '9 画面', checked: props.mosaic === 9, shortcut: 'Ctrl+3' },
       { id: 'mosaic:16', label: '16 画面', checked: props.mosaic === 16, shortcut: 'Ctrl+4' },
+      ...featuredOptions(),
     ],
   },
   {
@@ -230,13 +232,25 @@ function toggle(id: string) {
   openMenu.value = openMenu.value === id ? null : id
 }
 
+function featuredOptions(): MenuItem[] {
+  return ([4, 6, 8, 13] as const).map(count => ({
+    id: `featured:${count}`,
+    label: `主辅布局（1 大 ${count - 1} 小）`,
+    checked: !!props.featuredLayout && props.mosaic === count,
+  }))
+}
+
 function pick(item: MenuItem) {
   if (item.separator || item.disabled || !item.id) return
   openMenu.value = null
   const id = item.id
+  if (id.startsWith('featured:')) {
+    emit('featuredLayout', Number(id.slice(9)) as 4 | 6 | 8 | 13)
+    return
+  }
 
   if (id.startsWith('mosaic:')) {
-    emit('mosaic', Number(id.slice(7)) as 1 | 4 | 9 | 16)
+    emit('mosaic', Number(id.slice(7)) as 1 | 4 | 6 | 8 | 9 | 13 | 16)
     return
   }
   if (id.startsWith('theme:')) {
@@ -312,9 +326,6 @@ function pick(item: MenuItem) {
       break
     case 'logout':
       emit('logout')
-      break
-    case 'quitApp':
-      emit('quitApp')
       break
     case 'displayGroup':
       emit('displayGroup')

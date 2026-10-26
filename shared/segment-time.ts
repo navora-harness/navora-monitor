@@ -1,7 +1,7 @@
 /** Parse wall-clock start time encoded in recording segment filenames. */
 
 /** Matches `...-YYYYMMDD-HHMMSS.mp4` (strftime segment names). */
-const STAMP_RE = /(\d{8})-(\d{6})(?:\.[^.]+)?$/i
+const STAMP_RE = /(\d{8})-(\d{6})(?:-[a-f0-9]{16})?(?:\.[^.]+)?$/i
 
 /**
  * Parse start time from a segment file name.

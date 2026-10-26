@@ -891,6 +891,7 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
       </button>
     </div>
 
+    <p v-if="searchQuery" class="search-summary" role="status">找到 {{ flatIds.length }} 台设备 <button type="button" @click="searchQuery = ''">清除筛选</button></p>
     <div
       v-if="buckets.length"
       class="list"
@@ -1057,6 +1058,9 @@ function batchBarAction(action: 'enable' | 'disable' | 'remove' | 'start' | 'sto
 </template>
 
 <style scoped>
+.search-summary { padding: 8px 12px; color: var(--muted); font-size: 12px; }
+.search-summary button { border: 0; background: transparent; color: var(--accent); cursor: pointer; }
+
 .tree {
   position: relative;
   display: flex;

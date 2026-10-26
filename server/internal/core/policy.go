@@ -21,7 +21,7 @@ const (
 )
 
 var (
-	stampRe = regexp.MustCompile(`(\d{8})-(\d{6})(?:\.[^.]+)?$`)
+	stampRe = regexp.MustCompile(`(\d{8})-(\d{6})(?:-[a-fA-F0-9]{16})?(?:\.[^.]+)?$`)
 	timeRe  = regexp.MustCompile(`^([01]?\d|2[0-3]):([0-5]\d)$`)
 	userRe  = regexp.MustCompile(`^[A-Za-z0-9_@.\-]{1,32}$`)
 )
@@ -265,7 +265,6 @@ func buildSegmentRecordArgs(inputURL, outputPattern, title, transport string, se
 		"-max_delay", "500000",
 		"-probesize", "1000000",
 		"-analyzeduration", "1000000",
-		"-thread_queue_size", "64",
 	}
 	if strings.HasPrefix(strings.ToLower(inputURL), "rtsp://") {
 		if transport != "udp" {
@@ -303,7 +302,6 @@ func buildMpegtsPreviewArgs(inputURL, transport string, transcodeH264 bool) []st
 		"-max_delay", "500000",
 		"-probesize", "500000",
 		"-analyzeduration", "500000",
-		"-thread_queue_size", "32",
 	}
 	if strings.HasPrefix(strings.ToLower(inputURL), "rtsp://") {
 		if transport != "udp" {
@@ -350,7 +348,6 @@ func buildHlsPreviewArgs(inputURL, transport, indexPath, segPattern string) []st
 		"-max_delay", "500000",
 		"-probesize", "500000",
 		"-analyzeduration", "500000",
-		"-thread_queue_size", "32",
 	}
 	if strings.HasPrefix(strings.ToLower(inputURL), "rtsp://") {
 		if transport != "udp" {
@@ -393,6 +390,7 @@ func faststartAttemptArgs(input, output string, mid []string) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-fflags", "+genpts+igndts",
+		"-analyzeduration", "30000000", "-probesize", "67108864",
 		"-i", input,
 	}
 	args = append(args, mid...)

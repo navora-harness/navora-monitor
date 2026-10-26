@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -273,16 +274,12 @@ func (c *Core) ApplyConfig(path string, parts map[string]bool, keepLocal bool, c
 	if parts == nil {
 		parts = map[string]bool{"channels": true, "groupOrder": true, "settings": true, "layout": true}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var importedChannels []Channel
 	if parts["channels"] {
 		allow := map[string]bool{}
-		if len(channelIDs) > 0 {
-			for _, id := range channelIDs {
-				allow[id] = true
-			}
+		for _, id := range channelIDs {
+			allow[id] = true
 		}
-		var next []Channel
 		seen := map[string]bool{}
 		for _, ch := range doc.Channels {
 			if len(allow) > 0 && !allow[ch.ID] {
@@ -290,20 +287,19 @@ func (c *Core) ApplyConfig(path string, parts map[string]bool, keepLocal bool, c
 			}
 			clean, ok := sanitizeChannel(ch)
 			if !ok || seen[clean.ID] {
-				continue
+				return bundle{}, errStr("导入包含无效或重复的通道配置")
 			}
 			seen[clean.ID] = true
-			next = append(next, clean)
+			importedChannels = append(importedChannels, clean)
 		}
-		c.channels = next
 	}
-	if parts["groupOrder"] {
-		c.groupOrder = doc.GroupOrder
-	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
+	previousSettings := c.Settings()
 	if parts["settings"] {
 		incoming := sanitizeSettings(doc.Settings)
 		if keepLocal {
-			cur := c.settings
+			cur := previousSettings
 			incoming.RecordingsPath = cur.RecordingsPath
 			incoming.SnapshotsPath = cur.SnapshotsPath
 			incoming.SavedClipsPath = cur.SavedClipsPath
@@ -315,31 +311,65 @@ func (c *Core) ApplyConfig(path string, parts map[string]bool, keepLocal bool, c
 			incoming.DiskAutoCleanup = cur.DiskAutoCleanup
 			incoming.RecordCacheEnabled = cur.RecordCacheEnabled
 			incoming.OpenAtLogin = cur.OpenAtLogin
-			incoming.RemotePassword = ""
 			incoming.RemotePort = cur.RemotePort
 			incoming.RemoteUsername = cur.RemoteUsername
 		}
+		// Credentials never travel through an exported configuration bundle.
 		incoming.RemotePassword = ""
-		c.settings = incoming
-		_ = c.saveSettingsLocked()
+		if _, err := c.updateSettingsAndResumeLocked(incoming); err != nil {
+			if _, restoreErr := c.updateSettingsAndResumeLocked(previousSettings); restoreErr != nil {
+				return bundle{}, fmt.Errorf("导入设置失败：%w；恢复原设置失败：%v", err, restoreErr)
+			}
+			return bundle{}, fmt.Errorf("导入设置失败，已恢复原设置：%w", err)
+		}
 	}
-	if err := c.saveChannelsLocked(); err != nil {
+	rollbackSettings := func(cause error) error {
+		if parts["settings"] && c.Settings() != previousSettings {
+			if _, err := c.updateSettingsAndResumeLocked(previousSettings); err != nil {
+				return fmt.Errorf("%w；恢复原设置失败：%v", cause, err)
+			}
+		}
+		return cause
+	}
+	c.mu.Lock()
+	previous := append([]Channel(nil), c.channels...)
+	previousGroups := append([]string(nil), c.groupOrder...)
+	if parts["channels"] {
+		c.channels = importedChannels
+	}
+	if parts["groupOrder"] {
+		c.groupOrder = doc.GroupOrder
+	}
+	if parts["channels"] || parts["groupOrder"] {
+		if err := c.saveChannelsLocked(); err != nil {
+			c.mu.Unlock()
+			return bundle{}, rollbackSettings(err)
+		}
+	}
+	next := append([]Channel(nil), c.channels...)
+	c.mu.Unlock()
+	if parts["layout"] {
+		if err := c.SetLayout(doc.Layout); err != nil {
+			var restoreErr error
+			if parts["channels"] || parts["groupOrder"] {
+				c.mu.Lock()
+				c.channels, c.groupOrder = previous, previousGroups
+				restoreErr = c.saveChannelsLocked()
+				c.mu.Unlock()
+			}
+			if restoreErr != nil {
+				// Reconcile whichever document remains committed, even after rollback failure.
+				runtimeErr := c.reconcileChannelChangesLocked(previous, c.Channels())
+				return bundle{}, rollbackSettings(fmt.Errorf("保存布局失败：%v；恢复通道失败：%v；采集状态：%v", err, restoreErr, runtimeErr))
+			}
+			return bundle{}, rollbackSettings(fmt.Errorf("保存布局失败：%w", err))
+		}
+	}
+	if err := c.reconcileChannelChangesLocked(previous, next); err != nil {
 		return bundle{}, err
 	}
-	if parts["layout"] {
-		c.mu.Unlock()
-		_ = c.SetLayout(doc.Layout)
-		c.mu.Lock()
-	}
-	out := bundle{
-		Channels:   append([]Channel(nil), c.channels...),
-		GroupOrder: c.listGroupsLocked(),
-		Settings:   c.settings,
-	}
+	out := bundle{Channels: c.Channels(), GroupOrder: c.GroupOrder(), Settings: c.Settings(), Layout: c.Layout()}
 	out.Settings.RemotePassword = ""
-	c.mu.Unlock()
-	out.Layout = c.Layout()
-	c.mu.Lock()
 	return out, nil
 }
 
@@ -378,7 +408,7 @@ func defaultLayout() Layout {
 
 func sanitizeLayout(l Layout) Layout {
 	base := defaultLayout()
-	if l.Mosaic != 1 && l.Mosaic != 4 && l.Mosaic != 9 && l.Mosaic != 16 {
+	if l.Mosaic != 1 && l.Mosaic != 4 && l.Mosaic != 6 && l.Mosaic != 8 && l.Mosaic != 9 && l.Mosaic != 13 && l.Mosaic != 16 {
 		l.Mosaic = base.Mosaic
 	}
 	l.Version = 1

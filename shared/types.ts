@@ -54,6 +54,9 @@ export type ChannelRuntimeState = {
 }
 
 export type RecordingSegment = {
+  state?: 'writing' | 'finalizing' | 'ready' | 'invalid' | 'missing'
+  sourceVersion?: string
+  timeMeasured?: boolean
   id: string
   channelId: ChannelId
   fileName: string
@@ -82,6 +85,7 @@ export type ProbeResult =
   | { ok: false; error: string; latencyMs: number }
 
 export type AppInfo = {
+	storageWarning?: string
   name: string
   version: string
   license: string

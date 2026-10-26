@@ -9,7 +9,8 @@ import type {
   SystemServiceAction,
   SystemServiceInfo,
 } from '@shared/ipc-types'
-import { bytesToGb, formatDurationLabel, formatGbLabel, gbToBytes } from '@shared/storage-policy'
+import { storageSummary } from './storage-summary'
+import StorageSummary from './StorageSummary.vue'
 import {
   withStorageLeaf,
   applyStorageBundle,
@@ -56,6 +57,9 @@ const cats: { id: CatId; label: string }[] = [
 
 const cat = ref<CatId>(props.initialCat ?? 'appearance')
 const draft = reactive<AppSettings>({ ...DEFAULT_SETTINGS })
+const savedSnapshot = ref('')
+const dirty = computed(() => savedSnapshot.value !== '' && JSON.stringify(draft) !== savedSnapshot.value)
+const confirmDiscard = ref(false)
 const status = ref('')
 const saving = ref(false)
 const cleaning = ref(false)
@@ -69,10 +73,12 @@ const serviceMsg = ref('')
 const serviceMsgOk = ref(true)
 const showRemotePassword = ref(false)
 const copyMsg = ref('')
+const storageWarning = ref('')
 const resolved = reactive({
   recordings: '',
   snapshots: '',
   saved: '',
+  cache: '',
   configRoot: '',
 })
 const appMeta = reactive({
@@ -91,11 +97,14 @@ function api() {
 async function refresh() {
   const s = await api().getSettings()
   Object.assign(draft, s)
+  savedSnapshot.value = JSON.stringify(draft)
   const info = await api().getAppInfo()
   resolved.configRoot = info.dataRoot
+  storageWarning.value = info.storageWarning || ''
   resolved.recordings = info.recordingsPath
   resolved.snapshots = info.snapshotsPath
   resolved.saved = info.savedClipsPath
+  resolved.cache = info.recordCachePath || `${info.dataRoot}/record-cache`
   appMeta.name = info.name
   appMeta.version = info.version
   appMeta.license = info.license
@@ -182,63 +191,7 @@ watch(
   (t) => applyUiTheme(t as UiTheme),
 )
 
-const viz = computed(() => {
-  const d = disk.value
-  if (!d || !(d.totalBytes > 0)) {
-    return {
-      ready: false,
-      freePct: 0,
-      loopPct: 0,
-      savedPct: 0,
-      otherPct: 0,
-      freeLabel: '—',
-      loopLabel: '—',
-      savedLabel: '—',
-      totalLabel: '—',
-      usedLabel: '—',
-      remainLabel: '—',
-      needLabel: '—',
-      needPct: 0,
-      warnPos: 0,
-      stopPos: 0,
-      level: 'ok' as const,
-      retentionFit: true,
-      path: '',
-    }
-  }
-  const total = d.totalBytes
-  const free = d.freeBytes
-  const loop = d.recordingsBytes
-  const saved = d.savedClipsBytes
-  const usedKnown = loop + saved
-  const other = Math.max(0, total - free - usedKnown)
-  const pct = (n: number) => Math.max(0, Math.min(100, (n / total) * 100))
-  const warnPos = draft.diskWarnFreeGb > 0 ? pct(gbToBytes(draft.diskWarnFreeGb)) : 0
-  const stopPos = draft.diskStopFreeGb > 0 ? pct(gbToBytes(draft.diskStopFreeGb)) : 0
-  const need = d.retentionNeedBytes ?? 0
-  return {
-    ready: true,
-    freePct: pct(free),
-    loopPct: pct(loop),
-    savedPct: pct(saved),
-    otherPct: pct(other),
-    freeLabel: formatGbLabel(free),
-    loopLabel: formatGbLabel(loop),
-    savedLabel: formatGbLabel(saved),
-    totalLabel: formatGbLabel(total),
-    usedLabel: formatGbLabel(total - free),
-    remainLabel: d.estimatedRemainSec != null ? formatDurationLabel(d.estimatedRemainSec) : '—',
-    needLabel: need > 0 ? formatGbLabel(need) : '—',
-    needPct: need > 0 ? Math.min(120, (need / Math.max(free, 1)) * 100) : 0,
-    warnPos,
-    stopPos,
-    level: d.level,
-    retentionFit: d.retentionFit,
-    path: d.path,
-    freeGb: bytesToGb(free).toFixed(1),
-    writeMbps: d.writeBytesPerSec > 0 ? ((d.writeBytesPerSec * 8) / 1_000_000).toFixed(1) : '0',
-  }
-})
+const viz = computed(() => storageSummary(disk.value, draft))
 
 async function pickRecordings() {
   const dir = await api().pickDirectory(
@@ -288,6 +241,7 @@ async function pickFfmpeg() {
 
 async function save() {
   saving.value = true
+  confirmDiscard.value = false
   status.value = ''
   try {
     const nest = findStorageNestConflict({
@@ -301,6 +255,7 @@ async function save() {
     }
     const next = await api().setSettings({ ...draft })
     Object.assign(draft, next)
+    savedSnapshot.value = JSON.stringify(draft)
     applyUiTheme(next.uiTheme)
     emit('saved', next)
     await refresh()
@@ -369,6 +324,24 @@ function onBackdrop(e: MouseEvent) {
 }
 
 function close() {
+  if (saving.value) return
+  if (dirty.value && !confirmDiscard.value) {
+    confirmDiscard.value = true
+    return
+  }
+  if (confirmDiscard.value) {
+    confirmDiscard.value = false
+    return
+  }
+  discardAndClose()
+}
+
+async function pickCache() {
+  const dir = await api().pickDirectory(draft.recordCachePath || resolved.cache)
+  if (dir) draft.recordCachePath = dir
+}
+
+function discardAndClose() {
   applyUiTheme((props.currentTheme ?? draft.uiTheme) as UiTheme)
   emit('close')
 }
@@ -403,6 +376,12 @@ onUnmounted(() => {
             </svg>
           </button>
         </header>
+
+        <div v-if="confirmDiscard" class="discard-prompt" role="alert">
+          <span>有尚未保存的设置。关闭后这些修改会丢失。</span>
+          <button type="button" @click="confirmDiscard = false">继续编辑</button>
+          <button type="button" @click="discardAndClose">放弃修改并关闭</button>
+        </div>
 
         <div class="main">
           <nav class="nav">
@@ -462,15 +441,16 @@ onUnmounted(() => {
                 <button type="button" class="primary-lite" @click="pickAllStoragePaths">一键配置</button>
               </div>
               <p class="hint">
-                一键配置：选择父目录后自动填入三个并列子路径（如 D:\ → recordings / saved / snapshots）。默认空路径落在「视频/Navora Monitor/」下。若误选已有子文件夹会回退到父目录再生成，避免互相嵌套。
+                一键配置：选择父目录后自动填入三个并列子路径（如 D:\ → recordings / saved / snapshots）。默认使用配置目录下的 media 文件夹，不随服务账户变化。更换目录不会搬迁已有录像。
               </p>
+              <p v-if="storageWarning" class="hint" role="alert">{{ storageWarning }}</p>
               <div class="field">
                 <div class="field-head">
                   <span class="label">循环录像目录</span>
                   <span class="resolved" :title="resolved.recordings">{{ resolved.recordings }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.recordingsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/recordings" />
+                  <input v-model="draft.recordingsPath" spellcheck="false" placeholder="默认 配置目录/media/recordings" />
                   <button type="button" @click="pickRecordings">浏览</button>
                   <button type="button" class="ghost" @click="draft.recordingsPath = ''">默认</button>
                 </div>
@@ -481,7 +461,7 @@ onUnmounted(() => {
                   <span class="resolved" :title="resolved.saved">{{ resolved.saved }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.savedClipsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/saved" />
+                  <input v-model="draft.savedClipsPath" spellcheck="false" placeholder="默认 配置目录/media/saved" />
                   <button type="button" @click="pickSaved">浏览</button>
                   <button type="button" class="ghost" @click="draft.savedClipsPath = ''">默认</button>
                 </div>
@@ -492,7 +472,7 @@ onUnmounted(() => {
                   <span class="resolved" :title="resolved.snapshots">{{ resolved.snapshots }}</span>
                 </div>
                 <div class="path-row">
-                  <input v-model="draft.snapshotsPath" spellcheck="false" placeholder="默认 视频/Navora Monitor/snapshots" />
+                  <input v-model="draft.snapshotsPath" spellcheck="false" placeholder="默认 配置目录/media/snapshots" />
                   <button type="button" @click="pickSnapshots">浏览</button>
                   <button type="button" class="ghost" @click="draft.snapshotsPath = ''">默认</button>
                 </div>
@@ -501,77 +481,7 @@ onUnmounted(() => {
 
             <section v-show="cat === 'storage'" class="storage">
               <h3>存储感知</h3>
-              <p class="hint path" :title="viz.path">{{ viz.path || '尚未读取磁盘信息' }}</p>
-
-              <div class="viz-card">
-                <div class="viz-head">
-                  <span>磁盘占用</span>
-                  <span class="level" :class="viz.level">{{ viz.level === 'ok' ? '正常' : viz.level === 'warn' ? '告警' : '危急' }}</span>
-                </div>
-                <div class="bar" :class="{ empty: !viz.ready }">
-                  <div class="seg loop" :style="{ width: viz.loopPct + '%' }" title="循环录像" />
-                  <div class="seg saved" :style="{ width: viz.savedPct + '%' }" title="已保存" />
-                  <div class="seg other" :style="{ width: viz.otherPct + '%' }" title="其他占用" />
-                  <div class="seg free" :style="{ width: viz.freePct + '%' }" title="可用" />
-                  <span
-                    v-if="viz.warnPos > 0"
-                    class="mark warn"
-                    :style="{ left: viz.warnPos + '%' }"
-                    title="告警阈值"
-                  />
-                  <span
-                    v-if="viz.stopPos > 0"
-                    class="mark stop"
-                    :style="{ left: viz.stopPos + '%' }"
-                    title="停录阈值"
-                  />
-                </div>
-                <div class="legend">
-                  <span><i class="dot loop" />循环 {{ viz.loopLabel }}</span>
-                  <span><i class="dot saved" />已保存 {{ viz.savedLabel }}</span>
-                  <span><i class="dot free" />可用 {{ viz.freeLabel }}</span>
-                </div>
-              </div>
-
-              <div class="stat-grid">
-                <div class="stat">
-                  <div class="k">总容量</div>
-                  <div class="v">{{ viz.totalLabel }}</div>
-                </div>
-                <div class="stat">
-                  <div class="k">已用</div>
-                  <div class="v">{{ viz.usedLabel }}</div>
-                </div>
-                <div class="stat">
-                  <div class="k">约可再录</div>
-                  <div class="v">{{ viz.remainLabel }}</div>
-                </div>
-                <div class="stat">
-                  <div class="k">当前码流</div>
-                  <div class="v">{{ viz.writeMbps }} Mbps</div>
-                </div>
-              </div>
-
-              <div v-if="draft.retentionDays > 0" class="capacity">
-                <div class="cap-head">
-                  <span>保留 {{ draft.retentionDays }} 天所需</span>
-                  <span :class="{ bad: !viz.retentionFit }">{{ viz.needLabel }}</span>
-                </div>
-                <div class="cap-track">
-                  <div
-                    class="cap-fill"
-                    :class="{ bad: !viz.retentionFit }"
-                    :style="{ width: Math.min(100, viz.needPct) + '%' }"
-                  />
-                </div>
-                <p class="hint">
-                  {{
-                    viz.retentionFit
-                      ? `按当前码流，剩余空间约可再录 ${viz.remainLabel}；保留天数只是自动清理窗口，不是可录上限。`
-                      : `所需空间超过剩余容量。按当前码流约可再录 ${viz.remainLabel}；超出保留窗口的旧分段会被清理。`
-                  }}
-                </p>
-              </div>
+              <StorageSummary :disk="disk" :settings="draft" />
 
               <div class="grid">
                 <label>
@@ -633,6 +543,15 @@ onUnmounted(() => {
                 <input v-model="draft.recordCacheEnabled" type="checkbox" />
                 <span>启用本地录像缓存（慢速归档盘时先写本地再刷盘）</span>
               </label>
+              <div class="field">
+                <div class="field-head"><span class="label">录像缓存目录</span><span class="resolved" :title="resolved.cache">{{ resolved.cache }}</span></div>
+                <div class="path-row">
+                  <input v-model="draft.recordCachePath" spellcheck="false" placeholder="默认 配置目录/record-cache" />
+                  <button type="button" @click="pickCache">浏览</button>
+                  <button type="button" class="ghost" @click="draft.recordCachePath = ''">默认</button>
+                </div>
+                <p class="hint">{{ draft.recordCacheEnabled ? '已启用：新录像先写缓存，再归档到录像目录。' : '已关闭：新录像直接写入录像目录；缓存路径仍会保留。' }} 建议选择本地高速磁盘。保存录像目录或缓存设置时，会短暂停止并自动恢复原先正在录制的通道；更换目录不会自动搬迁旧缓存。</p>
+              </div>
             </section>
 
             <section v-show="cat === 'capture'">
@@ -669,9 +588,8 @@ onUnmounted(() => {
 
             <section v-show="cat === 'remote'">
               <h3>远程访问</h3>
-              <p class="hint">
-                本程序以网页提供全部监控功能。浏览器打开下面的地址即可登录。修改端口后需要重新启动命令行进程才会生效。
-              </p>
+              <label class="check block"><input v-model="draft.remoteEnabled" type="checkbox" /><span>允许局域网设备访问</span></label>
+              <p class="hint">开关保存后立即生效；修改端口需重启服务。</p>
               <div class="grid">
                 <label>
                   <span>端口</span>
@@ -687,7 +605,7 @@ onUnmounted(() => {
                   />
                 </label>
               </div>
-              <p class="hint">账户名支持字母、数字与 _ @ . -，最长 32 位；留空保存时恢复为 admin。</p>
+              <p class="hint">账户名最多 32 位；留空使用 navora。</p>
               <div class="field">
                 <span class="label">密码</span>
                 <div class="path-row">
@@ -696,27 +614,21 @@ onUnmounted(() => {
                     :type="showRemotePassword ? 'text' : 'password'"
                     spellcheck="false"
                     autocomplete="new-password"
-                    placeholder="留空并启用时自动生成"
+                    placeholder="留空保持当前密码"
                   />
                   <button type="button" @click="showRemotePassword = !showRemotePassword">
                     {{ showRemotePassword ? '隐藏' : '显示' }}
                   </button>
                   <button type="button" @click="randomRemotePassword">随机生成</button>
                 </div>
-                <p class="hint">留空表示保持当前密码。填写新密码并保存后立即生效。命令行只在首次生成或 --reset-password 时打印密码。</p>
+                <p class="hint">修改密码后，所有设备需重新登录。</p>
               </div>
               <div v-if="remoteStatus" class="remote-status">
-                <p class="label">服务状态</p>
-                <p class="resolved block">
-                  <template v-if="remoteStatus.listening">
-                    运行中 · 端口 {{ remoteStatus.port }}
-                  </template>
-                  <template v-else>
-                    未监听{{ remoteStatus.error ? `（${remoteStatus.error}）` : '' }}
-                  </template>
-                </p>
+                <p>{{ remoteStatus.enabled ? '已允许局域网访问' : '仅允许本机访问' }}<template v-if="remoteStatus.address"> · 监听 {{ remoteStatus.address }}</template></p>
+                <p v-if="remoteStatus.error" role="alert">{{ remoteStatus.error }}</p>
                 <template v-if="remoteStatus.urls.length">
                   <p class="label">访问地址</p>
+                  <p class="hint">其他设备连接超时：在主机上重新运行新版安装程序，修复局域网防火墙规则。</p>
                   <ul class="url-list">
                     <li v-for="u in remoteStatus.urls" :key="u">
                       <code>{{ u }}</code>
@@ -1312,158 +1224,6 @@ button:disabled {
   gap: 8px;
   flex-shrink: 0;
 }
-.viz-card {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-}
-.viz-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 12px;
-  font-weight: 600;
-}
-.level {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--accent);
-}
-.level.warn {
-  color: var(--warn);
-}
-.level.critical {
-  color: var(--danger);
-}
-.bar {
-  position: relative;
-  height: 18px;
-  border-radius: 9px;
-  overflow: hidden;
-  display: flex;
-  background: var(--chart-free);
-}
-.bar.empty {
-  opacity: 0.45;
-}
-.seg {
-  height: 100%;
-  min-width: 0;
-}
-.seg.loop {
-  background: var(--chart-loop);
-}
-.seg.saved {
-  background: var(--chart-saved);
-}
-.seg.other {
-  background: #7a8699;
-  opacity: 0.55;
-}
-.seg.free {
-  background: transparent;
-}
-.mark {
-  position: absolute;
-  top: -2px;
-  bottom: -2px;
-  width: 2px;
-  transform: translateX(-1px);
-  pointer-events: none;
-}
-.mark.warn {
-  background: var(--chart-warn);
-}
-.mark.stop {
-  background: var(--chart-stop);
-}
-.legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 14px;
-  font-size: 11px;
-  color: var(--muted);
-}
-.legend .dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-right: 5px;
-  vertical-align: middle;
-}
-.legend .dot.loop {
-  background: var(--chart-loop);
-}
-.legend .dot.saved {
-  background: var(--chart-saved);
-}
-.legend .dot.free {
-  background: var(--border);
-  box-shadow: inset 0 0 0 1px var(--muted);
-}
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-}
-.stat {
-  padding: 10px;
-  border-radius: 8px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  min-width: 0;
-}
-.stat .k {
-  font-size: 10px;
-  color: var(--muted);
-  margin-bottom: 4px;
-}
-.stat .v {
-  font-size: 13px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.capacity {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-}
-.cap-head {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  font-weight: 600;
-}
-.cap-head .bad {
-  color: var(--warn);
-}
-.cap-track {
-  height: 8px;
-  border-radius: 4px;
-  background: var(--surface-2);
-  overflow: hidden;
-}
-.cap-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 4px;
-  transition: width 0.2s ease;
-}
-.cap-fill.bad {
-  background: var(--warn);
-}
 .url-list {
   list-style: none;
   margin: 0;
@@ -1512,8 +1272,17 @@ button:disabled {
   .stat-grid {
     grid-template-columns: 1fr 1fr;
   }
-  .nav {
-    width: 108px;
-  }
+  .main { flex-direction: column; }
+  .nav { width: 100%; box-sizing: border-box; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border); padding: 6px; gap: 4px; }
+  .nav-item { height: 44px; flex: 1 0 auto; text-align: center; padding: 0 10px; }
+  .body { padding: 12px; }
+  .path-row { flex-wrap: wrap; }
+  .path-row input { flex: 1 1 100%; width: 100%; }
+  input, select, .path-row button, .foot button { min-height: 44px; }
+  .hint.path { white-space: normal; overflow: visible; text-overflow: clip; }
+  .field-head { flex-wrap: wrap; }
+  .resolved { flex: 1 1 100%; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 }
+.discard-prompt { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.discard-prompt span { flex: 1 1 200px; }
 </style>

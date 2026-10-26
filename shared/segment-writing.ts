@@ -3,10 +3,16 @@
 /** Match VOD playlist skip window — files touched this recently are held out of HLS. */
 export const SEGMENT_WRITING_FRESH_MS = 12_000
 
+/** An unfinished file's configured end is a prediction, not recorded footage. */
+export function timelineSegmentEnd(startMs: number, endMs: number, nowMs: number, open: boolean): number {
+  return open ? Math.max(startMs, nowMs) : Math.max(startMs + 500, endMs)
+}
+
 export function isSegmentWriting(
-  seg: { mtimeMs: number },
+  seg: { mtimeMs: number; state?: string },
   nowMs: number = Date.now(),
 ): boolean {
+  if (seg.state) return seg.state === 'writing' || seg.state === 'finalizing'
   if (!Number.isFinite(seg.mtimeMs) || !(seg.mtimeMs > 0)) return false
   return nowMs - seg.mtimeMs < SEGMENT_WRITING_FRESH_MS
 }
@@ -20,10 +26,11 @@ export const OPEN_SEGMENT_MAX_MS = 20 * 60_000
  * mtime check hides the live edge while the file is still growing.
  */
 export function isOpenTimelineSegment(
-  seg: { mtimeMs: number; protected?: boolean },
+  seg: { mtimeMs: number; protected?: boolean; state?: string },
   opts: { newest: boolean; startMs: number; nowMs: number; channelRecording?: boolean },
 ): boolean {
   if (seg.protected) return false
+  if (seg.state) return seg.state === 'writing' || seg.state === 'finalizing'
   const now = opts.nowMs
   const start = opts.startMs
   if (!Number.isFinite(start) || now < start || now - start > OPEN_SEGMENT_MAX_MS) return false

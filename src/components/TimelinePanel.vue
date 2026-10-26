@@ -9,10 +9,15 @@ import {
   formatSegmentTimeRange,
 } from '@shared/segment-time'
 import { isSparseTimeline, recentActivityRange } from '@shared/segment-range'
-import { isOpenTimelineSegment, isSegmentWriting } from '@shared/segment-writing'
+import { isOpenTimelineSegment, isSegmentWriting, timelineSegmentEnd } from '@shared/segment-writing'
 import { openContextMenu } from '../composables/useContextMenu'
+import { createTimelineIndex, compactTimelineSpans } from '@shared/timeline-index'
+import { anchoredTimelineCenter, clampTimelineScale } from '@shared/timeline-viewport'
 
 const props = defineProps<{
+  source?: 'loop' | 'saved'
+  rate?: number
+  continuous?: boolean
   height: number
   channelId: string | null
   channelName: string | null
@@ -25,6 +30,7 @@ const props = defineProps<{
   playingId?: string | null
   active?: boolean
   exportBusy?: boolean
+  exportFeedback?: { kind: 'success' | 'error'; text: string } | null
   /** Wall-clock time from player — timeline follows when not grabbing */
   followMs?: number | null
   /**
@@ -42,35 +48,90 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   refresh: []
-  play: [segment: RecordingSegment]
+  play: [segment: RecordingSegment, startSec?: number]
   scrub: [payload: { atMs: number; segment: RecordingSegment | null; seekSec: number }]
   saveClip: []
   deleteSaved: [segment: RecordingSegment]
+  download: [segment: RecordingSegment]
   activate: []
   menu: [action: string, payload?: { channelId?: string; segmentId?: string }]
   'update:source': [source: 'loop' | 'saved']
   'update:rate': [rate: number]
   'update:continuous': [on: boolean]
   exportRange: [payload: { channelId: string; startMs: number; endMs: number; pickPath?: boolean }]
+  cancelExport: []
+  dismissExportFeedback: []
 }>()
 
-const MIN_PX_PER_MS = 4 / (24 * 60 * 60 * 1000) // ~4px / day (whole week on a phone)
-const MAX_PX_PER_MS = 240 / 1000 // 240px / second (fine scrub)
 const DEFAULT_PX_PER_MS = 48 / 60_000 // 48px / minute
 /** Minimum on-screen gap between labeled major ticks (px). */
 const MIN_TICK_LABEL_GAP_PX = 56
 /** Mobile: slightly wider so labels don't collide on narrow screens. */
 const MIN_TICK_LABEL_GAP_MOBILE_PX = 72
 
+const jumpTime = ref('')
+const jumpError = ref('')
+const followPlayback = ref(true)
+const panelRef = ref<HTMLElement | null>(null)
+const toolsRef = ref<HTMLDetailsElement | null>(null)
+const motionPreference = window.matchMedia('(prefers-reduced-motion: reduce)')
+function closeToolsOutside(event: PointerEvent) {
+  if (toolsRef.value?.open && !toolsRef.value.contains(event.target as Node)) toolsRef.value.open = false
+}
+const contentMinimumHeight = ref(160)
+let panelObserver: ResizeObserver | null = null
+function measurePanelContent() {
+  const root = panelRef.value
+  if (!root) return
+  const height = (selector: string) => root.querySelector<HTMLElement>(selector)?.getBoundingClientRect().height ?? 0
+  const hints = Array.from(root.querySelectorAll<HTMLElement>('.body > .hint')).reduce((sum, el) => sum + el.getBoundingClientRect().height + 8, 0)
+  contentMinimumHeight.value = Math.ceil(Math.max(160, height('.head') + height('.export-bar') + height('.legend') + hints + 90))
+}
+const effectiveHeight = computed(() => Math.max(props.height, contentMinimumHeight.value))
+const displayCenterMs = ref(Date.now())
+function jumpToTime() {
+  const time = jumpTime.value
+  if (!/^\d{2}:\d{2}(?::\d{2})?$/.test(time)) { jumpError.value = '请输入有效时间'; return }
+  const day = dayFilter.value || formatSegmentDayKey(Date.now())
+  const ms = new Date(day + 'T' + (time.length === 5 ? time + ':00' : time)).getTime()
+  if (!Number.isFinite(ms)) { jumpError.value = '日期或时间无效'; return }
+  jumpError.value = ''
+  followPlayback.value = true
+  setCenterAndScrub(ms)
+}
+function adjacentCandidate(direction: number) {
+  const list = filteredAsc.value.filter(s => !isSegmentWriting(s) && s.state !== 'invalid')
+  const index = followPlayback.value ? list.findIndex(s => s.id === props.playingId) : -1
+  if (index >= 0) return list[index + direction] ?? null
+  const center = displayCenterMs.value
+  return direction > 0 ? list.find(s => segStart(s) > center + 500) : [...list].reverse().find(s => segStart(s) < center - 500)
+}
+function adjacentSegment(direction: number) {
+  const candidate = adjacentCandidate(direction)
+  if (candidate) onPlay(candidate)
+}
 const dayFilter = ref('')
-const autoNext = ref(true)
-const playbackRate = ref(1)
-const source = ref<'loop' | 'saved'>('loop')
+const autoNext = ref(props.continuous ?? true)
+watch(() => props.continuous, value => { if (value !== undefined) autoNext.value = value })
+watch(() => props.rate, value => { if (value !== undefined) playbackRate.value = value })
+const playbackRate = ref(props.rate ?? 1)
+const source = ref<'loop' | 'saved'>(props.source ?? 'loop')
+watch(() => props.source, value => { if (value && value !== source.value) source.value = value })
+const sourceViews = new Map<'loop' | 'saved', { center: number; scale: number; day: string; follow: boolean }>()
 const hoverId = ref<string | null>(null)
+const chosenSavedId = ref('')
+function playChosenSaved(event: Event) {
+  const id = (event.target as HTMLSelectElement).value
+  chosenSavedId.value = id
+  const clip = filteredAsc.value.find(s => s.id === id)
+  if (clip) onPlay(clip)
+}
 /** Soft clock so “writing” gray blocks refresh as mtime ages out. */
 const nowMs = ref(Date.now())
 let writingClockTimer: ReturnType<typeof setInterval> | null = null
 let liveEdgeTimer: ReturnType<typeof setInterval> | null = null
+let liveFollowRaf = 0
+let playbackFollowRaf = 0
 
 const viewportRef = ref<HTMLElement | null>(null)
 const trackShiftRef = ref<HTMLElement | null>(null)
@@ -106,6 +167,8 @@ let touchPanCaptured = false
 let scrubOnRelease = false
 let pendingPxPerMs = 0
 let zoomRaf = 0
+let zoomAnchorX = 0
+let zoomLastFrame = 0
 /** Structural viewport fit key — channel/source/day only (not drifting range ends). */
 let viewFittedKey = ''
 let selectAnchorMs = 0
@@ -166,14 +229,21 @@ function openSegmentId(list: RecordingSegment[], now: number): string | null {
 /** Wall end used for paint and hit-testing. The open file grows to now. */
 function displayEnd(s: RecordingSegment, now: number, openId: string | null): number {
   const a = segStart(s)
-  const b = Math.max(a + 500, segEnd(s))
-  if (openId != null && s.id === openId) return Math.max(b, now)
-  return b
+  return timelineSegmentEnd(a, segEnd(s), now, openId != null && s.id === openId)
 }
 
 const dayOptions = computed(() => {
   const set = new Set<string>()
-  for (const s of activeList.value) set.add(formatSegmentDayKey(segStart(s)))
+  for (const s of activeList.value) {
+    const start = segStart(s)
+    const end = Math.min(Math.max(start, segEnd(s) - 1), start + 7 * 86400_000)
+    const day = new Date(start)
+    day.setHours(0, 0, 0, 0)
+    while (day.getTime() <= end) {
+      set.add(formatSegmentDayKey(day.getTime()))
+      day.setDate(day.getDate() + 1)
+    }
+  }
   return [...set].sort((a, b) => b.localeCompare(a))
 })
 
@@ -190,9 +260,7 @@ watch(
       // Preferred day absent on this channel — fall through
     }
     if (!dayFilter.value && days[0]) dayFilter.value = days[0]!
-    else if (dayFilter.value && days.length && !days.includes(dayFilter.value)) {
-      dayFilter.value = days[0]!
-    }
+
   },
   { immediate: true },
 )
@@ -201,7 +269,9 @@ watch(
 const filteredAsc = computed(() => {
   let list = activeList.value
   if (dayFilter.value) {
-    list = list.filter((s) => formatSegmentDayKey(segStart(s)) === dayFilter.value)
+    const start = new Date(dayFilter.value + 'T00:00:00')
+    const end = new Date(start); end.setDate(end.getDate() + 1)
+    list = list.filter((s) => segStart(s) < end.getTime() && segEnd(s) > start.getTime())
   }
   return [...list].sort((a, b) => segStart(a) - segStart(b))
 })
@@ -230,7 +300,7 @@ const viewSpanMs = computed(() => Math.max(1000, viewportW.value / Math.max(pxPe
 const viewStartMs = computed(() => centerMs.value - viewSpanMs.value / 2)
 const viewEndMs = computed(() => centerMs.value + viewSpanMs.value / 2)
 
-const centerLabel = computed(() => formatSegmentClock(centerMs.value, true))
+const centerLabel = computed(() => formatSegmentClock(displayCenterMs.value, true))
 
 const zoomLabel = computed(() => {
   const ppm = pxPerMs.value
@@ -324,6 +394,8 @@ function majorTickEvery(stepMs: number): number {
 }
 
 type BlockView = {
+  count: number
+  selected: boolean
   seg: RecordingSegment
   left: number
   width: number
@@ -345,7 +417,8 @@ type BlockView = {
  * Block geometry relative to dataRange.start — independent of pan center.
  * Parent track-shift translate moves them; avoids rebuilding on every drag frame.
  */
-const originMs = computed(() => dataRange.value?.start ?? 0)
+const renderSpan = computed(() => Math.max(1000, viewportW.value / Math.max(pxPerMs.value, 1e-12)))
+const originMs = computed(() => Math.floor(centerMs.value / 3600000) * 3600000)
 
 /** Absolute ticks (same coordinate system as blocks) — pan via shared transform. */
 const ticks = computed(() => {
@@ -357,8 +430,8 @@ const ticks = computed(() => {
   const viewSpan = Math.max(1000, w / Math.max(ppm, 1e-12))
   const step = pickTickStep(viewSpan, w)
   const pad = viewSpan
-  const start = range.start - pad
-  const end = range.end + pad
+  const start = centerMs.value - pad * 2
+  const end = centerMs.value + pad * 2
   const first = Math.floor(start / step) * step
   const out: Tick[] = []
   const majorEvery = majorTickEvery(step)
@@ -367,7 +440,7 @@ const ticks = computed(() => {
   let i = 0
   for (let t = first; t <= end + step; t += step, i++) {
     const x = (t - origin) * ppm
-    const wantMajor = i % majorEvery === 0
+    const wantMajor = Math.round(t / step) % majorEvery === 0
     // Promote day/hour boundaries to major when nearby minors would otherwise dominate.
     const d = new Date(t)
     const boundaryBoost =
@@ -392,6 +465,8 @@ const ticks = computed(() => {
   return out
 })
 
+const blockIndex = computed(() => createTimelineIndex(filteredAsc.value, segStart, s => Math.max(segStart(s) + 500, segEnd(s))))
+const segmentById = computed(() => new Map(filteredAsc.value.map(s => [s.id, s])))
 const layoutBlocks = computed(() => {
   const origin = originMs.value
   const ppm = pxPerMs.value
@@ -399,34 +474,32 @@ const layoutBlocks = computed(() => {
   const now = nowMs.value
   const list = filteredAsc.value
   const openId = openSegmentId(list, now)
-  const fullRadius = props.mobile ? 4 : 5
+  const fullRadius = 0
   const viewW = viewportW.value
   const viewSpan = Math.max(1000, viewW / Math.max(ppm, 1e-12))
   const secondScale = viewW > 0 && pickTickStep(viewSpan, viewW) < 60_000
   const zoomRadius = secondScale ? fullRadius : 0
-  const spans: { seg: RecordingSegment; a: number; b: number; lane: number }[] = []
-  const laneEnds: number[] = []
-  for (const seg of list) {
-    const a = segStart(seg)
-    const b = displayEnd(seg, now, openId)
-    let lane = laneEnds.findIndex((end) => end <= a + 200)
-    if (lane < 0) {
-      lane = laneEnds.length
-      laneEnds.push(b)
-    } else {
-      laneEnds[lane] = b
-    }
-    spans.push({ seg, a, b, lane })
-  }
-  const lanes = Math.max(1, laneEnds.length)
+  const index = blockIndex.value
+  const from = centerMs.value - viewSpan * 2, to = centerMs.value + viewSpan * 2
+  const visible = index.query(from, to)
+  // A growing file can extend beyond the end recorded in the cached index.
+  const open = openId ? index.spans[index.spans.length - 1] : null
+  if (open && open.item.id === openId && open.start <= to && Math.max(open.end, now) >= from && !visible.includes(open)) visible.push(open)
+  const lanes = index.lanes
+  const centerId = underCenterSeg.value?.id
+  const compact = compactTimelineSpans(visible.map(span => span.item.id === openId ? { ...span, end: displayEnd(span.item, now, openId) } : span), ppm,
+    seg => seg.id === props.playingId || seg.id === centerId, seg => seg.id !== openId && !isSegmentWriting(seg, now))
   const out: BlockView[] = []
-  for (const { seg, a, b, lane } of spans) {
+  for (const span of compact) {
+    const seg = span.item, a = span.start, b = span.end, lane = span.lane
     const left = (a - origin) * ppm
-    const width = Math.max(3, (b - a) * ppm)
+    const width = Math.max(0, (b - a) * ppm)
     const writing = seg.id === openId || isSegmentWriting(seg, now)
     const stacked = lanes > 1
     const radiusPx = Math.min(zoomRadius, Math.max(0, (width - 2) / 2))
     out.push({
+      count: span.count,
+      selected: span.selected,
       seg,
       left,
       width,
@@ -436,11 +509,11 @@ const layoutBlocks = computed(() => {
       writing,
       startLabel: formatSegmentClock(a, withSec),
       endLabel: formatSegmentClock(b, withSec),
-      showStart: width >= 44,
-      showEnd: width >= 110,
-      showDuration: width >= 160,
+      showStart: width >= (withSec ? 76 : 56),
+      showEnd: width >= (withSec ? 152 : 112),
+      showDuration: width >= (withSec ? 236 : 196),
       durationLabel: formatSegmentDuration(a, b),
-      rangeTitle: writing
+      rangeTitle: span.count > 1 ? `${span.count} 段录像 · ${formatSegmentTimeRange(a, b)} · 缩放查看或点击定位` : writing
         ? `${formatSegmentTimeRange(seg.startMs, seg.endMs)} · 正在录制中`
         : `${formatSegmentTimeRange(seg.startMs, seg.endMs)} · ${formatSegmentDuration(a, b)}`,
       radius: radiusPx < 0.75 ? '0' : `${Math.round(radiusPx * 10) / 10}px`,
@@ -460,6 +533,8 @@ function trackOffsetFor(center: number): number {
  */
 function paintLiveCenter(center: number) {
   liveCenterMs = center
+  if (Math.floor(displayCenterMs.value / 1000) !== Math.floor(center / 1000)) displayCenterMs.value = center
+  if (viewportRef.value) viewportRef.value.dataset.center = String(center)
   const tx = trackOffsetFor(center)
   const t = `translate3d(${tx}px,0,0)`
   const track = trackShiftRef.value
@@ -474,6 +549,9 @@ function paintLiveCenter(center: number) {
 
 function schedulePaint(center: number) {
   liveCenterMs = center
+  // Rebase only near the overscan boundary; keep coordinates small and extend
+  // ticks during long drags without rebuilding all recordings on every frame.
+  if (Math.abs(center - centerMs.value) > renderSpan.value * 0.5) centerMs.value = center
   if (transformRaf) return
   transformRaf = requestAnimationFrame(() => {
     transformRaf = 0
@@ -525,7 +603,7 @@ const cursorLabel = computed(() => {
   return formatSegmentClock(cursorMs.value, true)
 })
 
-const underCenterSeg = computed(() => segmentAt(centerMs.value))
+const underCenterSeg = computed(() => playingSeg.value && followPlayback.value ? playingSeg.value : segmentAt(displayCenterMs.value))
 
 const selection = computed(() => {
   if (selA.value == null || selB.value == null) return null
@@ -539,12 +617,36 @@ const selectionOverlapCount = computed(() => {
   const sel = selection.value
   if (!sel) return 0
   return filteredAsc.value.filter((s) => {
+    if (isSegmentWriting(s) || s.state === 'invalid') return false
     const a = segStart(s)
     const b = Math.max(a, segEnd(s))
-    return a <= sel.endMs && b >= sel.startMs
+    return a < sel.endMs && b > sel.startMs
   }).length
 })
 
+const selectionCoverage = computed(() => {
+  const selected = selection.value
+  if (!selected) return { media: '', gap: '' }
+  let total = 0, cursor = selected.startMs
+  for (const segment of filteredAsc.value) {
+    if (isSegmentWriting(segment) || segment.state === 'invalid') continue
+    const start = Math.max(selected.startMs, segStart(segment), cursor)
+    const end = Math.min(selected.endMs, segEnd(segment))
+    if (end > start) { total += end-start; cursor = end }
+  }
+  return { media: formatSegmentDuration(0, total), gap: total < selected.spanMs ? formatSegmentDuration(0, selected.spanMs-total) : '' }
+})
+
+function localDateTime(ms: number) {
+  const date = new Date(ms)
+  return new Date(ms-date.getTimezoneOffset()*60_000).toISOString().slice(0,19)
+}
+function editSelection(event: Event, edge: 'start' | 'end') {
+  const ms = new Date((event.target as HTMLInputElement).value).getTime()
+  if (!Number.isFinite(ms)) return
+  if (edge === 'start') selA.value = ms
+  else selB.value = ms
+}
 const selectionLabel = computed(() => {
   const sel = selection.value
   if (!sel) return ''
@@ -555,29 +657,12 @@ function segmentAt(ms: number): RecordingSegment | null {
   const list = filteredAsc.value
   const now = nowMs.value
   const openId = openSegmentId(list, now)
-  // Binary search first segment that ends after ms, then scan a few
-  let lo = 0
-  let hi = list.length - 1
-  let idx = -1
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1
-    const s = list[mid]!
-    const b = displayEnd(s, now, openId)
-    if (b < ms) lo = mid + 1
-    else {
-      idx = mid
-      hi = mid - 1
-    }
-  }
-  if (idx < 0) return null
-  for (let i = idx; i < Math.min(list.length, idx + 8); i++) {
-    const s = list[i]!
-    const a = segStart(s)
-    const b = displayEnd(s, now, openId)
-    if (ms >= a && ms <= b) return s
-    if (a > ms) break
-  }
-  return null
+  const preferred = props.playingId ? segmentById.value.get(props.playingId) : undefined
+  if (preferred && ms >= segStart(preferred) && ms < displayEnd(preferred, now, openId)) return preferred
+  const candidates = blockIndex.value.query(ms, ms)
+  const newest = list[list.length - 1]
+  if (newest?.id === openId && ms >= segStart(newest) && ms < displayEnd(newest, now, openId)) return newest
+  return candidates.filter(span => ms < displayEnd(span.item, now, openId)).at(-1)?.item ?? null
 }
 
 function emitScrub() {
@@ -599,6 +684,8 @@ function emitScrub() {
     return
   }
   const seekSec = Math.max(0, (at - segStart(seg)) / 1000)
+  followPlayback.value = true
+  followLockUntil = 0
   emit('scrub', { atMs: at, segment: seg, seekSec })
 }
 
@@ -681,6 +768,7 @@ function zoomToRange(startMs: number, endMs: number, padRatio = 0.15) {
   const viewSpan = span + pad * 2
   const w = Math.max(120, viewportW.value)
   userAnchored = true
+  followPlayback.value = false
   pxPerMs.value = clampZoom(w / viewSpan)
   commitCenter((a + b) / 2, 'none')
 }
@@ -693,12 +781,13 @@ function beginSaveSelection(): { ok: true } | { ok: false; error: string } {
   if (!props.channelId) return { ok: false, error: '请先选择通道' }
   if (props.remoteMode) return { ok: false, error: '远程端不能保存片段' }
 
+  const saveAnchor = source.value === 'loop' && props.active ? liveCenterMs : Date.now()
   setSource('loop')
   measureViewport()
 
   const minutes = Math.max(0.5, props.savedClipMinutes ?? 10)
   const durationMs = Math.round(minutes * 60_000)
-  const endMs = Date.now()
+  const endMs = saveAnchor
   const startMs = endMs - durationMs
 
   // Prefer day of the window end so recent footage isn't hidden by an old day filter.
@@ -739,7 +828,11 @@ function onBlockClick(seg: RecordingSegment, e?: MouseEvent) {
   const at = e ? clientXToMs(e.clientX) : segStart(seg)
   const a = segStart(seg)
   const b = Math.max(a + 1, segEnd(seg))
-  setCenterAndScrub(Math.min(b, Math.max(a, at)))
+  const target = Math.min(b - 1, Math.max(a, at))
+  followPlayback.value = true
+  followLockUntil = 0
+  commitCenter(target, 'none')
+  emit('play', seg, Math.max(0, (target - a) / 1000))
 }
 
 function requestExport(pickPath = false) {
@@ -756,12 +849,14 @@ function requestExport(pickPath = false) {
 
 function setSource(next: 'loop' | 'saved') {
   source.value = next
-  emit('update:source', next)
 }
 
 function onPlay(seg: RecordingSegment) {
   if (props.scrubLocked) return
-  setCenterAndScrub(segStart(seg))
+  followPlayback.value = true
+  followLockUntil = 0
+  commitCenter(segStart(seg), 'none')
+  emit('play', seg, 0)
 }
 
 function playNext(): RecordingSegment | null {
@@ -781,10 +876,7 @@ function onActivateClick() {
 }
 
 function clampZoom(v: number) {
-  const w = Math.max(120, viewportW.value)
-  // Keep at least ~1.5s on screen at max zoom so fine scrub stays controllable.
-  const maxPpm = Math.max(MAX_PX_PER_MS, w / 1500)
-  return Math.min(maxPpm, Math.max(MIN_PX_PER_MS, v))
+  return clampTimelineScale(v, viewportW.value)
 }
 
 /** Prefer the calendar day that contains `ms` so live "now" isn't an empty filter. */
@@ -804,6 +896,7 @@ function syncDayFilterToWall(ms: number) {
  * filter + zoom, so the track looked empty.
  */
 function enterLiveStrip() {
+  followPlayback.value = true
   followLockUntil = 0
   userAnchored = false
   const now = Date.now()
@@ -830,7 +923,14 @@ function enterLiveStrip() {
 function measureViewport() {
   const el = viewportRef.value
   if (!el) return
-  viewportW.value = Math.max(120, el.clientWidth)
+  const width = Math.max(120, el.clientWidth)
+  if (width !== viewportW.value) {
+    viewportW.value = width
+    pxPerMs.value = clampZoom(pxPerMs.value)
+    pendingPxPerMs = 0
+    if (zoomRaf) cancelAnimationFrame(zoomRaf)
+    zoomRaf = 0
+  }
 }
 
 function fitView(mode: 'auto' | 'all' = 'auto') {
@@ -838,7 +938,7 @@ function fitView(mode: 'auto' | 'all' = 'auto') {
   const range = dataRange.value
   const list = filteredAsc.value
   /** Live preview with recording: keep playhead on "now" (source/day refits must not yank to history). */
-  const liveFollow = !props.active && !!props.followLiveEdge
+  const liveFollow = source.value === 'loop' && !props.active && !!props.followLiveEdge
 
   if (!range || !list.length) {
     pxPerMs.value = DEFAULT_PX_PER_MS
@@ -880,9 +980,9 @@ function fitView(mode: 'auto' | 'all' = 'auto') {
 
   const w = Math.max(120, viewportW.value)
   let span = Math.max(5_000, end - start)
-  const pad = Math.max(span * 0.08, 20_000)
+  const pad = Math.max(span * 0.08, source.value === 'saved' ? 500 : 20_000)
   span += pad * 2
-  pxPerMs.value = clampZoom(w / Math.max(span, 3 * 60_000))
+  pxPerMs.value = clampZoom(w / Math.max(span, source.value === 'saved' ? 5000 : 3 * 60_000))
 
   // Auto-fit while live-following: adjust zoom from data, but never leave "now"
   // (switching 循环↔已保存 used to center on clip midpoint and kill live scroll).
@@ -929,6 +1029,9 @@ watch(
 )
 
 function centerOnPlaying() {
+  followPlayback.value = true
+  followLockUntil = 0
+  if (!props.active) { commitCenter(Date.now(), 'none'); return }
   if (props.followMs != null) {
     commitCenter(props.followMs, 'none')
     return
@@ -940,18 +1043,29 @@ function centerOnPlaying() {
   commitCenter((a + b) / 2, 'none')
 }
 
-function zoomAt(_clientX: number, factor: number) {
-  // Keep the center playhead time fixed. Coalesce pinch events to one paint per frame.
+function zoomAt(clientX: number, factor: number) {
+  const rect = viewportRef.value?.getBoundingClientRect()
+  zoomAnchorX = !followPlayback.value && rect ? Math.max(0, Math.min(viewportW.value, clientX - rect.left)) - viewportW.value / 2 : 0
   const base = pendingPxPerMs > 0 ? pendingPxPerMs : pxPerMs.value
   pendingPxPerMs = clampZoom(base * factor)
   if (zoomRaf) return
-  zoomRaf = requestAnimationFrame(() => {
+  zoomLastFrame = performance.now()
+  const frame = (now: number) => {
     zoomRaf = 0
     if (!(pendingPxPerMs > 0)) return
-    pxPerMs.value = pendingPxPerMs
-    pendingPxPerMs = 0
-    paintLiveCenter(liveCenterMs)
-  })
+    const oldScale = pxPerMs.value
+    const alpha = motionPreference.matches ? 1 : 1 - Math.exp(-Math.min(50, now - zoomLastFrame) / 45)
+    zoomLastFrame = now
+    let nextScale = Math.exp(Math.log(oldScale) + (Math.log(pendingPxPerMs) - Math.log(oldScale)) * alpha)
+    if (Math.abs(Math.log(nextScale / pendingPxPerMs)) < 0.002) { nextScale = pendingPxPerMs; pendingPxPerMs = 0 }
+    liveCenterMs = source.value === 'loop' && !props.active && props.followLiveEdge && followPlayback.value
+      ? Date.now()
+      : anchoredTimelineCenter(liveCenterMs, zoomAnchorX, oldScale, nextScale)
+    pxPerMs.value = nextScale
+    centerMs.value = liveCenterMs
+    if (pendingPxPerMs > 0) zoomRaf = requestAnimationFrame(frame)
+  }
+  zoomRaf = requestAnimationFrame(frame)
 }
 
 function pointerSpan(): number {
@@ -1005,6 +1119,11 @@ function onViewportPointerDown(e: PointerEvent) {
   }
   const el = viewportRef.value
   if (!el) return
+  if (wheelCommitTimer) clearTimeout(wheelCommitTimer)
+  wheelCommitTimer = null
+  if (zoomRaf) cancelAnimationFrame(zoomRaf)
+  zoomRaf = 0
+  pendingPxPerMs = 0
 
   // New contact cancels a pending seek from the previous swipe.
   cancelPendingScrub()
@@ -1049,6 +1168,7 @@ function onViewportPointerDown(e: PointerEvent) {
     pinchBaseDist = pointerSpan()
     userGrabbing.value = true
     userAnchored = true
+  followPlayback.value = false
     // Release element capture so both fingers keep delivering events; document
     // guards still receive pointerup outside the viewport.
     // Ignore the synchronous lostpointercapture that releasePointerCapture fires.
@@ -1069,6 +1189,7 @@ function onViewportPointerDown(e: PointerEvent) {
   panActive = true
   panning.value = true
   userAnchored = true
+  followPlayback.value = false
   panDistance = 0
   suppressClick = false
   panLastX = e.clientX
@@ -1082,9 +1203,15 @@ function onWheel(e: WheelEvent) {
   e.preventDefault()
   userAnchored = true
   if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    followPlayback.value = false
+    if (zoomRaf) cancelAnimationFrame(zoomRaf)
+    zoomRaf = 0
+    pendingPxPerMs = 0
     panActive = true
     userGrabbing.value = true
-    schedulePaint(liveCenterMs + (e.deltaY || e.deltaX) / pxPerMs.value)
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? viewportW.value : 1
+    schedulePaint(liveCenterMs + delta * unit / pxPerMs.value)
     if (wheelCommitTimer) clearTimeout(wheelCommitTimer)
     wheelCommitTimer = setTimeout(() => {
       wheelCommitTimer = null
@@ -1097,9 +1224,8 @@ function onWheel(e: WheelEvent) {
     }, 120)
     return
   }
-  const zoomIn = e.deltaY < 0
-  const step = props.mobile ? 1.28 : 1.18
-  zoomAt(e.clientX, zoomIn ? step : 1 / step)
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? viewportW.value : 1
+  zoomAt(e.clientX, Math.exp(-Math.max(-240, Math.min(240, e.deltaY * unit)) * 0.002))
 }
 
 function onViewportPointerMove(e: PointerEvent) {
@@ -1261,6 +1387,8 @@ function onViewportDblClick(e: MouseEvent) {
 
 function onPanelCtx(e: MouseEvent) {
   const items: CtxMenuItem[] = []
+  const downloadSegment = viewportRef.value?.contains(e.target as Node) ? segmentAt(clientXToMs(e.clientX)) : underCenterSeg.value
+  items.push({ id: 'download', label: '下载片段', disabled: !downloadSegment || isSegmentWriting(downloadSegment, nowMs.value) || downloadSegment.sizeBytes <= 0 }, { separator: true })
   if (!props.remoteMode) {
     items.push({ id: 'saveClip', label: '框选保存片段…', disabled: !props.channelId }, { separator: true })
   }
@@ -1282,6 +1410,7 @@ function onPanelCtx(e: MouseEvent) {
     )
   }
   openContextMenu(e, items, (id) => {
+    if (id === 'download' && downloadSegment) { emit('download', downloadSegment); return }
     if (id === 'refresh') {
       emit('refresh')
       return
@@ -1315,7 +1444,7 @@ function onPanelCtx(e: MouseEvent) {
 }
 
 function onSegCtx(e: MouseEvent, seg: RecordingSegment) {
-  const items: CtxMenuItem[] = [{ id: 'play', label: '播放' }]
+  const items: CtxMenuItem[] = [{ id: 'play', label: '播放' }, { id: 'download', label: '下载片段', disabled: isSegmentWriting(seg, nowMs.value) || seg.sizeBytes <= 0 }]
   if (!props.remoteMode) {
     items.push({ id: 'reveal', label: '打开所在目录' }, { separator: true })
     if (seg.protected) {
@@ -1327,6 +1456,7 @@ function onSegCtx(e: MouseEvent, seg: RecordingSegment) {
   items.push({ separator: true }, { id: 'refresh', label: '刷新时间轴' })
 
   openContextMenu(e, items, (id) => {
+    if (id === 'download') { emit('download', seg); return }
     if (id === 'play') {
       onPlay(seg)
       return
@@ -1373,19 +1503,53 @@ watch(
 
 watch(playbackRate, (r) => emit('update:rate', r))
 
-watch(source, () => {
+watch(source, (next, previous) => {
+  if (wheelCommitTimer) clearTimeout(wheelCommitTimer)
+  wheelCommitTimer = null
+  panActive = false
+  userGrabbing.value = false
+  chosenSavedId.value = ''
+  clearSelection()
+  selectMode.value = false
+  sourceViews.set(previous, { center: liveCenterMs, scale: pxPerMs.value, day: dayFilter.value, follow: followPlayback.value })
+  cancelPendingScrub()
+  stopLiveEdgeFollow()
+  if (zoomRaf) cancelAnimationFrame(zoomRaf)
+  zoomRaf = 0
+  pendingPxPerMs = 0
   dayFilter.value = ''
   viewFittedKey = ''
   userAnchored = false
-  // Live + recording: releasing the structural fit key will call fitView('auto'),
-  // which now keeps "now". Also clear any leftover follow lock from pans.
-  if (!props.active && props.followLiveEdge) {
-    followLockUntil = 0
-  }
-})
+  followPlayback.value = false
+  followLockUntil = 0
+  const saved = sourceViews.get(next)
+  void nextTick(() => {
+    if (source.value !== next) return
+    if (saved) {
+      userAnchored = true
+      dayFilter.value = saved.day
+      pxPerMs.value = clampZoom(saved.scale)
+      followPlayback.value = saved.follow
+      commitCenter(saved.center, 'none')
+      viewFittedKey = structuralFitKey(filteredAsc.value.length > 0)
+    } else if (next === 'saved') {
+      fitView('auto')
+    } else if (!props.active && props.followLiveEdge) {
+      enterLiveStrip()
+    } else { fitView('auto') }
+    if (next === 'loop' && !props.active && props.followLiveEdge) startLiveEdgeFollow()
+  })
+}, { flush: 'sync' })
+
+watch([selectMode, selection, source, () => props.exportFeedback], async () => { await nextTick(); measurePanelContent() })
 
 watch(dayFilter, () => {
   viewFittedKey = ''
+})
+
+watch(() => source.value === 'saved' ? `${dataRange.value?.start}|${dataRange.value?.end}` : '', () => {
+  if (source.value !== 'saved' || userAnchored || followPlayback.value || gestureInFlight()) return
+  void nextTick(() => { if (source.value === 'saved' && !userAnchored && !followPlayback.value) fitView('auto') })
 })
 
 watch(
@@ -1397,6 +1561,7 @@ watch(
     preferredDayOnChannelSwitch = formatSegmentDayKey(liveCenterMs)
     dayFilter.value = ''
     userAnchored = true
+    followPlayback.value = !props.active && source.value === 'loop'
     followLockUntil = Date.now() + 1500
     void nextTick(() => {
       viewFittedKey = structuralFitKey(filteredAsc.value.length > 0)
@@ -1408,6 +1573,7 @@ watch(
 watch(
   () => props.followLiveEdge,
   (on) => {
+    if (source.value === 'saved') { stopLiveEdgeFollow(); return }
     if (props.active || !on) {
       stopLiveEdgeFollow()
       return
@@ -1421,13 +1587,14 @@ watch(
   () => props.active,
   (on, was) => {
     if (on) {
+      followPlayback.value = true
       stopLiveEdgeFollow()
       return
     }
     // Leaving playback → live: restore today's strip under "now".
     // Keeping the playback day filter + zoom left the track empty.
     if (was && !on) {
-      enterLiveStrip()
+      if (source.value === 'loop') enterLiveStrip()
       return
     }
     if (props.followLiveEdge) startLiveEdgeFollow()
@@ -1458,7 +1625,8 @@ watch(
 
 watch(
   () => props.playingId,
-  () => {
+  (id) => {
+    if (source.value === 'saved' && id && props.savedClips.some(clip => clip.id === id)) chosenSavedId.value = id
     // Do not auto-recenter on segment change — that fights scrub and causes bounce.
     // Timeline position is owned by user pan + player followMs.
   },
@@ -1468,15 +1636,28 @@ watch(
   () => props.followMs,
   (ms) => {
     // Playback mode: follow player wall clock
-    if (!props.active) return
+    if (!props.active || !followPlayback.value) return
     if (ms == null || userGrabbing.value || selectMode.value || panActive) return
     if (Date.now() < followLockUntil) return
     if (Math.abs(ms - liveCenterMs) < 80) return
-    schedulePaint(ms)
+    if (!playbackFollowRaf) {
+      let previous = performance.now()
+      const frame = (now: number) => {
+        playbackFollowRaf = 0
+        if (!props.active || !followPlayback.value || props.followMs == null || panActive || userGrabbing.value || selectMode.value || Date.now() < followLockUntil) return
+        const target = props.followMs
+        const distance = target - liveCenterMs
+        const alpha = motionPreference.matches || Math.abs(distance) > renderSpan.value ? 1 : 1 - Math.exp(-Math.min(50, now - previous) / 65)
+        previous = now
+        schedulePaint(Math.abs(distance) < 40 ? target : liveCenterMs + distance * alpha)
+        if (Math.abs(target - liveCenterMs) > 40) playbackFollowRaf = requestAnimationFrame(frame)
+      }
+      playbackFollowRaf = requestAnimationFrame(frame)
+    }
     if (followCommitTimer) return
     followCommitTimer = setTimeout(() => {
       followCommitTimer = null
-      if (!props.active || userGrabbing.value || panActive) return
+      if (!props.active || !followPlayback.value || userGrabbing.value || panActive) return
       if (Date.now() < followLockUntil) return
       if (Math.abs(liveCenterMs - centerMs.value) > 250) {
         centerMs.value = liveCenterMs
@@ -1486,7 +1667,9 @@ watch(
 )
 
 function tickLiveEdge() {
+  if (source.value !== 'loop') return
   if (props.active || !props.followLiveEdge) return
+  if (!followPlayback.value) return
   if (userGrabbing.value || selectMode.value || panActive) return
   if (Date.now() < followLockUntil) return
   const now = Date.now()
@@ -1501,9 +1684,18 @@ function startLiveEdgeFollow() {
   if (liveEdgeTimer) return
   tickLiveEdge()
   liveEdgeTimer = setInterval(tickLiveEdge, 1000)
+  const frame = () => {
+    liveFollowRaf = 0
+    if (props.active || !props.followLiveEdge || source.value !== 'loop') return
+    if (followPlayback.value && !userGrabbing.value && !selectMode.value && !panActive && Date.now() >= followLockUntil) schedulePaint(Date.now())
+    liveFollowRaf = requestAnimationFrame(frame)
+  }
+  liveFollowRaf = requestAnimationFrame(frame)
 }
 
 function stopLiveEdgeFollow() {
+  if (liveFollowRaf) cancelAnimationFrame(liveFollowRaf)
+  liveFollowRaf = 0
   if (liveEdgeTimer) {
     clearInterval(liveEdgeTimer)
     liveEdgeTimer = null
@@ -1514,7 +1706,6 @@ function stopLiveEdgeFollow() {
 watch(
   [pxPerMs, originMs, viewportW],
   () => {
-    if (panActive || userGrabbing.value) return
     paintLiveCenter(liveCenterMs)
   },
   { flush: 'post' },
@@ -1550,6 +1741,14 @@ function bindResizeObserver() {
 }
 
 onMounted(() => {
+  document.addEventListener('pointerdown', closeToolsOutside)
+  if (panelRef.value) {
+    panelObserver = new ResizeObserver(measurePanelContent)
+    panelObserver.observe(panelRef.value)
+    panelObserver.observe(panelRef.value.querySelector('.head')!)
+    panelObserver.observe(panelRef.value.querySelector('.body')!)
+  }
+  measurePanelContent()
   measureViewport()
   bindResizeObserver()
   paintLiveCenter(centerMs.value)
@@ -1560,12 +1759,15 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('pointerdown', closeToolsOutside)
+  panelObserver?.disconnect()
   resizeObs?.disconnect()
   resizeObs = null
   resizeObsBound = false
   if (scrubTimer) clearTimeout(scrubTimer)
   if (transformRaf) cancelAnimationFrame(transformRaf)
   if (zoomRaf) cancelAnimationFrame(zoomRaf)
+  if (playbackFollowRaf) cancelAnimationFrame(playbackFollowRaf)
   if (wheelCommitTimer) clearTimeout(wheelCommitTimer)
   if (followCommitTimer) clearTimeout(followCommitTimer)
   if (writingClockTimer) clearInterval(writingClockTimer)
@@ -1586,14 +1788,16 @@ onUnmounted(() => {
 
 <template>
   <section
+    ref="panelRef"
     class="timeline"
+    :data-segment-count="filteredAsc.length"
     :class="{
       active,
       armed: !active && activeList.length > 0,
       compact: height <= 96 && !mobile,
       mobile: !!mobile,
     }"
-    :style="{ height: `${height}px` }"
+    :style="{ height: `${effectiveHeight}px` }"
     @contextmenu="onPanelCtx"
     @click="onActivateClick"
   >
@@ -1623,64 +1827,36 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="actions" @click.stop>
-        <button
-          v-if="!remoteMode"
-          type="button"
-          class="save"
-          :disabled="!channelId"
-          :class="{ on: selectMode }"
-          :title="saveHint"
-          @click="emit('saveClip')"
-        >
-          保存片段
-        </button>
-        <select v-model="dayFilter" title="按日期筛选" class="day">
-          <option v-if="!dayOptions.length" value="">无录像</option>
-          <option v-for="d in dayOptions" :key="d" :value="d">{{ d }}</option>
+        <div class="locate-tools">
+        <input v-model="dayFilter" type="date" class="day" aria-label="回放日期" :min="dayOptions[dayOptions.length - 1]" :max="dayOptions[0]" />
+        <select v-if="source === 'saved'" class="saved-picker" aria-label="选择已保存片段" :value="chosenSavedId" @change="playChosenSaved">
+          <option value="">选择片段（{{ filteredAsc.length }}）</option>
+          <option v-for="(clip, index) in filteredAsc" :key="clip.id" :value="clip.id">片段 {{ index + 1 }} · {{ formatSegmentDayKey(segStart(clip)) }} {{ formatSegmentTimeRange(segStart(clip), segEnd(clip)) }} · {{ formatSegmentDuration(segStart(clip), segEnd(clip)) }}</option>
         </select>
-        <select v-model.number="playbackRate" title="播放倍速" class="rate">
-          <option :value="0.5">0.5×</option>
-          <option :value="1">1×</option>
-          <option :value="1.5">1.5×</option>
-          <option :value="2">2×</option>
-          <option :value="4">4×</option>
-        </select>
-        <label v-if="!mobile" class="auto" title="播完自动下一片段">
-          <input v-model="autoNext" type="checkbox" />
-          连续
-        </label>
-        <label v-else class="auto auto-tight" title="播完自动下一片段">
-          <input v-model="autoNext" type="checkbox" />
-          连
-        </label>
-        <button
-          v-if="!remoteMode"
-          type="button"
-          class="ghost"
-          :class="{ on: selectMode }"
-          title="框选时间段并导出合并片段"
-          :disabled="!channelId || source !== 'loop'"
-          @click="setSelectMode(!selectMode)"
-        >
-          框选导出
-        </button>
-        <button type="button" class="ghost" title="适应最近录像；双击轨道适应全部" @click="fitView('auto')">
-          适应
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          title="定位到正在播放"
-          :disabled="!playingId"
-          @click="centerOnPlaying"
-        >
-          定位
-        </button>
-        <button type="button" class="ghost" @click="emit('refresh')">刷新</button>
+        <form class="time-jump" @submit.prevent="jumpToTime"><input v-model="jumpTime" type="time" step="1" aria-label="跳转到具体时间" required /><button type="submit" class="ghost" :disabled="!channelId">跳转</button></form>
+        <div class="navigation-tools">
+          <button type="button" class="ghost" aria-label="上一录像段" :disabled="!adjacentCandidate(-1)" @click="adjacentSegment(-1)">上一段</button>
+          <button type="button" class="ghost" aria-label="下一录像段" :disabled="!adjacentCandidate(1)" @click="adjacentSegment(1)">下一段</button>
+        </div>
+        </div>
+        <div class="operation-tools">
+          <button type="button" class="ghost" :disabled="source === 'saved' && !playingSeg" :class="{ on: followPlayback }" :aria-pressed="followPlayback" @click="followPlayback ? (followPlayback = false) : centerOnPlaying()">{{ followPlayback ? (active ? '跟随播放' : '跟随实时') : '恢复跟随' }}</button>
+          <details ref="toolsRef" class="timeline-tools" @keydown.esc.stop.prevent="toolsRef && (toolsRef.open = false)">
+            <summary aria-label="更多时间轴工具">更多</summary>
+            <div class="tools-popover">
+              <button type="button" class="ghost" @click="fitView('auto'); toolsRef && (toolsRef.open = false)">适应录像范围</button>
+              <p>{{ mobile ? '滑动浏览，双指缩放。' : '拖动浏览，滚轮缩放；双击录像定位。' }}</p>
+            </div>
+          </details>
+        <button v-if="!remoteMode" type="button" class="save" :disabled="!channelId" :class="{ on: selectMode }" @click="emit('saveClip')">保存片段</button>
+        </div>
       </div>
     </div>
 
     <div class="body" @click.stop>
+      <p v-if="source === 'saved' && savedClips.some(clip => clip.timeMeasured === false)" class="hint" role="status">正在读取已保存片段时长，时间范围确认后会自动调整视图。</p>
+      <p v-if="exportFeedback" class="hint export-feedback" :class="exportFeedback.kind" :role="exportFeedback.kind === 'error' ? 'alert' : 'status'">{{ exportFeedback.text }}<button type="button" aria-label="关闭保存提示" @click="emit('dismissExportFeedback')">×</button></p>
+      <p v-if="jumpError" class="hint" role="alert">{{ jumpError }}</p>
       <p v-if="loading && !filteredAsc.length" class="hint">加载中…</p>
       <p v-else-if="!filteredAsc.length" class="hint">
         <template v-if="source === 'saved'">
@@ -1697,6 +1873,8 @@ onUnmounted(() => {
         <div
           ref="viewportRef"
           class="viewport"
+          :data-scale="pxPerMs"
+          data-center=""
           :class="{ panning, selecting: selectMode, locked: scrubLocked }"
           :title="scrubLocked ? '加载中，请稍候…' : undefined"
           @wheel.prevent="onWheel"
@@ -1713,6 +1891,7 @@ onUnmounted(() => {
               <span
                 v-for="t in ticks"
                 :key="t.ms"
+                :data-wall-ms="t.ms"
                 class="tick"
                 :class="{ major: t.major }"
                 :style="{ left: `${t.x}px` }"
@@ -1745,7 +1924,7 @@ onUnmounted(() => {
                 type="button"
                 class="block"
                 :class="{
-                  active: playingId === b.seg.id || underCenterSeg?.id === b.seg.id,
+                  active: b.selected,
                   locked: b.seg.protected,
                   writing: b.writing,
                   hover: hoverId === b.seg.id,
@@ -1759,10 +1938,10 @@ onUnmounted(() => {
                   borderRadius: b.radius,
                 }"
                 :title="b.rangeTitle"
-                @click.stop="onBlockClick(b.seg, $event)"
+                @click.stop="onBlockClick(b.count > 1 && $event.detail ? segmentAt(clientXToMs($event.clientX)) ?? b.seg : b.seg, $event)"
                 @mouseenter="hoverId = b.seg.id"
                 @mouseleave="hoverId = null"
-                @contextmenu.stop="onSegCtx($event, b.seg)"
+                @contextmenu.stop="onSegCtx($event, b.count > 1 ? segmentAt(clientXToMs($event.clientX)) ?? b.seg : b.seg)"
               >
                 <span v-if="b.showStart" class="t-start">{{ b.startLabel }}</span>
                 <span v-if="b.showDuration" class="t-dur">{{ b.durationLabel }}</span>
@@ -1775,10 +1954,13 @@ onUnmounted(() => {
             <div ref="badgeRef" class="badge">{{ centerLabel }}</div>
           </div>
         </div>
-        <div v-if="!remoteMode && (selectMode || selection)" class="export-bar" @click.stop>
+        <div v-if="!remoteMode && (selectMode || selection)" class="export-bar" :aria-busy="Boolean(exportBusy)" @click.stop>
           <template v-if="selection">
             <span class="export-range">{{ selectionLabel }}</span>
-            <span class="export-meta">覆盖 {{ selectionOverlapCount }} 段</span>
+            <span v-if="selectionCoverage.gap" class="gap-notice" role="status">选区包含无录像时段，保存时将跳过缺口。</span>
+            <span class="export-meta">覆盖 {{ selectionOverlapCount }} 段 · 有效录像 {{ selectionCoverage.media }}<template v-if="selectionCoverage.gap"> · 缺口 {{ selectionCoverage.gap }}，将按顺序拼接</template> · 裁剪精度取决于关键帧</span>
+            <label class="selection-edit">起点<input :disabled="exportBusy" type="datetime-local" step="1" :value="localDateTime(selection.startMs)" @change="editSelection($event, 'start')" /></label>
+            <label class="selection-edit">终点<input :disabled="exportBusy" type="datetime-local" step="1" :value="localDateTime(selection.endMs)" @change="editSelection($event, 'end')" /></label>
             <button
               type="button"
               class="primary"
@@ -1795,8 +1977,9 @@ onUnmounted(() => {
             >
               另存为…
             </button>
-            <button type="button" class="ghost" @click="clearSelection">清除</button>
-            <button type="button" class="ghost" @click="setSelectMode(false)">取消</button>
+            <button v-if="exportBusy" type="button" class="ghost" @click="emit('cancelExport')">取消导出</button>
+            <button type="button" class="ghost" :disabled="exportBusy" @click="clearSelection">清除</button>
+            <button type="button" class="ghost" :disabled="exportBusy" @click="setSelectMode(false)">退出选区</button>
           </template>
           <template v-else>
             <span class="muted">框选模式：在轨道上拖动选择起止时间，确认后自动裁切并拼接为一段</span>
@@ -1806,29 +1989,9 @@ onUnmounted(() => {
         <div class="legend">
           <span class="sel playhead-time">
             {{ centerLabel }}
-            <span v-if="underCenterSeg" class="dim">
-              · {{
-                followLiveEdge && !active
-                  ? '实时跟播'
-                  : isSegmentWriting(underCenterSeg, nowMs)
-                    ? '正在录制中'
-                    : underCenterSeg.protected
-                      ? '已保存'
-                      : '录像'
-              }}
-              · {{ formatSegmentDuration(segStart(underCenterSeg), Math.max(segStart(underCenterSeg), segEnd(underCenterSeg))) }}
-            </span>
-            <span v-else-if="followLiveEdge && !active" class="dim"> · 实时跟播</span>
-            <span v-else class="dim"> · 无录像</span>
           </span>
-          <span class="muted">
-            <template v-if="selectMode">拖动调整保存范围，确认后裁切拼接</template>
-            <template v-else-if="followLiveEdge && !active">
-              实时跟播 · 中线为当前时间<span v-if="mobile"> · 双指缩放</span> · 共 {{ filteredAsc.length }} 段
-            </template>
-            <template v-else-if="mobile">单指滑动 · 双指缩放 · 中线为播放点 · 共 {{ filteredAsc.length }} 段</template>
-            <template v-else>抓取滚动 · 中线为播放点 · 滚轮缩放 · 共 {{ filteredAsc.length }} 段</template>
-          </span>
+          <span v-if="source === 'loop' && followLiveEdge && !active" class="live-summary">实时录像 · {{ channelRecording ? '录制中' : '未录制' }}<span class="muted"> · 拖动查看历史</span></span>
+          <span v-else class="muted">{{ selectMode ? '调整起止时间后保存' : (mobile ? '滑动浏览 · 双指缩放' : '拖动浏览 · 滚轮缩放') }}</span>
           <span class="right">
             <span class="zoom" :title="zoomLabel">{{ zoomLabel }}</span>
           </span>
@@ -1839,6 +2002,13 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.saved-picker { max-width: min(320px, 60vw); }
+.time-jump { display: flex; gap: 4px; align-items: center; }
+.time-jump input { width: 112px; }
+.selection-edit { display: flex; gap: 4px; align-items: center; }
+.selection-edit input { max-width: 190px; }
+@media (max-width: 640px) { .time-jump { flex: 1; } .time-jump input { flex: 1; } .selection-edit { width: 100%; } .export-bar { flex-wrap: wrap; max-height: 180px; overflow: auto; } }
+
 .timeline {
   flex-shrink: 0;
   display: flex;
@@ -1857,6 +2027,7 @@ onUnmounted(() => {
 }
 .head {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 6px;
@@ -1871,22 +2042,33 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   min-width: 0;
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 .title {
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
   white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .actions {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  justify-content: flex-start;
   cursor: default;
 }
+.actions > * { flex-shrink: 0; }
+.actions button { white-space: nowrap; }
 .tabs {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
@@ -2203,12 +2385,12 @@ onUnmounted(() => {
   top: 4px;
   bottom: 4px;
   margin: 0;
-  padding: 0 6px;
+  padding: 0;
   border: 0;
   border-radius: 5px;
   background: color-mix(in srgb, var(--accent) 72%, #0d6b54);
   cursor: pointer;
-  min-width: 3px;
+  min-width: 0;
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
   display: flex;
   align-items: center;
@@ -2267,6 +2449,12 @@ onUnmounted(() => {
   text-align: center;
   opacity: 0.92;
   font-weight: 600;
+}
+.t-start {
+  margin-left: 8px;
+}
+.t-end {
+  margin-right: 8px;
 }
 .legend {
   display: flex;
@@ -2468,4 +2656,54 @@ onUnmounted(() => {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+.timeline.mobile .head { position: relative; overflow: visible; }
+.timeline.mobile .head-left { padding-right: 82px; min-height: 44px; box-sizing: border-box; }
+.timeline.mobile .tabs button { height: 44px; }
+.timeline.mobile .actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: visible; flex: 0 0 auto; }
+.timeline.mobile .actions .saved-picker { grid-column: 1 / -1; width: 100%; max-width: none; min-width: 0; }
+.timeline.mobile .actions .day { min-width: 0; width: 100%; }
+.timeline.mobile .actions .time-jump { grid-column: span 2; min-width: 0; }
+.timeline.mobile .time-jump input { min-width: 0; width: 100%; }
+.timeline.mobile .actions button, .timeline.mobile .actions select, .timeline.mobile .actions input[type="time"], .timeline.mobile .actions .auto { height: 44px; min-height: 44px; }
+
+/* Keep the track visible and controls in task order at any panel width. */
+.timeline .head { flex-wrap: wrap; align-items: center; padding: 6px 10px; gap: 8px 16px; }
+.timeline .actions { flex: 1 1 720px; flex-wrap: wrap; overflow: visible; padding: 0; gap: 8px; }
+.locate-tools { display: flex; flex: 1 1 480px; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.operation-tools { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
+.navigation-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.timeline .actions .day { width: 144px; min-width: 0; }
+.timeline .actions button, .timeline .actions input { height: 32px; }
+.timeline .viewport, .timeline .track, .timeline .block, .timeline .selection, .timeline .badge { border-radius: 0 !important; }
+.timeline .ruler-layer { overflow: visible; margin: 0; }
+.timeline .legend { display: grid; grid-template-columns: 8ch minmax(0, 1fr) auto; min-height: 20px; gap: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timeline .legend .playhead-time { width: 8ch; }
+.timeline .live-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.timeline .export-bar { flex-shrink: 0; max-height: 180px; overflow: auto; align-content: start; }
+.timeline .export-meta { flex: 1 1 100%; }
+.timeline.mobile .head-left { padding-right: 0; }
+.timeline.mobile .actions { display: grid; flex: 0 0 auto; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.timeline.mobile .actions .day { width: 100%; }
+.timeline.mobile .locate-tools { display: contents; }
+.timeline.mobile .navigation-tools { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.timeline.mobile .operation-tools { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; margin-left: 0; }
+.timeline.mobile .operation-tools .save { grid-column: auto; }
+.timeline.mobile .actions > .save { grid-column: 1 / -1; }
+.timeline.mobile .actions .saved-picker { order: -1; }
+.timeline.mobile .actions input, .timeline.mobile .actions button, .timeline.mobile .actions select { height: 44px; min-height: 44px; padding: 0 6px; }
+.timeline.mobile .export-bar { max-height: 220px; }
+.timeline-tools { position: relative; }
+.timeline-tools summary { display: flex; align-items: center; justify-content: center; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; list-style: none; white-space: nowrap; }
+.timeline-tools summary::-webkit-details-marker { display: none; }
+.timeline-tools summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tools-popover { position: absolute; right: 0; bottom: calc(100% + 8px); width: 230px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: 0 8px 28px #0003; z-index: 60; }
+.tools-popover button { width: 100%; }
+.tools-popover p { margin: 10px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.timeline.mobile .timeline-tools summary { height: 44px; padding: 0 6px; }
+.export-feedback { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.export-feedback button { flex: 0 0 28px; margin-left: auto; }
+.export-feedback.error { color: var(--danger); }
+.gap-notice { color: var(--text-muted); }
+.gap-notice { flex: 1 1 100%; font-size: 12px; }
 </style>

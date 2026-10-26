@@ -22,6 +22,9 @@ describe('parseSegmentStartMs', () => {
   it('returns null for legacy numeric suffixes', () => {
     expect(parseSegmentStartMs('Cafe_East-001.mp4')).toBeNull()
   })
+  it('recognizes unique saved clip filenames without losing capture time', () => {
+    expect(parseSegmentStartMs('clip-20261011-235958-a1b2c3d4e5f60718.mp4')).toBe(new Date(2026, 9, 11, 23, 59, 58).getTime())
+  })
 })
 
 describe('formatSegmentTimeRange', () => {

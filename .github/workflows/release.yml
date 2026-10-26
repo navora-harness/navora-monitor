@@ -54,6 +54,11 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Test frontend and check types
+        run: |
+          npm test
+          npm run typecheck
+
       - name: Resolve version
         id: ver
         run: |
@@ -111,6 +116,12 @@ jobs:
             fi
             echo "ok ${id}"
           done
+
+      - name: Test and vet backend with bundled FFmpeg
+        working-directory: server
+        run: |
+          go test ./...
+          go vet ./...
 
       - name: Build portable packages
         run: node scripts/dist-go.mjs portable win-x64 win-arm64 linux-x64 linux-arm64

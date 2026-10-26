@@ -56,7 +56,7 @@ export function wallToClip(clipsAsc: TimedClip[], wallMs: number): WallHit {
   if (!clipsAsc.length) return { kind: 'empty' }
 
   for (const clip of clipsAsc) {
-    if (wallMs >= clip.startMs && wallMs <= clip.endMs) {
+    if (wallMs >= clip.startMs && wallMs < clip.endMs) {
       const offsetSec = Math.max(0, (wallMs - clip.startMs) / 1000)
       return { kind: 'inside', clip, offsetSec }
     }

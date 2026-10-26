@@ -62,6 +62,8 @@ func groupLess(a, b string) bool {
 }
 
 func (c *Core) MoveGroupBefore(groupName string, before *string) ([]string, error) {
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	current := c.listGroupsLocked()
@@ -108,6 +110,8 @@ func moveNameBefore(order []string, moving, before string) []string {
 }
 
 func (c *Core) MoveChannelsBefore(ids []string, targetGroup string, beforeID *string) ([]Channel, error) {
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	before := ""
@@ -205,6 +209,8 @@ func (c *Core) CreateGroup(name string) ([]string, error) {
 	if stringsTrim(name) == "" {
 		return nil, errStr("分组名称不能为空")
 	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if n == defaultGroup {
@@ -226,6 +232,8 @@ func (c *Core) DeleteGroup(name string) ([]string, error) {
 	if src == defaultGroup {
 		return nil, errStr("不能删除默认分组")
 	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	count := 0
@@ -262,6 +270,8 @@ func (c *Core) RenameGroup(from, to string) ([]Channel, error) {
 	if dest == defaultGroup {
 		return nil, errStr("不能重命名为默认分组，请使用解散分组")
 	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if dest == src {
@@ -293,6 +303,8 @@ func (c *Core) DissolveGroup(name string) ([]Channel, error) {
 	if src == defaultGroup {
 		return nil, errStr("不能解散默认分组")
 	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i := range c.channels {

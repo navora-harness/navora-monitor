@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useEnlargementGrace } from '../ui/enlargement-grace'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import type { ChannelConfig } from '@shared/types'
 import MpegtsPlayer from '../components/MpegtsPlayer.vue'
@@ -6,7 +7,7 @@ import { buildRemoteLivePreviewUrl } from '../media-url'
 import { pushEscapeLayer } from '../ui/escape-stack'
 
 const props = defineProps<{
-  mosaic: 1 | 4 | 9 | 16
+  mosaic: 1 | 4 | 6 | 8 | 9 | 13 | 16
   channels: ChannelConfig[]
   slotIds: (string | null)[]
   selectedId: string | null
@@ -19,10 +20,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [id: string]
   enlarged: [index: number | null]
+  previewScope: [index: number | null]
   hevcUnsupported: []
 }>()
 
 const enlargedIndex = ref<number | null>(null)
+const releasedSlot = useEnlargementGrace(enlargedIndex)
+watch(releasedSlot, (index) => emit('previewScope', index), { immediate: true })
 let lastTapAt = 0
 let lastTapIndex = -1
 let pendingSelectTimer: ReturnType<typeof setTimeout> | null = null
@@ -48,10 +52,7 @@ const cells = computed(() => {
 })
 
 const visibleCells = computed(() => {
-  if (enlargedIndex.value != null) {
-    const one = cells.value.find((c) => c.index === enlargedIndex.value && c.id)
-    return one ? [one] : []
-  }
+  if (releasedSlot.value != null) return cells.value.filter((cell) => cell.index === releasedSlot.value)
   if (scrollMode.value) {
     const filled = cells.value.filter((c) => c.id)
     return filled.length ? filled : cells.value
@@ -163,6 +164,7 @@ onUnmounted(() => {
     >
       <div
         v-for="cell in visibleCells"
+        v-show="enlargedIndex == null || enlargedIndex === cell.index"
         :key="cell.index"
         class="cell"
         :class="{

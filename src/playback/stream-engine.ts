@@ -88,6 +88,8 @@ export class StreamEngine {
   private wallSpanSec = 30
   private mediaDurationSec: number | null = null
   private seekedHandler: (() => void) | null = null
+  private cancelSeekWait: (() => void) | null = null
+  private frameWaits = new Set<() => void>()
   private seekFallbackTimer: ReturnType<typeof setTimeout> | null = null
   private unpinTimer: ReturnType<typeof setTimeout> | null = null
   private listeners: Partial<StreamEngineEvents> = {}
@@ -242,7 +244,7 @@ export class StreamEngine {
     const seekTok = ++this.seekGen
     this.muteTime = true
     this.lastLoadOpts = { ...opts }
-    // Keep last frame when switching segments / reloading (scrub already uses freeze in reloadMpegtsAt).
+    // Capture only a small poster, so a 4K frame does not block interaction.
     if (this.usingMpegts || this.hasSource) this.captureFreezeFrame()
     this.destroyPlayer({ clearVideo: true })
     this.timeBase.reset()
@@ -407,6 +409,7 @@ export class StreamEngine {
     const v = this.video
     if (!v) return
     const dur = this.durationSec
+    const loadGen = this.loadGen
     const gen = ++this.seekGen
     this.seeking = true
     this.pinnedRel = t
@@ -416,7 +419,7 @@ export class StreamEngine {
     this.clearSeekedListeners()
     await new Promise<void>((resolve) => {
       const onSeeked = () => {
-        if (gen !== this.seekGen) {
+        if (gen !== this.seekGen || loadGen !== this.loadGen) {
           resolve()
           return
         }
@@ -446,6 +449,7 @@ export class StreamEngine {
         }, 400)
         resolve()
       }
+      this.cancelSeekWait = resolve
       this.seekedHandler = onSeeked
       v.addEventListener('seeked', onSeeked)
       try {
@@ -550,11 +554,11 @@ export class StreamEngine {
     if (v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
     try {
       const c = document.createElement('canvas')
-      c.width = v.videoWidth
-      c.height = v.videoHeight
+      c.width = Math.min(640, v.videoWidth)
+      c.height = Math.round(v.videoHeight * c.width / v.videoWidth)
       const ctx = c.getContext('2d')
       if (!ctx) return
-      ctx.drawImage(v, 0, 0)
+      ctx.drawImage(v, 0, 0, c.width, c.height)
       const url = c.toDataURL('image/jpeg', 0.82)
       this.freezePoster = url
       v.poster = url
@@ -717,6 +721,7 @@ export class StreamEngine {
    * Confirms decode actually advances (avoids "loaded + spinner/big-play forever").
    */
   async play(): Promise<boolean> {
+    const generation = this.loadGen
     const v = this.video
     if (!v) return false
 
@@ -806,13 +811,21 @@ export class StreamEngine {
     // Prefer soft seek-to-buffer over destroy/recreate (HEVC often needs a nudge,
     // not a full MSE rebuild which flashes and fights StallJumper).
     let framesOk = await this.waitForVideoFrames(2, 1600)
+    if (generation !== this.loadGen) return false
     if (!framesOk) {
       framesOk = await this.softRecoverToBufferedStart()
     }
-    if (!framesOk && this.canHardReload()) {
+    if (generation !== this.loadGen) return false
+    if (!framesOk && this.usingMpegts && this.canHardReload()) {
       framesOk = await this.hardRecoverOnce()
     }
 
+    if (generation !== this.loadGen) return false
+    if (!framesOk && !this.usingMpegts) {
+      this.emit('error', '未能解码录像画面，请检查视频编码是否受当前浏览器支持')
+      this.emit('buffering', false)
+      return false
+    }
     this.lastAbsMedia = v.currentTime
     this.lastAbsMediaAt = performance.now()
     // Only seed frame clock when we actually saw frames — seeding on failure
@@ -856,7 +869,19 @@ export class StreamEngine {
     v.volume = muted ? 0 : Math.min(1, Math.max(0, vol))
   }
 
+  cancelPending() {
+    for (const cancel of this.frameWaits) cancel()
+    this.loadGen += 1
+    this.seekGen += 1
+    this.readyWait?.cancel()
+    this.clearSeekedListeners()
+    this.seeking = false
+    this.pinnedRel = null
+    this.muteTime = false
+  }
+
   unload() {
+    for (const cancel of this.frameWaits) cancel()
     this.loadGen += 1
     this.muteTime = true
     this.cancelFrameWatch()
@@ -952,7 +977,12 @@ export class StreamEngine {
       {
         enableStashBuffer: true,
         stashInitialSize: 512,
-        lazyLoad: false,
+        lazyLoad: true,
+        lazyLoadMaxDuration: 30,
+        lazyLoadRecoverDuration: 10,
+        autoCleanupSourceBuffer: true,
+        autoCleanupMaxBackwardDuration: 30,
+        autoCleanupMinBackwardDuration: 15,
         deferLoadAfterSourceOpen: false,
         seekType: 'range',
         accurateSeek: false,
@@ -1008,8 +1038,10 @@ export class StreamEngine {
     } catch {
       /* ignore */
     }
-    // fMP4 remux / temp faststart may wait on FFmpeg before first byte
-    await this.waitForReady(v, gen, this.usingFmp4Remux ? 60000 : 5000)
+    await this.waitForReady(v, gen, 10000)
+    if (gen === this.loadGen && v.readyState < 2) {
+      throw new Error(v.error?.message || '画面加载失败，请检查编码支持或重试')
+    }
   }
 
   /**
@@ -1143,6 +1175,9 @@ export class StreamEngine {
   }
 
   private clearSeekedListeners() {
+    const cancel = this.cancelSeekWait
+    this.cancelSeekWait = null
+    cancel?.()
     const v = this.video
     if (v && this.seekedHandler) v.removeEventListener('seeked', this.seekedHandler)
     this.seekedHandler = null
@@ -1397,7 +1432,7 @@ export class StreamEngine {
       if (this.pinnedRel != null && this.unpinTimer == null) {
         this.pinnedRel = null
       }
-      if (!this.active || !this.video || this.video.paused || !this.player) {
+      if (!this.active || !this.video || this.video.paused || this.usingMpegts && !this.player) {
         this.frameWatchHandle = null
         return
       }
@@ -1422,6 +1457,7 @@ export class StreamEngine {
 
   /** Resolve true once `count` video frames have been painted (or timeout). */
   private waitForVideoFrames(count: number, timeoutMs: number): Promise<boolean> {
+    const generation = this.loadGen
     const v = this.video as
       | (HTMLVideoElement & {
           requestVideoFrameCallback?: (cb: (now: number, meta: unknown) => void) => number
@@ -1430,7 +1466,7 @@ export class StreamEngine {
       | null
     if (!v) return Promise.resolve(false)
     if (typeof v.requestVideoFrameCallback !== 'function') {
-      return sleep(Math.min(400, timeoutMs)).then(() => !v.paused)
+      return sleep(Math.min(400, timeoutMs)).then(() => generation === this.loadGen && !v.paused)
     }
 
     return new Promise((resolve) => {
@@ -1440,15 +1476,19 @@ export class StreamEngine {
       const finish = (ok: boolean) => {
         if (settled) return
         settled = true
+        this.frameWaits.delete(cancel)
         window.clearTimeout(timer)
         try {
           v.cancelVideoFrameCallback?.(handle)
         } catch {
           /* ignore */
         }
-        if (ok) this.armFrameWatch()
-        resolve(ok)
+        const current = generation === this.loadGen
+        if (ok && current) this.armFrameWatch()
+        resolve(ok && current)
       }
+      const cancel = () => finish(false)
+      this.frameWaits.add(cancel)
       const timer = window.setTimeout(() => finish(got >= count), timeoutMs)
       const onFrame = () => {
         got += 1

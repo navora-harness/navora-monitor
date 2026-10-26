@@ -95,6 +95,7 @@ const playbackScrubWallMs = ref<number | null>(null)
 const playbackScrubNonce = ref(0)
 const playbackPlayId = ref<string | null>(null)
 const playbackPlayNonce = ref(0)
+const playbackPlayStartSec = ref(0)
 const playbackFollowMs = ref<number | null>(null)
 const playbackContinuous = ref(true)
 const playbackBusy = ref(false)
@@ -113,7 +114,7 @@ const mobileTimelineHeight = computed(() => {
   if (typeof window === 'undefined') return 196
   const vh = window.innerHeight || 700
   // Two-row head + tappable track; extra room for iOS home-indicator padding.
-  const base = Math.min(220, Math.max(168, vh * 0.27))
+  const base = Math.min(300, Math.max(260, vh * 0.35))
   return Math.round(base + 28)
 })
 
@@ -131,11 +132,7 @@ const recordingCount = computed(
 const timelineFollowLiveEdge = computed(() => {
   if (viewMode.value !== 'live') return false
   if (!layout.showTimeline) return false
-  const ids = slotIds.value.filter((x): x is string => !!x).slice(0, layout.mosaic)
-  return ids.some((id) => {
-    const st = states.value[id]
-    return st?.preview === 'live' || st?.preview === 'starting'
-  })
+  return selectedId.value !== null
 })
 const selected = computed(() => channels.value.find((c) => c.id === selectedId.value) ?? null)
 const showTimelinePanel = computed(
@@ -228,7 +225,7 @@ function fillSlotsFromGroup() {
   if (!selectedId.value && ids[0]) selectedId.value = ids[0]
 }
 
-function mosaicForCount(n: number): 1 | 4 | 9 | 16 {
+function mosaicForCount(n: number): 1 | 4 | 6 | 8 | 9 | 13 | 16 {
   if (n <= 1) return 1
   if (n <= 4) return 4
   if (n <= 9) return 9
@@ -309,10 +306,13 @@ function replaceWallWithGroup(ids: string[]) {
   scheduleSync()
 }
 
+const previewScope = ref<number | null>(null)
+
 async function refreshPreviews() {
   if (!authed.value) return
   try {
-    const res = await syncPreviews(activeSlotIds(), browserSupportsHevcMse())
+    const ids = previewScope.value == null ? activeSlotIds() : [slotIds.value[previewScope.value]].filter((id): id is string => !!id)
+    const res = await syncPreviews(ids, browserSupportsHevcMse())
     applyStates(res.states)
     if (status.value.startsWith('同步失败')) status.value = '就绪'
   } catch (e) {
@@ -431,12 +431,16 @@ async function doLogout() {
   status.value = '已退出'
 }
 
+let recordingsGeneration = 0
 async function refreshRecordings(opts?: { silent?: boolean }) {
+  const generation = ++recordingsGeneration
+  const requestedChannel = selectedId.value
   if (!authed.value) return
   if (!opts?.silent) segmentsLoading.value = true
   try {
     const id = selectedId.value
     const [loop, saved] = await Promise.all([fetchRecordings(id), fetchSavedClips(id)])
+    if (generation !== recordingsGeneration || requestedChannel !== selectedId.value) return
     segments.value = (loop.segments ?? []).map(withSegmentMediaAuth)
     savedClips.value = (saved.segments ?? []).map(withSegmentMediaAuth)
   } catch (e) {
@@ -446,7 +450,7 @@ async function refreshRecordings(opts?: { silent?: boolean }) {
     }
     status.value = e instanceof Error ? e.message : '加载录像失败'
   } finally {
-    if (!opts?.silent) segmentsLoading.value = false
+    if (generation === recordingsGeneration) segmentsLoading.value = false
   }
 }
 
@@ -491,12 +495,15 @@ function setPanelTimeline(v: number) {
   schedulePersist()
 }
 
-function onPlaybackPlay(seg: RecordingSegment) {
+function onPlaybackPlay(seg: RecordingSegment, startSec = 0) {
+  status.value = `正在播放 · ${seg.protected ? '已保存片段' : '循环录像'}`
   if (seg.protected) timelineSource.value = 'saved'
   else timelineSource.value = 'loop'
+  playbackPlayStartSec.value = Math.max(0, startSec)
+  playbackScrubWallMs.value = null
   playbackPlayId.value = seg.id
   playbackPlayNonce.value += 1
-  playbackFollowMs.value = seg.startMs ?? seg.mtimeMs
+  playbackFollowMs.value = (seg.startMs ?? seg.mtimeMs) + playbackPlayStartSec.value * 1000
   if (viewMode.value !== 'playback') enterPlayback()
 }
 
@@ -505,8 +512,8 @@ function onTimelineScrub(payload: {
   segment: RecordingSegment | null
   seekSec: number
 }) {
-  if (playbackBusy.value) return
   if (viewMode.value !== 'playback') enterPlayback()
+  if (payload.segment?.protected) { onPlaybackPlay(payload.segment, payload.seekSec); return }
   // Do not write followMs here — avoids fighting the player follow throttle during seek
   playbackScrubWallMs.value = payload.atMs
   playbackScrubNonce.value += 1
@@ -585,7 +592,8 @@ function onSwap(from: number, to: number) {
   setSlotIds(next)
 }
 
-function setMosaic(n: 1 | 4 | 9 | 16) {
+function setMosaic(n: 1 | 4 | 6 | 8 | 9 | 13 | 16) {
+  layout.featuredLayout = false
   layout.mosaic = n
   const kept = activeSlotIds().slice(0, n)
   const next = emptySlotIds()
@@ -923,6 +931,7 @@ onUnmounted(() => {
     <TitleBar
       :title="selected?.name ?? (viewMode === 'playback' ? '远程回放' : '远程预览')"
       :mosaic="layout.mosaic"
+      :featured-layout="layout.featuredLayout"
       :recording-count="recordingCount"
       :ffmpeg-ok="true"
       :groups="groups"
@@ -934,6 +943,7 @@ onUnmounted(() => {
       remote-mode
       :compact="mobile"
       @mosaic="setMosaic"
+      @featured-layout="n => { setMosaic(n); layout.featuredLayout = true }"
       @update:active-group="setActiveGroup"
       @update:show-explorer="setShowExplorer"
       @update:show-timeline="setShowTimeline"
@@ -994,6 +1004,7 @@ onUnmounted(() => {
           :scrub-nonce="playbackScrubNonce"
           :play-id="playbackPlayId"
           :play-nonce="playbackPlayNonce"
+          :play-start-sec="playbackPlayStartSec"
           :auth-token="mediaAuthToken"
           :media-base-url="mediaBaseUrl"
           @exit="exitPlayback"
@@ -1001,17 +1012,20 @@ onUnmounted(() => {
           @segment="onPlaybackSegment"
           @playlist-ended="onPlaylistEnded"
           @busy="(on) => (playbackBusy = on)"
+          @update:continuous="(enabled) => (playbackContinuous = enabled)"
           @update:rate="(r) => (playbackRate = r)"
         />
         <!-- Dedicated remote live grid: always mounts <video> when slots have channels. -->
         <RemoteLiveGrid
           v-else
           :mosaic="layout.mosaic"
+          :featured-layout="layout.featuredLayout"
           :channels="channels"
           :slot-ids="slotIds"
           :selected-id="selectedId"
           :mobile="mobile"
           :layout-mode="layoutMode"
+          @preview-scope="(index) => { previewScope = index; scheduleSync() }"
           @select="onSelect"
           @hevc-unsupported="onHevcUnsupported"
         />
@@ -1026,14 +1040,17 @@ onUnmounted(() => {
             @update:value="setPanelTimeline"
           />
           <TimelinePanel
+            :rate="playbackRate"
+            :continuous="playbackContinuous"
             ref="timelineRef"
             :height="mobile ? mobileTimelineHeight : layout.panelSizes.timeline"
             :channel-id="selectedId"
             :channel-name="selected?.name ?? null"
             :segments="segments"
             :saved-clips="savedClips"
+            :source="timelineSource"
             :loading="segmentsLoading"
-            :scrub-locked="viewMode === 'playback' && playbackBusy"
+            :scrub-locked="false"
             :playing-id="playbackSeg?.id ?? null"
             :active="viewMode === 'playback'"
             :follow-ms="viewMode === 'playback' ? playbackFollowMs : null"
@@ -1057,7 +1074,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true">
+    <div v-if="mobile && mobileDrawer" class="drawer-layer" aria-modal="true" role="dialog" aria-label="设备列表">
       <div class="scrim" @click="setShowExplorer(false)" />
       <div
         class="drawer-panel"

@@ -7,7 +7,10 @@ import (
 )
 
 func TestListFSLeafFiles(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), "navora-leaf-pick")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "only-file.txt"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	entries, path, err := (&Core{}).ListFS(dir, "dir")
 	if err != nil {
 		t.Fatal(err)

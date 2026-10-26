@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { isOpenTimelineSegment, isSegmentWriting, SEGMENT_WRITING_FRESH_MS } from './segment-writing'
+import { isOpenTimelineSegment, isSegmentWriting, SEGMENT_WRITING_FRESH_MS, timelineSegmentEnd } from './segment-writing'
+
+describe('timelineSegmentEnd', () => {
+  it('ends an open recording at now instead of its predicted end', () => {
+    expect(timelineSegmentEnd(1000, 301000, 61000, true)).toBe(61000)
+    expect(timelineSegmentEnd(1000, 2000, 61000, true)).toBe(61000)
+    expect(timelineSegmentEnd(1000, 301000, 61000, false)).toBe(301000)
+  })
+})
 
 describe('isSegmentWriting', () => {
   it('true when mtime is within fresh window', () => {
@@ -18,6 +26,13 @@ describe('isSegmentWriting', () => {
 describe('isOpenTimelineSegment', () => {
   const now = 1_700_000_000_000
   const start = now - 3 * 60_000
+
+  it('uses explicit lifecycle even with stale mtime or a running channel', () => {
+    const opts = { newest: true, startMs: now-60*60_000, nowMs: now, channelRecording: true }
+    expect(isOpenTimelineSegment({ mtimeMs: now, state: 'ready' }, opts)).toBe(false)
+    expect(isOpenTimelineSegment({ mtimeMs: now-60*60_000, state: 'writing' }, opts)).toBe(true)
+    expect(isOpenTimelineSegment({ mtimeMs: now, state: 'invalid' }, opts)).toBe(false)
+  })
 
   it('keeps the newest recording gray when mtime has not moved', () => {
     expect(

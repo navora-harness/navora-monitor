@@ -111,7 +111,7 @@ async function download(url, dest) {
   let lastErr = /** @type {unknown} */ (null)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(url, { redirect: 'follow', headers: authHeaders() })
+      const res = await fetch(url, { redirect: 'follow', headers: authHeaders(), signal: AbortSignal.timeout(120_000) })
       if (!res.ok || !res.body) {
         throw new Error(`HTTP ${res.status} for ${url}`)
       }
@@ -168,7 +168,9 @@ function findExtractedRoot(outDir) {
 async function fetchBuild(build, force) {
   const destDir = join(root, 'vendor', 'ffmpeg', build.id)
   const destBin = join(destDir, build.destName)
-  if (!force && existsSync(destBin) && statSync(destBin).size > 1024 * 1024) {
+  const probeName = build.destName.replace('ffmpeg', 'ffprobe')
+  const destProbe = join(destDir, probeName)
+  if (!force && existsSync(destBin) && existsSync(destProbe) && statSync(destBin).size > 1024 * 1024) {
     const mb = (statSync(destBin).size / 1024 / 1024).toFixed(1)
     console.log(`Skip ${build.id} (exists, ${mb} MB). Use --force to re-download.`)
     return
@@ -212,6 +214,7 @@ async function fetchBuild(build, force) {
 
   mkdirSync(destDir, { recursive: true })
   copyFileSync(binSrc, destBin)
+  copyFileSync(join(packRoot, ...build.bin.replace('ffmpeg', 'ffprobe').split('/')), destProbe)
   if (existsSync(licSrc)) copyFileSync(licSrc, join(destDir, 'LICENSE.txt'))
 
   // Legacy alias: win64 ← win-x64 (older docs / local paths)
@@ -219,6 +222,7 @@ async function fetchBuild(build, force) {
     const legacy = join(root, 'vendor', 'ffmpeg', 'win64')
     mkdirSync(legacy, { recursive: true })
     copyFileSync(destBin, join(legacy, 'ffmpeg.exe'))
+    copyFileSync(destProbe, join(legacy, 'ffprobe.exe'))
     if (existsSync(join(destDir, 'LICENSE.txt'))) {
       copyFileSync(join(destDir, 'LICENSE.txt'), join(legacy, 'LICENSE.txt'))
     }

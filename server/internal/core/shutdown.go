@@ -20,13 +20,14 @@ func (c *Core) RequestShutdown() {
 	c.shutdownOnce.Do(func() {
 		log.Printf("shutdown requested")
 		close(c.shutdownCh)
+		c.CancelScan()
 	})
 }
 
 // StopAllMedia stops preview and recording FFmpeg (including adopted recorders).
 func (c *Core) StopAllMedia() {
 	c.rec.stopAll()
-	for id, pids := range recordingFfmpegByChannel() {
+	for id, pids := range c.recordingFfmpegByChannel() {
 		for _, pid := range pids {
 			if !processAlive(pid) {
 				continue

@@ -114,7 +114,10 @@ func (c *Core) SystemServiceAction(action string) SystemServiceInfo {
 		info.Message = "服务已停止"
 		return info
 	case "restart":
-		_ = stopSystemService()
+		if err := stopSystemService(); err != nil {
+			info.Error = err.Error()
+			return c.mergeServiceAction(info)
+		}
 		if err := startSystemService(exe, args); err != nil {
 			info.Error = err.Error()
 			return c.mergeServiceAction(info)

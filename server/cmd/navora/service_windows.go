@@ -5,6 +5,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/navora-harness/navora-monitor/server/internal/core"
@@ -29,7 +30,7 @@ func maybeRunWindowsService() bool {
 }
 
 func parseServiceArgs(args []string) (data, addr string, port int) {
-	addr = "0.0.0.0"
+	addr = ""
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -75,6 +76,20 @@ func (ws *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	changes <- svc.Status{State: svc.StartPending}
 
 	root := resolveData(ws.data)
+	release, err := acquireDataLock(root)
+	if err != nil {
+		log.Printf("service data lock: %v", err)
+		return true, 1
+	}
+	defer release()
+	file, err := newRotatingLog(filepath.Join(root, "logs", "service.log"), 4*1024*1024)
+	if err != nil {
+		log.Printf("service log: %v", err)
+		return true, 1
+	}
+	defer file.Close()
+	log.SetOutput(file)
+	defer log.SetOutput(os.Stderr)
 	app, err := core.Open(root)
 	if err != nil {
 		log.Printf("service open data: %v", err)
@@ -89,17 +104,24 @@ func (ws *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	if ws.port != 0 {
 		listenPort = ws.port
 	}
-	host := ws.addr
-	if host == "" {
-		host = "0.0.0.0"
+	host := core.ListenHost(ws.addr, true)
+	urls := []string{}
+	if settings.RemoteEnabled {
+		urls = lanURLs(listenPort)
 	}
-	app.SetListen(listenPort, lanURLs(listenPort))
-	go app.RunLoops()
+	app.SetListen(listenPort, urls)
 
 	done := make(chan error, 1)
+	ready := make(chan struct{})
 	go func() {
-		done <- serveHTTP(app, host, listenPort)
+		done <- serveHTTPReady(app, host, listenPort, ready)
 	}()
+	select {
+	case <-ready:
+	case err := <-done:
+		log.Printf("service failed before ready: %v", err)
+		return true, 1
+	}
 
 	changes <- svc.Status{State: svc.Running, Accepts: accepts}
 	for {

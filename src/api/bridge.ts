@@ -98,7 +98,6 @@ function installHooks() {
     }).catch(() => undefined)
   })
   window.setInterval(() => {
-    if (document.visibilityState === 'hidden') return
     const live = (ws && ws.readyState === WebSocket.OPEN) || events
     if (!live) return
     void post('/api/previews', { channelIds: previewIds }).catch(() => undefined)
@@ -387,6 +386,7 @@ export function createMonitorApi(): NavoraMonitorApi {
       return post('/api/clips/save-recent', { channelId, durationSec })
     },
     async exportClipRange(opts) {
+      const { signal, ...request } = opts
       let destPath = ''
       if (opts.pickPath) {
         const picked = await requestPick({
@@ -398,7 +398,8 @@ export function createMonitorApi(): NavoraMonitorApi {
         if (!('path' in picked)) return { ok: false, error: '请选择服务器上的保存路径' }
         destPath = picked.path
       }
-      return post('/api/clips/export', { ...opts, destPath })
+      signal?.throwIfAborted()
+      return send('/api/clips/export', { method: 'POST', signal, body: JSON.stringify({ ...request, destPath }) })
     },
     async deleteSavedClip(segmentId) {
       return post('/api/clips/delete', { id: segmentId })

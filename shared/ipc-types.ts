@@ -21,6 +21,8 @@ export type StorageAction = {
 }
 
 export type DiskSpaceInfo = {
+  cacheFreeBytes?: number
+  cacheLevel?: StorageLevel
   path: string
   freeBytes: number
   totalBytes: number
@@ -245,6 +247,7 @@ export type NavoraMonitorApi = {
     | { ok: false; error: string }
   >
   exportClipRange: (opts: {
+    signal?: AbortSignal
     channelId: string
     startMs: number
     endMs: number
@@ -310,6 +313,7 @@ export type NavoraMonitorApi = {
 }
 
 export type RemoteAccessStatus = {
+  address?: string
   enabled: boolean
   listening: boolean
   port: number

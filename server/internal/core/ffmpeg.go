@@ -154,6 +154,9 @@ func (c *Core) ffprobePath() string {
 	if st, err := os.Stat(p); err == nil && !st.IsDir() {
 		return p
 	}
+	if found, err := exec.LookPath(name); err == nil {
+		return found
+	}
 	return ""
 }
 

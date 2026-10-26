@@ -1,8 +1,10 @@
 /**
  * Windowed HLS VOD playback controller — wall-clock scrub / follow SSOT.
- * Finished .ts segments play via mpegts.js over localhost HTTP Range.
+ * Finished TS/MKV segments use prepared MP4 copies over HTTP Range.
  */
 
+import { createTimelineIndex } from '@shared/timeline-index'
+import { browserSupportsHevcNative } from '@shared/hevc-mse'
 import type { RecordingSegment } from '@shared/types'
 import {
   defaultVodWindow,
@@ -56,10 +58,15 @@ function segmentIsFragile(seg: RecordingSegment): boolean {
 }
 
 export class PlaybackController {
+  private compatH264 = typeof document !== 'undefined' && !browserSupportsHevcNative()
   private vod = new VodEngine()
   private stream = new StreamEngine()
   private mode: PlayMode = 'vod'
   private segments: RecordingSegment[] = []
+  private orderedSegments: RecordingSegment[] = []
+  private segmentPositions = new Map<string, number>()
+  private intervalIndex = createTimelineIndex<RecordingSegment>([], segStartMs, segEndMs)
+  private warmLink: HTMLLinkElement | null = null
   private vodSegs: VodSeg[] = []
   private channelId: string | null = null
   private source: VodSource = 'loop'
@@ -71,6 +78,16 @@ export class PlaybackController {
   private windowEndMs = 0
   private windowLoaded = false
   private current: RecordingSegment | null = null
+  private continuous = true
+  private prepareAbort: AbortController | null = null
+  private prefetchAbort: AbortController | null = null
+  private prefetchedId: string | null = null
+  private preparedNext: { key: string; url: string } | null = null
+  private prefetchRetryAt = 0
+
+  private prepareKey(seg: RecordingSegment) {
+    return `${this.source}:${seg.channelId}:${seg.id}:${seg.sourceVersion ?? `${seg.sizeBytes}:${seg.mtimeMs}`}`
+  }
   private wantPlay = false
   private rate = 1
   private suspended = false
@@ -86,6 +103,7 @@ export class PlaybackController {
   private pendingFollowMs: number | null = null
   private followTimer: ReturnType<typeof setTimeout> | null = null
   private loadToken = 0
+  private intentGen = 0
   private streamSegId: string | null = null
   private liveRecording = false
   /** Actual media loaded into StreamEngine (may be remuxed .play.mp4). */
@@ -177,6 +195,68 @@ export class PlaybackController {
     })
   }
 
+  private cancelOperation() {
+    this.intentGen += 1
+    this.loadToken += 1
+    this.prepareAbort?.abort()
+    this.prepareAbort = null
+    this.prefetchAbort?.abort()
+    this.prefetchAbort = null
+    this.prefetchedId = null
+    this.warmLink?.remove()
+    this.warmLink = null
+    this.stream.cancelPending()
+  }
+
+  private prefetchNext(wall: number) {
+    if (!this.continuous || !this.wantPlay || !this.current || this.prepareAbort || this.prefetchAbort || Date.now() < this.prefetchRetryAt) return
+    if (segEndMs(this.current) - wall > Math.max(15_000, 15_000 * this.rate)) return
+    const position = this.segmentPositions.get(this.current.id)
+    const seg = position == null ? undefined : this.orderedSegments[position + 1]
+    if (!seg || seg.state === 'invalid' || isSegmentWriting(seg) || !/\.(ts|mkv|mp4)$/i.test(seg.fileName)) return
+    const key = this.prepareKey(seg)
+    if (this.preparedNext?.key === key) return
+    this.prefetchedId = key
+    const abort = new AbortController()
+    this.prefetchAbort = abort
+    const base = forceHttpMediaUrl(seg.url, this.mediaBaseUrl || this.sampleMediaUrl)
+    if (/\.mp4$/i.test(seg.fileName) && !this.compatH264) {
+      this.preparedNext = { key, url: base }
+      this.warmNext(base, seg.sizeBytes)
+      this.prefetchAbort = null
+      return
+    }
+    const url = new URL('/api/playback/prepare', new URL(base, location.href))
+    void fetch(url, { method: 'POST', credentials: 'include', signal: abort.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefetch: true, h264: this.compatH264, channelId: seg.channelId, fileName: seg.fileName, kind: this.source === 'saved' ? 'saved' : 'recordings' }),
+    }).then(async response => {
+      const result = await response.json()
+      if (!response.ok || !result.ok || typeof result.url !== 'string') throw new Error('prepare failed')
+      if (!abort.signal.aborted && this.prefetchedId === key) {
+        this.preparedNext = { key, url: new URL(result.url, url).toString() }
+        this.warmNext(this.preparedNext.url, seg.sizeBytes)
+      }
+    }).catch(() => {
+      if (!abort.signal.aborted) this.prefetchRetryAt = Date.now() + 5000
+    }).finally(() => { if (this.prefetchAbort === abort) this.prefetchAbort = null })
+  }
+
+  private warmNext(url: string, size: number) {
+    this.warmLink?.remove()
+    this.warmLink = null
+    if (typeof document === 'undefined' || !(size > 0) || size > 32 * 1024 * 1024) return
+    const connection = (navigator as Navigator & { connection?: { saveData?: boolean; effectiveType?: string } }).connection
+    if (connection?.saveData || /(^|-)2g$/.test(connection?.effectiveType ?? '')) return
+    // Browser-managed, low-priority prefetch; no second decoder or JS media blob.
+    this.warmLink = document.createElement('link')
+    this.warmLink.rel = 'prefetch'
+    this.warmLink.as = 'video'
+    this.warmLink.href = url
+    this.warmLink.setAttribute('fetchpriority', 'low')
+    document.head.append(this.warmLink)
+  }
+
   private useMode(next: PlayMode) {
     this.mode = next
     this.vod.setActive(next === 'vod')
@@ -189,11 +269,13 @@ export class PlaybackController {
       this.emit('buffering', false)
       return
     }
+    const operation = this.loadToken
     this.emit('buffering', true)
     let ok = false
     let delegated = false
     try {
       ok = this.mode === 'stream' ? await this.stream.play() : await this.vod.play()
+      if (operation !== this.loadToken) return
       if (!ok && this.wantPlay && !this.suspended && !this.liveRecording) {
         await new Promise((r) => setTimeout(r, 150))
         ok = this.mode === 'stream' ? await this.stream.play() : await this.vod.play()
@@ -213,13 +295,16 @@ export class PlaybackController {
           return
         }
       }
+      if (operation !== this.loadToken) return
       this.emit('playing', ok)
+      if (ok) this.emit('status', '')
     } finally {
-      if (!delegated) this.emit('buffering', false)
+      if (!delegated && operation === this.loadToken) this.emit('buffering', false)
     }
   }
 
   detach() {
+    this.cancelOperation()
     if (this.scrubTimer) clearTimeout(this.scrubTimer)
     if (this.followTimer) clearTimeout(this.followTimer)
     if (this.pinReleaseTimer) clearTimeout(this.pinReleaseTimer)
@@ -253,12 +338,16 @@ export class PlaybackController {
       this.vod.setAuthToken(opts.authToken)
     }
     if (changed) {
+      this.stop()
       this.windowLoaded = false
     }
   }
 
   setSegments(segments: RecordingSegment[]) {
     this.segments = segments
+    this.orderedSegments = [...segments].sort((a,b) => segStartMs(a)-segStartMs(b))
+    this.segmentPositions = new Map(this.orderedSegments.map((s,i) => [s.id,i]))
+    this.intervalIndex = createTimelineIndex(segments, segStartMs, segEndMs)
     this.vodSegs = segments
       .filter((s) => s.fileName.toLowerCase().endsWith('.ts'))
       .map((s) => {
@@ -277,8 +366,16 @@ export class PlaybackController {
     }
   }
 
-  setContinuous(_on: boolean) {
-    /* continuous is inherent to HLS VOD window; stream mode chains via ended */
+  setContinuous(on: boolean) {
+    this.continuous = on
+    if (!on) {
+      this.prefetchAbort?.abort()
+      this.prefetchAbort = null
+      this.prefetchedId = null
+      this.preparedNext = null
+      this.warmLink?.remove()
+      this.warmLink = null
+    }
   }
 
   setRate(rate: number) {
@@ -309,6 +406,7 @@ export class PlaybackController {
 
   scrubToWall(wallMs: number) {
     if (!this.attached) return
+    this.cancelOperation()
     this.pendingScrubMs = wallMs
     this.pinnedFollowWall = wallMs
     this.emitFollow(wallMs, true)
@@ -322,12 +420,19 @@ export class PlaybackController {
   }
 
   async playSegment(seg: RecordingSegment, offsetSec = 0) {
+    this.cancelOperation()
+    const intent = this.intentGen
     this.wantPlay = true
     this.pendingScrubMs = null
     const wall = segStartMs(seg) + offsetSec * 1000
     this.pinnedFollowWall = wall
     this.emitFollow(wall, true)
-    await this.ensureWindowAndSeek(wall)
+    // An explicit file selection must retain its identity. Resolving only by
+    // wall time can select a different saved clip covering the same interval.
+    this.holdFollowPin(wall)
+    await this.enterStreamMode(seg, offsetSec)
+    if (intent !== this.intentGen || this.pendingScrubMs != null) return
+    this.settleFollowToMedia(wall)
   }
 
   async play() {
@@ -355,6 +460,11 @@ export class PlaybackController {
   }
 
   pause() {
+    this.prefetchAbort?.abort()
+    this.prefetchAbort = null
+    this.prefetchedId = null
+    this.warmLink?.remove()
+    this.warmLink = null
     this.wantPlay = false
     this.vod.pause()
     this.stream.pause()
@@ -372,6 +482,9 @@ export class PlaybackController {
   }
 
   stop() {
+    this.cancelOperation()
+    this.preparedNext = null
+    this.prefetchRetryAt = 0
     this.wantPlay = false
     this.pendingScrubMs = null
     this.clearFollowPin()
@@ -391,6 +504,7 @@ export class PlaybackController {
   }
 
   private handleWallTick(wall: number) {
+    this.prefetchNext(wall)
     if (this.pinnedFollowWall != null) {
       // Only release pin when media actually reached the scrub target.
       if (Math.abs(wall - this.pinnedFollowWall) < 2000) {
@@ -491,6 +605,7 @@ export class PlaybackController {
   }
 
   private async ensureWindowAndSeek(wallMs: number) {
+    const intent = this.intentGen
     const clips = this.segments.map(toTimedClip).sort((a, b) => a.startMs - b.startMs)
     const hit = wallToClip(clips, wallMs)
 
@@ -535,14 +650,14 @@ export class PlaybackController {
     // Switch to stream before any segment emit so UI/debug never flashes [vod]→[stream].
     if (targetSeg) {
       await this.enterStreamMode(targetSeg, offsetSec)
-      if (this.pendingScrubMs != null) return
+      if (intent !== this.intentGen || this.pendingScrubMs != null) return
       this.settleFollowToMedia(wallMs)
       return
     }
 
     this.syncCurrentSegment(mediaWall)
     await this.enterVodMode(mediaWall)
-    if (this.pendingScrubMs != null) return
+    if (intent !== this.intentGen || this.pendingScrubMs != null) return
     this.settleFollowToMedia(wallMs)
   }
 
@@ -593,13 +708,23 @@ export class PlaybackController {
     }
     const token = ++this.loadToken
     this.setLiveRecording(false)
-    this.vod.unload()
+    if (this.mode === 'vod') this.vod.unload()
     const offset = Math.max(0, offsetSec)
 
     // Same recording file — rebuild/seek in place. Do not require hasSource:
     // mid-scrub readyState is often 0, and forcing load() stacking raced the MSE session.
     const sameFile =
-      this.mode === 'stream' && this.streamSegId === seg.id && this.stream.hasSession
+      this.mode === 'stream' && this.streamSegId === seg.id &&
+      this.current != null && this.prepareKey(this.current) === this.prepareKey(seg) && this.stream.hasSession
+    if (!sameFile) {
+      // The old source must stop before preparation: its time/ended events
+      // would otherwise be interpreted as belonging to the new segment.
+      this.stream.unload()
+      this.streamPlayFile = null
+      this.streamPlayUrl = null
+      this.streamViaRemux = false
+      this.emit('playing', false)
+    }
     this.useMode('stream')
     this.windowLoaded = false
     const segChanged = this.current?.id !== seg.id
@@ -608,6 +733,7 @@ export class PlaybackController {
     if (segChanged || !sameFile) this.emit('segment', seg)
 
     if (sameFile) {
+      this.emit('status', '正在定位…')
       await this.stream.seek(offset)
       if (token !== this.loadToken || this.mode !== 'stream') return
       this.stream.setPlaybackRate(this.rate)
@@ -615,22 +741,41 @@ export class PlaybackController {
       return
     }
 
-    // Play the recording file (.ts). playbackUrl may still point at the MP4 remux cache.
     let url = seg.url || seg.playbackUrl || ''
-    if (!url || url.includes('/media/play/')) {
-      url = seg.url || ''
-    }
-    if (!url) {
-      this.emit('error', '录像地址无效')
-      return
-    }
-
-    // Prefer localhost HTTP Range for mpegts.js (navora:// is Range-hostile).
     url = forceHttpMediaUrl(url, this.mediaBaseUrl || this.sampleMediaUrl)
-
-    const remux = url.includes('/media/play/')
+    if (!url) { this.emit('error', '录像地址无效'); return }
+    const needsPrepare = /\.(ts|mkv)$/i.test(seg.fileName) || this.compatH264
+    const prepared = this.preparedNext?.key === this.prepareKey(seg) ? this.preparedNext : null
+    if (prepared) url = prepared.url
+    if (needsPrepare && !prepared) {
+      this.emit('buffering', true)
+      this.emit('status', '正在准备回放，首次打开需要生成播放副本…')
+      const abort = new AbortController()
+      this.prepareAbort = abort
+      try {
+        const endpoint = new URL('/api/playback/prepare', new URL(url, location.href))
+        const response = await fetch(endpoint, {
+          method: 'POST', credentials: 'include', signal: abort.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ h264: this.compatH264, channelId: seg.channelId, fileName: seg.fileName, kind: this.source === 'saved' ? 'saved' : 'recordings' }),
+        })
+        const result = await response.json()
+        if (token !== this.loadToken) return
+        if (!response.ok || !result.ok) throw new Error(result.error || '无法准备回放')
+        url = new URL(result.url, endpoint).toString()
+      } catch (error) {
+        if (token !== this.loadToken || abort.signal.aborted) return
+        this.emit('error', error instanceof Error ? error.message : '无法准备回放')
+        this.emit('status', '')
+        this.emit('buffering', false)
+        return
+      } finally { if (this.prepareAbort === abort) this.prepareAbort = null }
+    }
+    if (token !== this.loadToken) return
+    const remux = needsPrepare
     const playFileName = remux ? seg.fileName.replace(/\.(ts|mkv)$/i, '.mp4') : seg.fileName
-    const transport = remux || !isMpegTsPath(playFileName) ? 'native' : 'mpegts'
+    const transport = 'native' as const
+    this.emit('status', '正在加载画面…')
 
     this.streamPlayFile = playFileName
     this.streamViaRemux = remux
@@ -638,6 +783,7 @@ export class PlaybackController {
     url = withVodAuth(url, this.authToken)
     this.streamPlayUrl = url
 
+    try {
     await this.stream.load({
       url,
       fileName: playFileName,
@@ -645,6 +791,12 @@ export class PlaybackController {
       startOffsetSec: offset,
       transport,
     })
+    } catch (error) {
+      if (token !== this.loadToken) return
+      this.emit('error', error instanceof Error ? error.message : '画面加载失败')
+      this.emit('buffering', false)
+      return
+    }
     if (token !== this.loadToken || this.mode !== 'stream') return
 
     this.stream.setPlaybackRate(this.rate)
@@ -680,20 +832,16 @@ export class PlaybackController {
 
   private async onStreamEnded() {
     this.emit('playing', false)
+    if (!this.continuous || !this.wantPlay) { this.emit('playlistEnded'); return }
     const cur = this.current
     if (!cur) {
       this.emit('playlistEnded')
       return
     }
-    const clips = this.segments.map(toTimedClip).sort((a, b) => a.startMs - b.startMs)
-    const next = nextClip(clips, cur.id)
-    if (!next) {
-      this.emit('playlistEnded')
-      return
-    }
-    // Continue into next clip (may switch back to VOD if friendly)
-    this.wantPlay = true
-    await this.ensureWindowAndSeek(next.startMs)
+    const position = this.segmentPositions.get(cur.id)
+    const nextSegment = position == null ? undefined : this.orderedSegments[position + 1]
+    if (!nextSegment) { this.emit('playlistEnded'); return }
+    await this.playSegment(nextSegment, 0)
   }
 
   private async loadWindow(centerWallMs: number) {
@@ -757,16 +905,13 @@ export class PlaybackController {
   }
 
   private segmentAtWall(wallMs: number): RecordingSegment | null {
-    return (
-      this.segments.find((s) => {
-        const a = segStartMs(s)
-        const b = segEndMs(s)
-        return wallMs >= a && wallMs <= b
-      }) ?? null
-    )
+    return this.intervalIndex.query(wallMs, wallMs).filter(span => wallMs < span.end).at(-1)?.item ?? null
   }
 
   private syncCurrentSegment(wallMs: number) {
+    // Native single-file playback owns its file identity until load/advance.
+    // Overlapping clips must not replace it merely because their time matches.
+    if (this.mode === 'stream') return
     const seg = this.segmentAtWall(wallMs)
     if (seg?.id !== this.current?.id) {
       this.current = seg

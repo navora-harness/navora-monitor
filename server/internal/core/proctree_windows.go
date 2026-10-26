@@ -8,14 +8,14 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
-	jobObjectInfoClassExtendedLimit = 9
-	jobObjectLimitKillOnJobClose    = 0x2000
-	processSetQuota                 = 0x0100
-	processTerminate                = 0x0001
-	processSetInformation           = 0x0200
+	processSetQuota       = 0x0100
+	processTerminate      = 0x0001
+	processSetInformation = 0x0200
 )
 
 var (
@@ -23,40 +23,9 @@ var (
 	jobHandle syscall.Handle
 	jobOK     bool
 
-	createJobObjectW           = kernel32.NewProc("CreateJobObjectW")
-	setInformationJobObject    = kernel32.NewProc("SetInformationJobObject")
-	assignProcessToJobObject   = kernel32.NewProc("AssignProcessToJobObject")
+	createJobObjectW         = kernel32.NewProc("CreateJobObjectW")
+	assignProcessToJobObject = kernel32.NewProc("AssignProcessToJobObject")
 )
-
-type ioCounters struct {
-	ReadOperationCount  uint64
-	WriteOperationCount uint64
-	OtherOperationCount uint64
-	ReadTransferCount   uint64
-	WriteTransferCount  uint64
-	OtherTransferCount  uint64
-}
-
-type jobObjectBasicLimitInformation struct {
-	PerProcessUserTimeLimit int64
-	PerJobUserTimeLimit     int64
-	LimitFlags              uint32
-	MinimumWorkingSetSize   uintptr
-	MaximumWorkingSetSize   uintptr
-	ActiveProcessLimit      uint32
-	Affinity                uintptr
-	PriorityClass           uint32
-	SchedulingClass         uint32
-}
-
-type winJobExtendedLimitInfo struct {
-	BasicLimitInformation jobObjectBasicLimitInformation
-	IoInfo                ioCounters
-	ProcessMemoryLimit    uintptr
-	JobMemoryLimit        uintptr
-	PeakProcessMemoryUsed uintptr
-	PeakJobMemoryUsed     uintptr
-}
 
 func ensureJob() bool {
 	jobOnce.Do(func() {
@@ -66,15 +35,13 @@ func ensureJob() bool {
 			return
 		}
 		jobHandle = syscall.Handle(h)
-		var info winJobExtendedLimitInfo
-		info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
-		r1, _, err := setInformationJobObject.Call(
-			uintptr(jobHandle),
-			jobObjectInfoClassExtendedLimit,
-			uintptr(unsafe.Pointer(&info)),
-			unsafe.Sizeof(info),
+		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		_, err = windows.SetInformationJobObject(
+			windows.Handle(jobHandle), windows.JobObjectExtendedLimitInformation,
+			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)),
 		)
-		if r1 == 0 {
+		if err != nil {
 			log.Printf("proctree: SetInformationJobObject failed: %v", err)
 			_ = syscall.CloseHandle(jobHandle)
 			jobHandle = 0

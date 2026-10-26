@@ -12,7 +12,8 @@ export type UiLayoutState = {
   showExplorer: boolean
   showInspector: boolean
   showTimeline: boolean
-  mosaic: 1 | 4 | 9 | 16
+  mosaic: 1 | 4 | 6 | 8 | 9 | 13 | 16
+  featuredLayout?: boolean
   /** Mosaic wall channel ids (length 16); null = empty cell */
   slotIds: (string | null)[]
 }
@@ -20,8 +21,8 @@ export type UiLayoutState = {
 export const PANEL_LIMITS = {
   explorer: { min: 180, max: 420, default: 240 },
   inspector: { min: 220, max: 480, default: 280 },
-  /** Compact chrome allows ~72px; default keeps a comfortable track. */
-  timeline: { min: 72, max: 320, default: 112 },
+  /** Reserve room for controls, track and status even with a wide sidebar. */
+  timeline: { min: 160, max: 520, default: 184 },
 } as const
 
 export const MOSAIC_SLOT_COUNT = 16
@@ -68,8 +69,8 @@ export function sanitizeUiLayout(raw: Partial<UiLayoutState> | null | undefined)
   const base = defaultUiLayout()
   const sizes = raw?.panelSizes ?? base.panelSizes
   const mosaicRaw = Number(raw?.mosaic)
-  const mosaic = ([1, 4, 9, 16] as const).includes(mosaicRaw as 1 | 4 | 9 | 16)
-    ? (mosaicRaw as 1 | 4 | 9 | 16)
+  const mosaic = ([1, 4, 6, 8, 9, 13, 16] as const).includes(mosaicRaw as 1 | 4 | 6 | 8 | 9 | 13 | 16)
+    ? (mosaicRaw as 1 | 4 | 6 | 8 | 9 | 13 | 16)
     : base.mosaic
   return {
     version: 1,
@@ -86,6 +87,7 @@ export function sanitizeUiLayout(raw: Partial<UiLayoutState> | null | undefined)
     showInspector: raw?.showInspector === true,
     showTimeline: raw?.showTimeline !== false,
     mosaic,
+    featuredLayout: raw?.featuredLayout === true,
     slotIds: sanitizeSlotIds(raw?.slotIds),
   }
 }

@@ -1,10 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { useContextMenuHost } from '../composables/useContextMenu'
 import { pushEscapeLayer } from '../ui/escape-stack'
 
 const { session, openTick, closeContextMenu, pickContextMenu } = useContextMenuHost()
 const el = ref<HTMLElement | null>(null)
+const menuTarget = shallowRef<Element | string>('body')
+
+function syncFullscreenTarget() {
+  closeContextMenu()
+  menuTarget.value = document.fullscreenElement ?? 'body'
+}
 
 const style = computed(() => {
   const s = session.value
@@ -47,12 +53,15 @@ watch(session, (open) => {
 })
 
 onMounted(() => {
+  syncFullscreenTarget()
+  document.addEventListener('fullscreenchange', syncFullscreenTarget)
   document.addEventListener('mousedown', onDoc, true)
   document.addEventListener('scroll', onScroll, true)
   window.addEventListener('blur', closeContextMenu)
 })
 
 onUnmounted(() => {
+  document.removeEventListener('fullscreenchange', syncFullscreenTarget)
   popEscape?.()
   document.removeEventListener('mousedown', onDoc, true)
   document.removeEventListener('scroll', onScroll, true)
@@ -61,7 +70,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport :to="menuTarget">
     <div
       v-if="session"
       ref="el"

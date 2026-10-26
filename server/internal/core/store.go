@@ -1,10 +1,12 @@
 package core
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,13 +88,14 @@ type authFile struct {
 }
 
 type Layout struct {
-	Version       int        `json:"version"`
-	PanelSizes    panelSizes `json:"panelSizes"`
-	ShowExplorer  bool       `json:"showExplorer"`
-	ShowInspector bool       `json:"showInspector"`
-	ShowTimeline  bool       `json:"showTimeline"`
-	Mosaic        int        `json:"mosaic"`
-	SlotIDs       []*string  `json:"slotIds"`
+	Version        int        `json:"version"`
+	PanelSizes     panelSizes `json:"panelSizes"`
+	ShowExplorer   bool       `json:"showExplorer"`
+	ShowInspector  bool       `json:"showInspector"`
+	ShowTimeline   bool       `json:"showTimeline"`
+	Mosaic         int        `json:"mosaic"`
+	FeaturedLayout bool       `json:"featuredLayout"`
+	SlotIDs        []*string  `json:"slotIds"`
 }
 
 type panelSizes struct {
@@ -102,6 +105,7 @@ type panelSizes struct {
 }
 
 type Session struct {
+	done     chan struct{}
 	Username string
 	Expires  time.Time
 	// channel id -> last demand refresh
@@ -109,15 +113,23 @@ type Session struct {
 }
 
 type Core struct {
+	scanMu     sync.Mutex
+	scanCancel context.CancelFunc
+	scanID     uint64
 	mu         sync.Mutex
 	root       string
 	settings   Settings
 	channels   []Channel
 	groupOrder []string
-	auth       authFile
-	sessions   map[string]*Session
-	events     *broker
-	ws         *wsHub
+	// Last committed channel document, used to restore every mutation on write failure.
+	committedChannels []Channel
+	committedGroups   []string
+	auth              authFile
+	sessions          map[string]*Session
+	loginWindows      map[string]loginWindow
+	accessChanged     chan struct{}
+	events            *broker
+	ws                *wsHub
 
 	rec   *recorder
 	prev  *previewMgr
@@ -125,9 +137,12 @@ type Core struct {
 
 	scheduleHold map[string]bool
 	// Manual recordings to resume after process/service restart (persisted).
-	remembered map[string]bool
-	listenPort int
-	listenURLs []string
+	remembered             map[string]bool
+	listenPort             int
+	listenURLs             []string
+	remoteSwitch           func(bool) error
+	listenAddress          func() string
+	storageDefaultsChanged bool
 
 	// Set when any browser reports HEVC MSE is unavailable.
 	previewNeedH264 bool
@@ -137,23 +152,45 @@ type Core struct {
 }
 
 func Open(root string) (*Core, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	root = absRoot
+	if windowsSystemPath(root) {
+		return nil, fmt.Errorf("配置数据目录不能位于 Windows 系统目录，请通过 --data 指定独立数据目录")
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
 	c := &Core{
-		root:         root,
-		sessions:     map[string]*Session{},
-		events:       newBroker(),
-		ws:           newWSHub(),
-		scheduleHold: map[string]bool{},
-		remembered:   map[string]bool{},
+		root:          root,
+		sessions:      map[string]*Session{},
+		accessChanged: make(chan struct{}),
+		events:        newBroker(),
+		ws:            newWSHub(),
+		scheduleHold:  map[string]bool{},
+		remembered:    map[string]bool{},
 	}
 	c.events.extra = func(event string, v any) {
 		c.ws.broadcast(event, v)
 	}
-	c.settings = c.loadSettings()
-	c.channels, c.groupOrder = c.loadChannels()
-	c.auth = c.loadAuth()
+	if c.settings, err = c.loadSettings(); err != nil {
+		return nil, fmt.Errorf("读取 settings.json 失败，请检查权限或恢复备份：%w", err)
+	}
+	if c.channels, c.groupOrder, err = c.loadChannels(); err != nil {
+		return nil, fmt.Errorf("读取 channels.json 失败，请检查权限或恢复备份：%w", err)
+	}
+	c.committedChannels = append([]Channel(nil), c.channels...)
+	c.committedGroups = append([]string(nil), c.groupOrder...)
+	if c.auth, err = c.loadAuth(); err != nil {
+		return nil, fmt.Errorf("读取 auth.json 失败，请检查权限或恢复备份：%w", err)
+	}
+	if c.storageDefaultsChanged {
+		if err := c.saveSettingsLocked(); err != nil {
+			return nil, fmt.Errorf("固定默认存储路径失败：%w", err)
+		}
+	}
 	c.remembered = c.loadRemembered()
 	c.rec = newRecorder(c)
 	c.prev = newPreview(c)
@@ -166,14 +203,40 @@ func (c *Core) Root() string { return c.root }
 
 func (c *Core) Events() *broker { return c.events }
 
-func (c *Core) loadSettings() Settings {
+func (c *Core) loadSettings() (Settings, error) {
 	s := defaultSettings()
 	b, err := os.ReadFile(filepath.Join(c.root, "settings.json"))
 	if err != nil {
-		return s
+		if os.IsNotExist(err) {
+			for _, name := range []string{"auth.json", "channels.json"} {
+				if _, statErr := os.Stat(filepath.Join(c.root, name)); statErr == nil {
+					return s, fmt.Errorf("已有数据但 settings.json 缺失，请恢复配置备份；不会自动覆盖旧配置")
+				}
+			}
+			if windowsSystemPath(c.root) {
+				return s, fmt.Errorf("数据目录位于 Windows 系统目录，请通过 --data 指定独立数据目录")
+			}
+			c.storageDefaultsChanged = true
+			return c.storageDefaults(s, false), nil
+		}
+		return s, err
 	}
-	_ = json.Unmarshal(b, &s)
-	return sanitizeSettings(s)
+	if err := json.Unmarshal(b, &s); err != nil {
+		return s, err
+	}
+	s = sanitizeSettings(s)
+	original := s
+	if s.RecordingsPath == "" || s.SavedClipsPath == "" || s.SnapshotsPath == "" || s.RecordCachePath == "" {
+		if windowsSystemPath(c.root) {
+			return s, fmt.Errorf("默认存储路径位于 Windows 系统目录，请恢复或明确设置存储路径")
+		}
+		c.storageDefaultsChanged = true
+	}
+	s = c.storageDefaults(s, true)
+	if s != original {
+		c.storageDefaultsChanged = true
+	}
+	return s, nil
 }
 
 func sanitizeSettings(s Settings) Settings {
@@ -225,13 +288,19 @@ func (c *Core) saveSettingsLocked() error {
 	return writeFileAtomic(filepath.Join(c.root, "settings.json"), b)
 }
 
-func (c *Core) loadAuth() authFile {
+func (c *Core) loadAuth() (authFile, error) {
 	var a authFile
 	b, err := os.ReadFile(filepath.Join(c.root, "auth.json"))
-	if err == nil {
-		_ = json.Unmarshal(b, &a)
+	if os.IsNotExist(err) {
+		return a, nil
 	}
-	return a
+	if err != nil {
+		return a, err
+	}
+	if err := json.Unmarshal(b, &a); err != nil {
+		return a, err
+	}
+	return a, nil
 }
 
 func (c *Core) saveAuthLocked() error {
@@ -314,7 +383,13 @@ func (c *Core) SetPassword(password string) error {
 	if err = c.saveAuthLocked(); err != nil {
 		return err
 	}
-	return c.saveSettingsLocked()
+	if err = c.saveSettingsLocked(); err != nil {
+		return err
+	}
+	for token := range c.sessions {
+		c.revokeSessionLocked(token)
+	}
+	return nil
 }
 
 func (c *Core) OpenSession(username string) (string, error) {
@@ -325,6 +400,7 @@ func (c *Core) OpenSession(username string) (string, error) {
 	token := hex.EncodeToString(buf)
 	c.mu.Lock()
 	c.sessions[token] = &Session{
+		done:     make(chan struct{}),
 		Username: username,
 		Expires:  time.Now().Add(12 * time.Hour),
 		Previews: map[string]time.Time{},
@@ -341,7 +417,7 @@ func (c *Core) Session(token string) (*Session, bool) {
 	defer c.mu.Unlock()
 	s, ok := c.sessions[token]
 	if !ok || time.Now().After(s.Expires) {
-		delete(c.sessions, token)
+		c.revokeSessionLocked(token)
 		return nil, false
 	}
 	return s, true
@@ -349,13 +425,14 @@ func (c *Core) Session(token string) (*Session, bool) {
 
 func (c *Core) DropSession(token string) {
 	c.mu.Lock()
-	delete(c.sessions, token)
+	c.revokeSessionLocked(token)
 	c.mu.Unlock()
 	c.prev.reconcile()
 }
 
 func (c *Core) TouchPreviews(token string, ids []string) {
 	now := time.Now()
+	var removed []string
 	c.mu.Lock()
 	s, ok := c.sessions[token]
 	if ok {
@@ -366,10 +443,16 @@ func (c *Core) TouchPreviews(token string, ids []string) {
 				next[id] = now
 			}
 		}
+		for id := range s.Previews {
+			if _, keep := next[id]; !keep {
+				removed = append(removed, id)
+			}
+		}
 		s.Previews = next
 	}
 	c.mu.Unlock()
 	if ok {
+		c.prev.releaseWanted(removed)
 		c.prev.reconcile()
 	}
 }
@@ -408,7 +491,7 @@ func (c *Core) gcSessions() {
 	c.mu.Lock()
 	for k, s := range c.sessions {
 		if now.After(s.Expires) {
-			delete(c.sessions, k)
+			c.revokeSessionLocked(k)
 		}
 	}
 	c.mu.Unlock()
@@ -429,26 +512,73 @@ func (c *Core) wantedPreviews() map[string]bool {
 	return out
 }
 
+type configWriteLock struct {
+	sync.Mutex
+	users int
+}
+
+var configWrites = struct {
+	sync.Mutex
+	paths map[string]*configWriteLock
+}{paths: map[string]*configWriteLock{}}
+
+func lockConfigWrite(path string) func() {
+	key := leaseKey(path)
+	configWrites.Lock()
+	lock := configWrites.paths[key]
+	if lock == nil {
+		lock = &configWriteLock{}
+		configWrites.paths[key] = lock
+	}
+	lock.users++
+	configWrites.Unlock()
+	lock.Lock()
+	return func() {
+		lock.Unlock()
+		configWrites.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(configWrites.paths, key)
+		}
+		configWrites.Unlock()
+	}
+}
+
 func writeFileAtomic(path string, b []byte) error {
+	unlock := lockConfigWrite(path)
+	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(path), ".navora-config-*")
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(path)
-	return os.Rename(tmp, path)
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.Write(b); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return replaceFile(file.Name(), path)
 }
 
-func (c *Core) loadChannels() ([]Channel, []string) {
+func (c *Core) loadChannels() ([]Channel, []string, error) {
 	var f channelsFile
 	b, err := os.ReadFile(filepath.Join(c.root, "channels.json"))
 	if err != nil {
-		return nil, nil
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
 	}
-	if json.Unmarshal(b, &f) != nil {
-		return nil, nil
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, nil, err
 	}
 	var list []Channel
 	seen := map[string]bool{}
@@ -460,7 +590,7 @@ func (c *Core) loadChannels() ([]Channel, []string) {
 		seen[clean.ID] = true
 		list = append(list, clean)
 	}
-	return list, f.GroupOrder
+	return list, f.GroupOrder, nil
 }
 
 func sanitizeChannel(ch Channel) (Channel, bool) {
@@ -512,7 +642,16 @@ func sanitizeChannel(ch Channel) (Channel, bool) {
 	return ch, true
 }
 
-func (c *Core) saveChannelsLocked() error {
+func (c *Core) saveChannelsLocked() (err error) {
+	defer func() {
+		if err != nil {
+			c.channels = append([]Channel(nil), c.committedChannels...)
+			c.groupOrder = append([]string(nil), c.committedGroups...)
+		} else {
+			c.committedChannels = append([]Channel(nil), c.channels...)
+			c.committedGroups = append([]string(nil), c.groupOrder...)
+		}
+	}()
 	f := channelsFile{Version: 1, Channels: c.channels, GroupOrder: c.groupOrder}
 	if f.Channels == nil {
 		f.Channels = []Channel{}
@@ -553,11 +692,48 @@ func (c *Core) Settings() Settings {
 }
 
 func (c *Core) UpdateSettings(next Settings) (Settings, error) {
+	// Serialize storage changes with recorder start/stop so an active FFmpeg
+	// process cannot keep writing to a directory hidden by the new settings.
+	if c.rec != nil {
+		c.rec.opMu.Lock()
+		defer c.rec.opMu.Unlock()
+	}
+	return c.updateSettingsLocked(next)
+}
+
+func (c *Core) updateSettingsLocked(next Settings) (Settings, error) {
 	pw := strings.TrimSpace(next.RemotePassword)
 	c.mu.Lock()
 	prev := c.settings
 	next = sanitizeSettings(next)
 	next.RemotePassword = ""
+	next = c.storageDefaults(next, false)
+	storageChanged := !samePath(next.RecordingsPath, prev.RecordingsPath) ||
+		!samePath(next.RecordCachePath, prev.RecordCachePath) || next.RecordCacheEnabled != prev.RecordCacheEnabled
+	if storageChanged && c.rec != nil {
+		for _, channel := range c.channels {
+			if c.rec.running(channel.ID) {
+				c.mu.Unlock()
+				return Settings{}, fmt.Errorf("请先停止录像，再修改录像目录、缓存目录或缓存开关；不会中断正在进行的录像")
+			}
+		}
+	}
+	for _, item := range []struct{ next, prev string }{
+		{next.RecordingsPath, prev.RecordingsPath}, {next.SavedClipsPath, prev.SavedClipsPath},
+		{next.SnapshotsPath, prev.SnapshotsPath}, {next.RecordCachePath, prev.RecordCachePath},
+	} {
+		if item.next != "" && !samePath(item.next, item.prev) && windowsSystemPath(item.next) {
+			c.mu.Unlock()
+			return Settings{}, fmt.Errorf("存储目录不能位于 Windows 系统目录，请选择独立录像目录")
+		}
+	}
+	remoteChanged := prev.RemoteEnabled != next.RemoteEnabled
+	if remoteChanged && c.remoteSwitch != nil {
+		if err := c.remoteSwitch(next.RemoteEnabled); err != nil {
+			c.mu.Unlock()
+			return Settings{}, fmt.Errorf("切换局域网监听失败，设置未保存：%w", err)
+		}
+	}
 	// Hidden Electron-era flags stay as previously stored if the client omitted them
 	// by sending the Go zero value only when the JSON included them. The Vue client
 	// always sends the full object, so keep the incoming values.
@@ -566,6 +742,24 @@ func (c *Core) UpdateSettings(next Settings) (Settings, error) {
 	}
 	c.settings = next
 	err := c.saveSettingsLocked()
+	if err != nil {
+		c.settings = prev
+		if remoteChanged && c.remoteSwitch != nil {
+			if rollbackErr := c.remoteSwitch(prev.RemoteEnabled); rollbackErr != nil {
+				err = fmt.Errorf("%w；恢复监听失败：%v，请重启服务", err, rollbackErr)
+			}
+		}
+	} else {
+		if prev.RemoteEnabled != next.RemoteEnabled {
+			close(c.accessChanged)
+			c.accessChanged = make(chan struct{})
+		}
+		if prev.RemoteUsername != next.RemoteUsername {
+			for token := range c.sessions {
+				c.revokeSessionLocked(token)
+			}
+		}
+	}
 	s := c.settings
 	needRestart := prev.PreviewTranscodeH264 != next.PreviewTranscodeH264
 	c.mu.Unlock()
@@ -585,42 +779,25 @@ func (c *Core) UpdateSettings(next Settings) (Settings, error) {
 }
 
 func (c *Core) UpsertChannel(ch Channel) ([]Channel, error) {
-	clean, ok := sanitizeChannel(ch)
-	if !ok {
-		return nil, errors.New("无效通道配置")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	found := false
-	for i := range c.channels {
-		if c.channels[i].ID == clean.ID {
-			c.channels[i] = clean
-			found = true
-			break
-		}
-	}
-	if !found {
-		c.channels = append(c.channels, clean)
-	}
-	g := channelGroup(clean.Group)
-	if g != defaultGroup && !contains(c.groupOrder, g) {
-		c.groupOrder = append(c.groupOrder, g)
-	}
-	if err := c.saveChannelsLocked(); err != nil {
-		return nil, err
-	}
-	out := append([]Channel(nil), c.channels...)
-	return out, nil
+	return c.UpsertChannels([]Channel{ch})
 }
 
 func (c *Core) UpsertChannels(list []Channel) ([]Channel, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	cleanList := make([]Channel, 0, len(list))
+	seen := map[string]bool{}
 	for _, ch := range list {
 		clean, ok := sanitizeChannel(ch)
-		if !ok {
-			continue
+		if !ok || seen[clean.ID] {
+			return nil, errors.New("无效或重复的通道配置")
 		}
+		seen[clean.ID] = true
+		cleanList = append(cleanList, clean)
+	}
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
+	c.mu.Lock()
+	previous := append([]Channel(nil), c.channels...)
+	for _, clean := range cleanList {
 		found := false
 		for i := range c.channels {
 			if c.channels[i].ID == clean.ID {
@@ -638,12 +815,20 @@ func (c *Core) UpsertChannels(list []Channel) ([]Channel, error) {
 		}
 	}
 	if err := c.saveChannelsLocked(); err != nil {
+		c.mu.Unlock()
 		return nil, err
 	}
-	return append([]Channel(nil), c.channels...), nil
+	out := append([]Channel(nil), c.channels...)
+	c.mu.Unlock()
+	if err := c.reconcileChannelChangesLocked(previous, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *Core) RemoveChannels(ids []string) ([]Channel, error) {
+	c.rec.opMu.Lock()
+	defer c.rec.opMu.Unlock()
 	drop := map[string]bool{}
 	for _, id := range ids {
 		drop[id] = true
@@ -673,7 +858,9 @@ func (c *Core) RemoveChannels(ids []string) ([]Channel, error) {
 	}
 	c.mu.Unlock()
 	for _, id := range ids {
-		_ = c.StopRecord(id, true)
+		c.rec.stopLocked(id)
+		c.ClearPreviewWant(id)
+		c.prev.stop(id)
 	}
 	return out, nil
 }

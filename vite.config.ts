@@ -43,6 +43,13 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('/node_modules/hls.js/')) return 'hls'
+          if (id.includes('/node_modules/mpegts.js/')) return 'mpegts'
+          if (id.includes('/node_modules/@vue/') || id.includes('/node_modules/vue/')) return 'vue'
+        },
+      },
       input: {
         main: resolve(__dirname, 'index.html'),
       },

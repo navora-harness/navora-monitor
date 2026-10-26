@@ -1,8 +1,12 @@
 package core
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +25,10 @@ func (c *Core) Handler() http.Handler {
 }
 
 func (c *Core) route(w http.ResponseWriter, r *http.Request) {
+	if !c.Settings().RemoteEnabled && !loopbackRequest(r.RemoteAddr) {
+		http.Error(w, "远程访问已关闭", http.StatusForbidden)
+		return
+	}
 	if r.URL.Path == "/api/login" && r.Method == http.MethodPost {
 		c.handleLogin(w, r)
 		return
@@ -30,10 +38,43 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/media/") {
-		if _, ok := c.authRequest(r); !ok {
+		session, ok := c.authRequest(r)
+		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "未登录"})
 			return
 		}
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		r = r.WithContext(ctx)
+		c.mu.Lock()
+		accessChanged := c.accessChanged
+		c.mu.Unlock()
+		go func() {
+			for {
+				select {
+				case <-session.done:
+					if strings.HasPrefix(r.URL.Path, "/media/") || r.URL.Path == "/api/events" || r.URL.Path == "/api/ws" {
+						cancel()
+						_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+					}
+					return
+				case <-accessChanged:
+					if !loopbackRequest(r.RemoteAddr) && !c.Settings().RemoteEnabled {
+						cancel()
+						if strings.HasPrefix(r.URL.Path, "/media/") || r.URL.Path == "/api/events" || r.URL.Path == "/api/ws" {
+							_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+						}
+						return
+					}
+					c.mu.Lock()
+					accessChanged = c.accessChanged
+					c.mu.Unlock()
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
 	}
 	switch {
 	case r.URL.Path == "/api/logout" && r.Method == http.MethodPost:
@@ -83,7 +124,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			ChannelID string `json:"channelId"`
 			Force     bool   `json:"force"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		writeJSON(w, 200, c.RepairTimestamps(body.ChannelID, body.Force))
 	case r.URL.Path == "/api/config/export" && r.Method == http.MethodPost:
 		c.handleExport(w, r)
@@ -129,7 +173,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Channels []Channel `json:"channels"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.UpsertChannels(body.Channels)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -140,10 +187,9 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			IDs []string `json:"ids"`
 		}
-		_ = readJSON(r, &body)
-		for _, id := range body.IDs {
-			_ = c.StopRecord(id, true)
-			c.prev.stop(id)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
 		}
 		list, err := c.RemoveChannels(body.IDs)
 		if err != nil {
@@ -156,7 +202,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			IDs   []string `json:"ids"`
 			Group *string  `json:"group"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		g := ""
 		if body.Group != nil {
 			g = *body.Group
@@ -173,7 +222,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			TargetGroup string   `json:"targetGroup"`
 			BeforeID    *string  `json:"beforeId"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.MoveChannelsBefore(body.IDs, body.TargetGroup, body.BeforeID)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -187,7 +239,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			Group  string  `json:"group"`
 			Before *string `json:"before"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.MoveGroupBefore(body.Group, body.Before)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -198,7 +253,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name string `json:"name"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.CreateGroup(body.Name)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -209,7 +267,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name string `json:"name"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.DeleteGroup(body.Name)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -221,7 +282,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			From string `json:"from"`
 			To   string `json:"to"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.RenameGroup(body.From, body.To)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -232,7 +296,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name string `json:"name"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		list, err := c.DissolveGroup(body.Name)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -246,7 +313,9 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/record/stop" && r.Method == http.MethodPost:
 		c.handleRecordStop(w, r)
 	case r.URL.Path == "/api/record/stop-all" && r.Method == http.MethodPost:
-		c.rec.stopAll()
+		for _, ch := range c.Channels() {
+			_ = c.StopRecord(ch.ID, true)
+		}
 		writeJSON(w, 200, c.States())
 	case r.URL.Path == "/api/record/group/start" && r.Method == http.MethodPost:
 		c.handleGroupRecord(w, r, true)
@@ -256,7 +325,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID string `json:"id"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		if err := c.prev.start(body.ID); err != nil {
 			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -267,7 +339,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID string `json:"id"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		c.ClearPreviewWant(body.ID)
 		c.prev.stop(body.ID)
 		writeJSON(w, 200, c.stateByID(body.ID))
@@ -275,7 +350,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var caps struct {
 			HevcMse *bool `json:"hevcMse"`
 		}
-		_ = readJSON(r, &caps)
+		if err := readJSON(r, &caps); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		if caps.HevcMse != nil && !*caps.HevcMse {
 			c.NoteNeedPreviewH264()
 		}
@@ -286,7 +364,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			ChannelIDs []string `json:"channelIds"`
 			HevcMse    *bool    `json:"hevcMse"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		if len(body.ChannelIDs) > 16 {
 			body.ChannelIDs = body.ChannelIDs[:16]
 		}
@@ -319,7 +400,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID string `json:"id"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		if err := c.DeleteSaved(body.ID); err != nil {
 			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -329,7 +413,10 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID string `json:"id"`
 		}
-		_ = readJSON(r, &body)
+		if err := readJSON(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+			return
+		}
 		ok, ms, msg := c.Probe(body.ID)
 		if ok {
 			writeJSON(w, 200, map[string]any{"ok": true, "latencyMs": ms, "summary": msg})
@@ -404,6 +491,11 @@ func cookieToken(r *http.Request) string {
 }
 
 func (c *Core) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !c.allowLogin(r.RemoteAddr) {
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, 429, map[string]any{"ok": false, "error": "登录尝试过于频繁，请一分钟后重试"})
+		return
+	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -426,6 +518,7 @@ func (c *Core) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((12 * time.Hour).Seconds()),
 	})
@@ -484,7 +577,14 @@ func (c *Core) appInfo() map[string]any {
 	s := c.Settings()
 	ff := c.ffmpegPath()
 	cache := c.cacheRoot()
+	storageWarning := ""
+	for _, p := range []string{c.recordingsRoot(), c.savedRoot(), c.snapshotsRoot(), cache} {
+		if p != "" && windowsSystemPath(p) {
+			storageWarning = "旧存储目录位于 Windows 系统目录，请在设置中选择独立录像盘；已有文件未移动。"
+		}
+	}
 	return map[string]any{
+		"storageWarning":        storageWarning,
 		"name":                  "Navora Monitor",
 		"version":               Version,
 		"license":               "MIT",
@@ -513,20 +613,51 @@ func nilIfEmpty(s string) any {
 }
 
 func (c *Core) remoteStatus() map[string]any {
-	s := c.Settings()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.settings
+	urls := []string{}
+	if s.RemoteEnabled {
+		urls = c.listenURLs
+	}
+	address := ""
+	var listenError any
+	if c.listenAddress != nil {
+		address = c.listenAddress()
+		host, _, _ := net.SplitHostPort(address)
+		if s.RemoteEnabled && net.ParseIP(host).IsLoopback() {
+			urls = []string{}
+			listenError = "启动参数 --addr 限定了本机监听，请修改启动参数后重启服务"
+		}
+	}
 	return map[string]any{
-		"enabled":   true,
+		"address":   address,
+		"enabled":   s.RemoteEnabled,
 		"listening": true,
 		"port":      c.listenPort,
-		"urls":      c.listenURLs,
+		"urls":      urls,
 		"username":  s.RemoteUsername,
-		"error":     nil,
+		"error":     listenError,
 	}
 }
 
 func (c *Core) SetListen(port int, urls []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.listenPort = port
 	c.listenURLs = urls
+}
+
+func (c *Core) SetRemoteSwitch(switcher func(bool) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.remoteSwitch = switcher
+}
+
+func (c *Core) SetListenAddress(provider func() string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listenAddress = provider
 }
 
 func (c *Core) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -535,7 +666,7 @@ func (c *Core) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "无效设置"})
 		return
 	}
-	next, err := c.UpdateSettings(s)
+	next, err := c.UpdateSettingsAndResume(s)
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
@@ -548,7 +679,10 @@ func (c *Core) handleExport(w http.ResponseWriter, r *http.Request) {
 		Path  string          `json:"path"`
 		Parts map[string]bool `json:"parts"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	n, err := c.ExportConfig(body.Path, body.Parts)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
@@ -561,7 +695,10 @@ func (c *Core) handleInspect(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path string `json:"path"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	writeJSON(w, 200, c.InspectConfig(body.Path))
 }
 
@@ -597,7 +734,10 @@ func (c *Core) handleApply(w http.ResponseWriter, r *http.Request) {
 		KeepLocalPaths bool            `json:"keepLocalPaths"`
 		ChannelIDs     []string        `json:"channelIds"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	doc, err := c.ApplyConfig(body.Path, body.Parts, body.KeepLocalPaths, body.ChannelIDs)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
@@ -636,7 +776,10 @@ func (c *Core) handleRecordStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID string `json:"id"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	st, err := c.StartRecord(body.ID, "manual")
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "state": c.stateByID(body.ID)})
@@ -649,7 +792,10 @@ func (c *Core) handleRecordStop(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID string `json:"id"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	if err := c.StopRecord(body.ID, true); err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -659,10 +805,17 @@ func (c *Core) handleRecordStop(w http.ResponseWriter, r *http.Request) {
 
 func (c *Core) handleGroupRecord(w http.ResponseWriter, r *http.Request, start bool) {
 	var body struct {
-		Group string `json:"group"`
+		Group *string `json:"group"`
 	}
-	_ = readJSON(r, &body)
-	name := normalizeGroupName(body.Group)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
+	if body.Group == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "缺少分组"})
+		return
+	}
+	name := normalizeGroupName(*body.Group)
 	var errors []string
 	started := 0
 	total := 0
@@ -703,21 +856,29 @@ func (c *Core) stateByID(id string) runtimeState {
 
 func (c *Core) handlePrepare(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Prefetch  bool   `json:"prefetch"`
+		H264      bool   `json:"h264"`
 		ChannelID string `json:"channelId"`
 		FileName  string `json:"fileName"`
 		Kind      string `json:"kind"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	kind := body.Kind
 	if kind == "" {
 		kind = "recordings"
 	}
-	path, err := c.EnsurePlayable(kind, body.ChannelID, body.FileName)
+	path, err := c.prepareSharedCodec(r.Context(), kind, body.ChannelID, body.FileName, body.Prefetch, body.H264)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	url := "/media/play/" + kind + "/" + body.ChannelID + "/" + body.FileName
+	if samePath(filepath.Dir(path), c.playCacheDir()) {
+		url = "/media/cache/" + filepath.Base(path)
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "url": url, "fileName": filepath.Base(path), "cached": true})
 }
 
@@ -726,7 +887,10 @@ func (c *Core) handleSaveRecent(w http.ResponseWriter, r *http.Request) {
 		ChannelID   string `json:"channelId"`
 		DurationSec int    `json:"durationSec"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	n, msg, clips, err := c.SaveRecent(body.ChannelID, body.DurationSec)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
@@ -745,8 +909,11 @@ func (c *Core) handleExportClip(w http.ResponseWriter, r *http.Request) {
 		EndMs     int64  `json:"endMs"`
 		DestPath  string `json:"destPath"`
 	}
-	_ = readJSON(r, &body)
-	path, n, err := c.ExportRange(body.ChannelID, body.StartMs, body.EndMs, body.DestPath)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
+	path, n, err := c.ExportRangeContext(r.Context(), body.ChannelID, body.StartMs, body.EndMs, body.DestPath)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -765,9 +932,16 @@ func (c *Core) handleScan(w http.ResponseWriter, r *http.Request) {
 		Password          string `json:"password"`
 		PreferredPresetID string `json:"preferredPresetId"`
 	}
-	_ = readJSON(r, &body)
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
+		return
+	}
 	start := time.Now()
-	cams, hosts, err := c.Scan(body.Mode, body.CIDR, body.Username, body.Password, body.PreferredPresetID)
+	cams, hosts, err := c.ScanContext(r.Context(), body.Mode, body.CIDR, body.Username, body.Password, body.PreferredPresetID)
+	if errors.Is(err, context.Canceled) {
+		writeJSON(w, 200, map[string]any{"ok": false, "canceled": true})
+		return
+	}
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -782,6 +956,17 @@ func (c *Core) handleMedia(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/media/")
 	parts := strings.Split(rest, "/")
 	w.Header().Set("Cache-Control", "no-store")
+	if len(parts) == 2 && parts[0] == "cache" && filepath.Base(parts[1]) == parts[1] && !strings.Contains(parts[1], "..") && strings.HasSuffix(parts[1], ".mp4") && !strings.HasPrefix(parts[1], ".") {
+		p := filepath.Join(c.playCacheDir(), parts[1])
+		release, err := c.media.leases.acquireContext(r.Context(), p)
+		if err != nil {
+			http.Error(w, "读取已取消", http.StatusRequestTimeout)
+			return
+		}
+		defer release()
+		serveFile(w, r, p)
+		return
+	}
 	if len(parts) >= 3 && parts[0] == "live" {
 		name := strings.Join(parts[2:], "/")
 		if name == "live.ts" {
@@ -801,16 +986,31 @@ func (c *Core) handleMedia(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		release, err := c.media.leases.acquireContext(r.Context(), p)
+		if err != nil {
+			http.Error(w, "读取已取消", http.StatusRequestTimeout)
+			return
+		}
+		defer release()
+		if r.URL.Query().Get("download") == "1" {
+			w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(p)}))
+		}
 		serveFile(w, r, p)
 		return
 	}
 	if len(parts) >= 4 && parts[0] == "play" {
-		p, err := c.EnsurePlayable(parts[1], parts[2], parts[3])
+		p, err := c.EnsurePlayableContext(r.Context(), parts[1], parts[2], parts[3])
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "video/mp4")
+		release, err := c.media.leases.acquireContext(r.Context(), p)
+		if err != nil {
+			http.Error(w, "读取已取消", http.StatusRequestTimeout)
+			return
+		}
+		defer release()
 		serveFile(w, r, p)
 		return
 	}
@@ -926,8 +1126,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func readJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
-	return dec.Decode(v)
+	body, err := io.ReadAll(io.LimitReader(r.Body, (8<<20)+1))
+	if err != nil {
+		return err
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(body) > 8<<20 || len(trimmed) == 0 || trimmed[0] != '{' {
+		return errors.New("请求必须是大小不超过 8 MiB 的 JSON 对象")
+	}
+	return json.Unmarshal(trimmed, v)
 }
 
 func ListenAddr(host string, port int) string {
