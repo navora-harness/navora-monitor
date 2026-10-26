@@ -15,7 +15,7 @@
 
 ## 准备
 
-1. Node.js ≥ 20  
+1. Node.js ≥ 20、Go ≥ 1.21（以 `server/go.mod` 为准）
 2. 拉取对应平台的内置 FFmpeg（**二进制不入库**，需本机下载）：
 
 ```bash
@@ -32,6 +32,7 @@ npm run ffmpeg:fetch:all
 ```bash
 npm install
 npm test
+npm run build        # 首次启动后端前生成内嵌网页；修改前端后也需重新构建
 npm run dev          # Vite 前端 http://127.0.0.1:5188
 npm run dev:server   # Go 后端（另开终端）
 ```
@@ -44,6 +45,38 @@ cp portable/channels.example.json portable/channels.json     # Linux
 ```
 
 **不要**把含真实 RTSP 密码的 `channels.json` / `settings.json` 提交到仓库。
+
+## 代码目录与验证
+
+- `src/`：Vue 界面、播放器控制器与远程访问入口。
+- `shared/`：前后端数据类型、时间轴算法和前端单元测试。
+- `server/cmd/navora/`：Go 启动入口、日志、数据目录锁和 Windows 服务。
+- `server/internal/core/`：设备配置、预览、录像、回放、存储与 HTTP/WebSocket 接口。
+- `scripts/`、`build/`：构建、部署、诊断和安装包资源。
+- `docs/`：功能说明、优化记录、审查计划与 Windows 安装更新指南。
+
+提交前执行：
+
+```bash
+npm test
+npm run build
+go -C server test ./...
+go -C server vet ./...
+```
+
+Windows 上可追加 `npm run test:browser`（需要默认路径的 Edge 与
+`vendor/ffmpeg/win-x64/ffmpeg.exe`），以及
+`powershell -NoProfile -File scripts/test-windows-deploy.ps1`。
+浏览器回归使用独立的 `.navora-dev-data/smoke-*` 目录；部署脚本测试使用
+`.navora-dev-data/deploy-test-*`，不修改系统防火墙。
+`node scripts/performance-smoke.mjs` 测量合成时间轴元数据，报告写入 `release/`。
+
+`dist/`、`dist-go/`、`release/` 与 `server/internal/webui/files/` 下的网页均为生成文件，
+不提交到仓库。内嵌网页目录仅保留 `.gitkeep`；新检出项目需先运行 `npm run build`，
+再启动或编译 Go 服务。打包脚本会自动执行网页构建。
+停止相关测试进程后，可删除 `.navora-dev-data/` 下的 `smoke-*`、`release-*` 和
+`deploy-test-*` 测试目录。`portable/`、现场诊断资料、`_recycle/` 中的旧源码备份
+与本地 FFmpeg 不应作为构建垃圾批量删除。
 
 ## 打包（Go + Vue）
 
@@ -71,11 +104,11 @@ cp portable/channels.example.json portable/channels.json     # Linux
 **打标签发布**（版本号三处一致：`package.json`、`version.go`、标签 `vX.Y.Z`）：
 
 ```bash
-# 例如当前版本 0.3.38（已在 main）
+# 例如发布 0.4.4（先确认对应代码已在 main）
 git checkout main
 git pull
-git tag v0.3.38
-git push origin v0.3.38
+git tag v0.4.4
+git push origin v0.4.4
 ```
 
 也可在 GitHub → Actions → **Release** → **Run workflow**（仅 `main`）手动跑一遍。

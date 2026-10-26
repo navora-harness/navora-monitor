@@ -36,5 +36,18 @@ Thumbs.db
 
 .navora-dev-data/
 
-# Vite output staged into the Go embed tree
-server/internal/webui/files/assets/
+# Vite output staged into the Go embed tree (keep an embed target in fresh clones)
+server/internal/webui/files/*
+!server/internal/webui/files/.gitkeep
+
+# Temporary files, coverage reports and TypeScript incremental caches
+*.tmp
+*.temp
+*.bak
+*.tsbuildinfo
+coverage/
+.vite/
+
+# Companion media metadata probes
+vendor/ffmpeg/**/ffprobe
+vendor/ffmpeg/**/ffprobe.exe
