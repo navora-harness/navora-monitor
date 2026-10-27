@@ -401,16 +401,29 @@ func (p *previewMgr) start(id string) error {
 	if ch.PreviewURL != "" {
 		input = ch.PreviewURL
 	}
+	var lease *ingestLease
+	if p.c.ingest != nil {
+		// Shared mode always uses the recording source, including for low-res preview.
+		var err error
+		lease, err = p.c.ingest.acquire(ch)
+		if err != nil {
+			return failReserve(err)
+		}
+		input = lease.URL
+	}
 	args := buildMpegtsPreviewArgs(input, ch.RtspTransport, h264)
 	cmd := exec.Command(bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		lease.Close()
 		return failReserve(err)
 	}
 	prepareMediaChild(cmd)
 	eb := tailBuf(4096)
 	cmd.Stderr = eb
 	if err := cmd.Start(); err != nil {
+		stdout.Close()
+		lease.Close()
 		return failReserve(err)
 	}
 	trackMediaChild(cmd)
@@ -420,6 +433,7 @@ func (p *previewMgr) start(id string) error {
 		p.mu.Unlock()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		lease.Close()
 		pipe.close()
 		return nil
 	}
@@ -429,6 +443,7 @@ func (p *previewMgr) start(id string) error {
 	go func() {
 		defer func() {
 			_ = cmd.Wait()
+			lease.Close()
 			p.mu.Lock()
 			if s := p.sess[id]; s != nil && s.cmd == cmd {
 				s.exited = true

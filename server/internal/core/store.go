@@ -131,9 +131,10 @@ type Core struct {
 	events            *broker
 	ws                *wsHub
 
-	rec   *recorder
-	prev  *previewMgr
-	media *mediaKit
+	rec    *recorder
+	prev   *previewMgr
+	media  *mediaKit
+	ingest *ingestMgr
 
 	scheduleHold map[string]bool
 	// Manual recordings to resume after process/service restart (persisted).
@@ -196,6 +197,10 @@ func Open(root string) (*Core, error) {
 	c.prev = newPreview(c)
 	c.media = newMedia(c)
 	c.initShutdown()
+	// v1 rollout is opt-in until real-camera continuity and bandwidth checks pass.
+	if os.Getenv("NAVORA_MONITOR_SHARED_INGEST") == "1" {
+		c.ingest = newIngest(c)
+	}
 	return c, nil
 }
 

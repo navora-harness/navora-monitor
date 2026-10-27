@@ -39,6 +39,7 @@ func (c *Core) StopAllMedia() {
 		}
 	}
 	c.prev.stopAll()
+	c.ingest.stopAll()
 }
 
 func (p *previewMgr) stopAll() {

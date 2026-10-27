@@ -275,7 +275,14 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 		}
 	}
 	r.mu.Unlock()
-	if r.claimExternal(ch, reason) {
+	if r.c.ingest != nil {
+		for _, pid := range r.c.recordingFfmpegByChannel()[ch.ID] {
+			if processAlive(pid) {
+				return errStr("检测到已有录像进程，请先停止旧录像再启用统一取流")
+			}
+		}
+	}
+	if r.c.ingest == nil && r.claimExternal(ch, reason) {
 		return nil
 	}
 
@@ -290,13 +297,24 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 	if seg < 10 {
 		seg = 300
 	}
-	args := buildSegmentRecordArgs(ch.URL, pattern, ch.Name, ch.RtspTransport, seg)
+	input := ch.URL
+	var lease *ingestLease
+	if r.c.ingest != nil {
+		var err error
+		lease, err = r.c.ingest.acquire(ch)
+		if err != nil {
+			return err
+		}
+		input = lease.URL
+	}
+	args := buildSegmentRecordArgs(input, pattern, ch.Name, ch.RtspTransport, seg)
 	cmd := exec.Command(bin, args...)
 	prepareMediaChild(cmd)
 	eb := tailBuf(4096)
 	cmd.Stderr = eb
 	cmd.Stdout = nil
 	if err := cmd.Start(); err != nil {
+		lease.Close()
 		return err
 	}
 	trackMediaChild(cmd)
@@ -306,6 +324,7 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 	r.mu.Unlock()
 	go func() {
 		err := cmd.Wait()
+		lease.Close()
 		r.mu.Lock()
 		session.exited = true
 		if cmd.ProcessState != nil {
@@ -789,7 +808,9 @@ func (c *Core) resumeRemembered() int {
 // Each lane is serial within itself, but file moves and cleanup cannot block
 // schedule evaluation, session expiration, preview health or timeline pushes.
 func (c *Core) RunLoops() {
-	c.rec.adoptAll()
+	if c.ingest == nil {
+		c.rec.adoptAll()
+	}
 	c.resumeRemembered()
 	var lanes sync.WaitGroup
 	every := func(period time.Duration, fn func()) {

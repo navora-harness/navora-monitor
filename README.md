@@ -2,6 +2,9 @@
 
 局域网 CCTV 预览 / 录像 / 回放（Go 服务 + Vue + FFmpeg）。
 
+v1 分支正在开发录像与预览共用摄像头输入的框架，开发开关、架构和验收计划见
+[`docs/v1-shared-ingest.md`](./docs/v1-shared-ingest.md)。默认链路暂不切换。
+
 ## 功能概览
 
 - 设备树、多画面宫格、通道属性、回放时间轴
