@@ -3,11 +3,54 @@
 package core
 
 import (
+	"golang.org/x/sys/windows"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func TestWindowsProcessAliveHelper(t *testing.T) {
+	if os.Getenv("NAVORA_TEST_PROCESS_WAIT") != "1" {
+		return
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	os.Exit(0)
+}
+
+func TestWindowsExitedProcessWithOpenHandleIsNotAlive(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestWindowsProcessAliveHelper$")
+	cmd.Env = append(os.Environ(), "NAVORA_TEST_PROCESS_WAIT=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); cmd.Process.Kill(); cmd.Wait() }()
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(h)
+	if !processAlive(cmd.Process.Pid) {
+		t.Fatal("running process was reported dead")
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	// Retain h so the terminated kernel process object still exists.
+	if processAlive(cmd.Process.Pid) {
+		t.Fatal("terminated process with a retained handle was reported alive")
+	}
+}
 
 func TestWindowsProcessScanPreservesQuotedUnicodeOutput(t *testing.T) {
 	c := isolatedCore(t)

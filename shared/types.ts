@@ -51,6 +51,14 @@ export type ChannelRuntimeState = {
   preview: PreviewStatus
   previewUrl: string | null
   previewError: string | null
+  ingest?: {
+    state: 'idle' | 'starting' | 'live' | 'reconnecting'
+    consumers: number
+    receivedBytes: number
+    starts: number
+    retryAt?: number
+    lastError?: string
+  }
 }
 
 export type RecordingSegment = {

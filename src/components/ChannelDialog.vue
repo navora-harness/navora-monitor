@@ -136,6 +136,10 @@ const canSave = computed(() => {
 const statusLine = computed(() => {
   if (props.isNew || !props.state) return ''
   const parts = [`录像 ${props.state.recording}`, `预览 ${props.state.preview}`]
+  if (props.state.ingest) {
+    const labels = { idle: '空闲', starting: '连接中', live: '已连接', reconnecting: '正在重连' }
+    parts.push(`统一取流：${labels[props.state.ingest.state]}`)
+  }
   if (props.state.lastError) parts.push(`错误：${props.state.lastError.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/g, '$1')}`)
   else if (props.state.previewError) parts.push(`预览：${props.state.previewError}`)
   return parts.join(' · ')
@@ -294,7 +298,7 @@ onUnmounted(() => popEscape?.())
               <textarea v-model="draft.url" rows="3" spellcheck="false" />
             </label>
             <label>
-              <span>预览 URL（可选，建议子码流）</span>
+              <span>{{ state?.ingest ? '预览 URL（统一取流时不使用）' : '预览 URL（可选，建议子码流）' }}</span>
               <textarea
                 v-model="draft.previewUrl"
                 rows="2"

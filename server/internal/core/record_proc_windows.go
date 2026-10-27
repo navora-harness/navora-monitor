@@ -23,12 +23,15 @@ func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	h, _, _ := openProcess.Call(0x1000, 0, uintptr(pid))
-	if h == 0 {
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+	if err != nil {
 		return false
 	}
-	_, _, _ = closeHandle.Call(h)
-	return true
+	defer windows.CloseHandle(h)
+	// An exited process can still be opened while another process or job keeps
+	// a handle to it. Only an unsignalled process handle means it is running.
+	state, err := windows.WaitForSingleObject(h, 0)
+	return err == nil && state == uint32(windows.WAIT_TIMEOUT)
 }
 
 func scanRecordingFfmpeg() []recordingProcess {

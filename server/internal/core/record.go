@@ -116,15 +116,16 @@ func recordingOutput(args []string) string {
 }
 
 type runtimeState struct {
-	ID           string  `json:"id"`
-	Recording    string  `json:"recording"`
-	Pid          *int    `json:"pid"`
-	LastError    *string `json:"lastError"`
-	OutputDir    *string `json:"outputDir"`
-	StartedAt    *string `json:"startedAt"`
-	Preview      string  `json:"preview"`
-	PreviewURL   *string `json:"previewUrl"`
-	PreviewError *string `json:"previewError"`
+	ID           string        `json:"id"`
+	Recording    string        `json:"recording"`
+	Pid          *int          `json:"pid"`
+	LastError    *string       `json:"lastError"`
+	OutputDir    *string       `json:"outputDir"`
+	StartedAt    *string       `json:"startedAt"`
+	Preview      string        `json:"preview"`
+	PreviewURL   *string       `json:"previewUrl"`
+	PreviewError *string       `json:"previewError"`
+	Ingest       *ingestStatus `json:"ingest,omitempty"`
 }
 
 func (r *recorder) state(id string) (recording string, pid *int, last *string, dir *string, started *string) {
@@ -194,6 +195,7 @@ func (c *Core) States() []runtimeState {
 			Preview:      prev,
 			PreviewURL:   pURL,
 			PreviewError: pErr,
+			Ingest:       c.ingest.status(ch.ID),
 		})
 	}
 	return out
@@ -269,7 +271,7 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 	}
 	r.mu.Lock()
 	if s := r.sess[ch.ID]; s != nil {
-		if p := s.process(); p != nil && processAlive(p.Pid) {
+		if p := s.process(); p != nil && !s.exited && processAlive(p.Pid) {
 			r.mu.Unlock()
 			return nil
 		}
@@ -308,6 +310,9 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 		input = lease.URL
 	}
 	args := buildSegmentRecordArgs(input, pattern, ch.Name, ch.RtspTransport, seg)
+	if lease != nil {
+		args = sharedConsumerArgs(args)
+	}
 	cmd := exec.Command(bin, args...)
 	prepareMediaChild(cmd)
 	eb := tailBuf(4096)
@@ -587,9 +592,16 @@ func stringsHasSuffixFold(s, suf string) bool {
 func (c *Core) applySchedule() {
 	now := time.Now()
 	channels := c.Channels()
-	for _, ch := range channels {
-		active := ch.Enabled && isScheduleActive(ch.Schedule, now)
+	for _, candidate := range channels {
+		c.rec.opMu.Lock()
 		c.mu.Lock()
+		ch, exists := c.channelByID(candidate.ID)
+		if !exists {
+			c.mu.Unlock()
+			c.rec.opMu.Unlock()
+			continue
+		}
+		active := ch.Enabled && isScheduleActive(ch.Schedule, now)
 		held := c.scheduleHold[ch.ID]
 		if !active {
 			delete(c.scheduleHold, ch.ID)
@@ -598,7 +610,7 @@ func (c *Core) applySchedule() {
 		c.mu.Unlock()
 		running := c.rec.running(ch.ID)
 		if active && !running && !held {
-			_, _ = c.StartRecord(ch.ID, "schedule")
+			_ = c.rec.startLocked(ch, "schedule")
 		}
 		if !active && running {
 			c.rec.mu.Lock()
@@ -609,9 +621,10 @@ func (c *Core) applySchedule() {
 			}
 			c.rec.mu.Unlock()
 			if reason == "schedule" {
-				_ = c.StopRecord(ch.ID, false)
+				c.rec.stopLocked(ch.ID)
 			}
 		}
+		c.rec.opMu.Unlock()
 	}
 }
 
@@ -781,17 +794,32 @@ func (c *Core) resumeRemembered() int {
 			drop = append(drop, id)
 			continue
 		}
+		// Serialize demand validation with explicit stop. A stale snapshot of
+		// remembered ids must not restart a recording the user just stopped.
+		c.rec.opMu.Lock()
 		c.mu.Lock()
 		ch, ok := c.channelByID(id)
+		wanted := c.remembered[id]
 		c.mu.Unlock()
-		if !ok || !ch.Enabled {
+		if !ok || !ch.Enabled || !wanted {
+			c.rec.opMu.Unlock()
 			continue
 		}
 		if c.rec.running(id) {
+			c.rec.opMu.Unlock()
 			continue
 		}
-		if _, err := c.StartRecord(id, "manual"); err != nil {
-			log.Printf("resume recording %s: %v", id, err)
+		err := c.rec.startLocked(ch, "manual")
+		if err == nil {
+			c.mu.Lock()
+			delete(c.scheduleHold, id)
+			c.mu.Unlock()
+		}
+		c.rec.opMu.Unlock()
+		if err != nil {
+			if _, waiting := err.(*ingestRetryError); !waiting {
+				log.Printf("resume recording %s: %v", id, err)
+			}
 			continue
 		}
 		started++
@@ -830,11 +858,22 @@ func (c *Core) RunLoops() {
 		}()
 	}
 	every(2*time.Second, c.rec.flushAll)
-	every(5*time.Second, func() { c.gcSessions(); c.prev.reconcile() })
-	every(15*time.Second, c.applySchedule)
+	every(5*time.Second, c.gcSessions)
+	if c.ingest != nil {
+		every(time.Second, c.recoverSharedMedia)
+	} else {
+		every(5*time.Second, c.prev.reconcile)
+		every(15*time.Second, c.applySchedule)
+	}
 	every(2*time.Second, c.pushStates)
 	every(2*time.Second, c.pushTimelines)
-	every(30*time.Second, func() { c.resumeRemembered(); c.rec.recycle(); c.prev.recycle() })
+	every(30*time.Second, func() {
+		if c.ingest == nil {
+			c.resumeRemembered()
+		}
+		c.rec.recycle()
+		c.prev.recycle()
+	})
 	every(30*time.Second, c.maybeCleanup)
 	every(5*time.Second, c.reconcileMediaMetadata)
 	every(5*time.Second, func() {

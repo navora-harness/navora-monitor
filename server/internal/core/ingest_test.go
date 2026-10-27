@@ -237,9 +237,18 @@ func TestSharedIngestReplacesFailedProducer(t *testing.T) {
 		t.Fatal("failed producer was not reaped")
 	}
 	second, err := m.acquire(ch)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		second.Close()
+		t.Fatal("failed producer was retried without backoff")
 	}
+	status := m.status(ch.ID)
+	if status.State != "reconnecting" || status.Starts != 1 || status.RetryAt == 0 {
+		t.Fatalf("missing recovery status: %+v", status)
+	}
+	waitIngest(t, "replacement could not be acquired after backoff", func() bool {
+		second, err = m.acquire(ch)
+		return err == nil
+	})
 	defer second.Close()
 	third, err := m.acquire(ch)
 	if err != nil {
@@ -257,6 +266,21 @@ func TestSharedIngestReplacesFailedProducer(t *testing.T) {
 	m.mu.Unlock()
 	if refs != 2 {
 		t.Fatalf("stale release changed replacement references: %d", refs)
+	}
+}
+
+func TestIngestRetryBudgetGrowsAndCaps(t *testing.T) {
+	m := newIngest(nil)
+	h := &ingestHistory{}
+	now := time.Now()
+	for i, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second} {
+		m.failed(h, now, "rtsp://user:secret@camera/main")
+		if got := h.retryAt.Sub(now); got != want {
+			t.Fatalf("attempt %d: delay %s, want %s", i, got, want)
+		}
+		if strings.Contains(h.lastError, "secret") {
+			t.Fatal("credentials leaked in retry status")
+		}
 	}
 }
 

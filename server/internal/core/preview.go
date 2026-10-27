@@ -25,6 +25,8 @@ type liveClient struct {
 	once       sync.Once
 	queue      chan []byte
 	writerDone chan struct{}
+	// waiting is guarded by livePipe.mu; ingest clients wait for a random-access point.
+	waiting bool
 }
 
 // Each HTTP viewer has a bounded ordered queue. Network writes never hold up
@@ -118,6 +120,7 @@ type livePipe struct {
 	pre    [][]byte
 	preN   int
 	closed bool
+	join   *tsJoinCache
 }
 
 func newLivePipe() *livePipe {
@@ -125,27 +128,46 @@ func newLivePipe() *livePipe {
 }
 
 func (l *livePipe) publish(chunk []byte) {
-	b := append([]byte(nil), chunk...)
+	var b []byte
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
 		return
 	}
-	l.pre = append(l.pre, b)
-	l.preN += len(b)
-	for l.preN > livePreambleMax && len(l.pre) > 1 {
-		l.preN -= len(l.pre[0])
-		l.pre = l.pre[1:]
+	joinAt := -1
+	var headers []byte
+	if l.join != nil {
+		b, joinAt, headers = l.join.feed(chunk)
+	} else {
+		b = append([]byte(nil), chunk...)
+		l.pre = append(l.pre, b)
+		l.preN += len(b)
+		for l.preN > livePreambleMax && len(l.pre) > 1 {
+			l.preN -= len(l.pre[0])
+			l.pre = l.pre[1:]
+		}
 	}
-	clients := make([]*liveClient, 0, len(l.subs))
+	type delivery struct {
+		client *liveClient
+		data   []byte
+	}
+	clients := make([]delivery, 0, len(l.subs))
 	for c := range l.subs {
-		clients = append(clients, c)
+		if c.waiting {
+			if joinAt < 0 {
+				continue
+			}
+			c.waiting = false
+			clients = append(clients, delivery{c, headers}, delivery{c, b[joinAt:]})
+		} else if len(b) > 0 {
+			clients = append(clients, delivery{c, b})
+		}
 	}
 	l.mu.Unlock()
 	var dead []*liveClient
-	for _, c := range clients {
-		if !c.enqueue(b) {
-			dead = append(dead, c)
+	for _, d := range clients {
+		if !d.client.enqueue(d.data) {
+			dead = append(dead, d.client)
 		}
 	}
 	if len(dead) == 0 {
@@ -168,12 +190,20 @@ func (l *livePipe) subscribe(c *liveClient) ([][]byte, bool) {
 		return nil, false
 	}
 	l.subs[c] = struct{}{}
+	if l.join != nil {
+		pre := l.join.snapshot()
+		c.waiting = len(pre) == 0
+		return pre, true
+	}
 	return append([][]byte(nil), l.pre...), true
 }
 
 func (l *livePipe) preamble() [][]byte {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.join != nil {
+		return l.join.snapshot()
+	}
 	return append([][]byte(nil), l.pre...)
 }
 
@@ -370,6 +400,9 @@ func (p *previewMgr) start(id string) error {
 		}
 	}
 	pipe := newLivePipe()
+	if p.c.ingest != nil {
+		pipe.join = &tsJoinCache{}
+	}
 	h264 := p.c.previewH264()
 	p.sess[id] = &prevSession{started: time.Now(), lastHit: time.Now(), starting: true, live: pipe, h264: h264}
 	p.mu.Unlock()
@@ -412,6 +445,10 @@ func (p *previewMgr) start(id string) error {
 		input = lease.URL
 	}
 	args := buildMpegtsPreviewArgs(input, ch.RtspTransport, h264)
+	if lease != nil {
+		args = sharedConsumerArgs(args)
+		args = append(args[:len(args)-1], "-mpegts_start_pid", "256", "-mpegts_pmt_start_pid", "4096", "-bsf:v", "dump_extra=freq=keyframe", "pipe:1")
+	}
 	cmd := exec.Command(bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
