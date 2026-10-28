@@ -417,7 +417,7 @@ func (c *Core) route(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "无效请求"})
 			return
 		}
-		ok, ms, msg := c.Probe(body.ID)
+		ok, ms, msg := c.ProbeContext(r.Context(), body.ID)
 		if ok {
 			writeJSON(w, 200, map[string]any{"ok": true, "latencyMs": ms, "summary": msg})
 		} else {

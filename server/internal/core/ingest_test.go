@@ -284,14 +284,71 @@ func TestIngestRetryBudgetGrowsAndCaps(t *testing.T) {
 	}
 }
 
-func TestIngestArgsPreserveOriginalAudioAndVideo(t *testing.T) {
+func TestIngestArgsPreserveVideoAndNormalizeAudio(t *testing.T) {
 	args := strings.Join(buildIngestArgs("rtsp://camera/main", "tcp"), " ")
-	for _, want := range []string{"-rtsp_transport tcp", "-map 0:v:0", "-map 0:a:0?", "-c copy", "-f mpegts"} {
+	for _, want := range []string{"-rtsp_transport tcp", "-map 0:v:0", "-map 0:a:0?", "-c:v copy", "-c:a aac", "-f mpegts"} {
 		if !strings.Contains(args, want) {
 			t.Fatal("missing", want, "in", args)
 		}
 	}
 	if strings.Contains(args, "-an ") || strings.Contains(args, "libx264") || strings.Contains(args, "nobuffer") {
 		t.Fatal("shared input must not discard audio, transcode or drop probe packets", args)
+	}
+}
+
+func TestSharedIngestMultipleViewersAndProbeShareCamera(t *testing.T) {
+	bin := ingestFFmpeg(t)
+	url, requests := ingestCamera(t, bin)
+	c := isolatedCore(t)
+	c.settings.FFmpegPath = bin
+	c.ingest = newIngest(c)
+	t.Cleanup(c.StopAllMedia)
+	c.channels = []Channel{{ID: "test", Name: "viewers", URL: url, Enabled: true}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if ok, _, _ := c.ProbeContext(ctx, "test"); ok || requests.Load() != 0 {
+		t.Fatal("cancelled probe opened camera")
+	}
+	c.sessions["watcher"] = &Session{Expires: time.Now().Add(time.Hour), Previews: map[string]time.Time{"test": time.Now()}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { c.prev.serveStream(w, r, "test") }))
+	defer server.Close()
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if _, err := io.CopyN(io.Discard, response.Body, 188*10); err != nil {
+			t.Fatal("viewer did not receive media", err)
+		}
+	}
+	if ok, _, msg := c.Probe("test"); !ok {
+		t.Fatal("shared probe failed", msg)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("three viewers and probe opened camera %d times", requests.Load())
+	}
+	status := c.ingest.status("test")
+	if status.Consumers != 1 || status.Starts != 1 {
+		t.Fatalf("probe leaked input lease: %+v", status)
+	}
+}
+
+func TestV1SharedIngestDefaultAndRollback(t *testing.T) {
+	for _, value := range []string{"", "0", "1"} {
+		t.Run("env="+value, func(t *testing.T) {
+			t.Setenv("NAVORA_MONITOR_SHARED_INGEST", value)
+			c, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.StopAllMedia()
+			if (c.ingest != nil) != (value != "0") {
+				t.Fatal("incorrect v1 default or rollback")
+			}
+		})
 	}
 }

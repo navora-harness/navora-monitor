@@ -2,8 +2,10 @@
 
 局域网 CCTV 预览 / 录像 / 回放（Go 服务 + Vue + FFmpeg）。
 
-v1 分支正在开发录像与预览共用摄像头输入的框架，开发开关、架构和验收计划见
-[`docs/v1-shared-ingest.md`](./docs/v1-shared-ingest.md)。默认链路暂不切换。
+v1 测试版 `1.0.0-beta.1` 默认让录像、实时预览和连接测试共用每通道一个摄像头输入。
+视频保留原编码，音频统一转换为 AAC；预览不再单独读取摄像头子码流。
+架构、验证结果、运行方式和旧链路兼容开关见
+[`docs/v1-shared-ingest.md`](./docs/v1-shared-ingest.md)。
 
 ## 功能概览
 

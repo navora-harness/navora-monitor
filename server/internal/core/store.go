@@ -197,8 +197,9 @@ func Open(root string) (*Core, error) {
 	c.prev = newPreview(c)
 	c.media = newMedia(c)
 	c.initShutdown()
-	// v1 rollout is opt-in until real-camera continuity and bandwidth checks pass.
-	if os.Getenv("NAVORA_MONITOR_SHARED_INGEST") == "1" {
+	// v1 defaults to a single input. The old pipeline remains an explicit
+	// rollback for deployments whose camera compatibility is still being tested.
+	if os.Getenv("NAVORA_MONITOR_SHARED_INGEST") != "0" {
 		c.ingest = newIngest(c)
 	}
 	return c, nil

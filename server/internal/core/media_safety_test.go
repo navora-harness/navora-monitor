@@ -22,6 +22,9 @@ func isolatedCore(t *testing.T) *Core {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Most historical media tests exercise file processing/legacy consumers.
+	// Shared-ingest tests explicitly create and clean up their input manager.
+	c.ingest = nil
 	c.settings.RecordingsPath = filepath.Join(root, "recordings")
 	c.settings.SavedClipsPath = filepath.Join(root, "saved")
 	c.settings.SnapshotsPath = filepath.Join(root, "snapshots")

@@ -51,6 +51,7 @@ export type ChannelRuntimeState = {
   preview: PreviewStatus
   previewUrl: string | null
   previewError: string | null
+  previewProcessing?: 'copy' | 'transcode'
   ingest?: {
     state: 'idle' | 'starting' | 'live' | 'reconnecting'
     consumers: number

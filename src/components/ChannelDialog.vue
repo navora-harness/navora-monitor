@@ -139,6 +139,7 @@ const statusLine = computed(() => {
   if (props.state.ingest) {
     const labels = { idle: '空闲', starting: '连接中', live: '已连接', reconnecting: '正在重连' }
     parts.push(`统一取流：${labels[props.state.ingest.state]}`)
+    if (props.state.previewProcessing) parts.push(props.state.previewProcessing === 'transcode' ? '预览兼容转换中（额外计算）' : '预览直接转发')
   }
   if (props.state.lastError) parts.push(`错误：${props.state.lastError.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/g, '$1')}`)
   else if (props.state.previewError) parts.push(`预览：${props.state.previewError}`)

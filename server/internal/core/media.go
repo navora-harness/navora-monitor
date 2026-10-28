@@ -1356,29 +1356,57 @@ func (c *Core) SaveSnapshot(channelID, dataURL string) (string, error) {
 }
 
 func (c *Core) Probe(id string) (bool, int64, string) {
+	return c.ProbeContext(context.Background(), id)
+}
+
+func (c *Core) ProbeContext(parent context.Context, id string) (bool, int64, string) {
+	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
+	defer cancel()
+	if ctx.Err() != nil {
+		return false, 0, "探测已取消或超时"
+	}
 	c.mu.Lock()
 	ch, ok := c.channelByID(id)
 	c.mu.Unlock()
 	if !ok {
 		return false, 0, "通道不存在"
 	}
+	if !ch.Enabled {
+		return false, 0, "通道已停用"
+	}
 	bin := c.ffmpegPath()
 	if bin == "" {
 		return false, 0, "未找到 FFmpeg"
 	}
 	start := time.Now()
-	cmd := exec.Command(bin, buildProbeArgs(ch.URL, ch.RtspTransport)...)
-	hideWindow(cmd)
+	input := ch.URL
+	if c.ingest != nil {
+		lease, err := c.ingest.acquire(ch)
+		if err != nil {
+			return false, time.Since(start).Milliseconds(), redactSecrets(err.Error())
+		}
+		defer lease.Close()
+		input = lease.URL
+	}
+	cmd := exec.CommandContext(ctx, bin, buildProbeArgs(input, ch.RtspTransport)...)
+	prepareMediaChild(cmd)
 	eb := tailBuf(2048)
 	cmd.Stderr = eb
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		trackMediaChild(cmd)
+		err = cmd.Wait()
+	}
 	ms := time.Since(start).Milliseconds()
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ms, "探测已取消或超时"
+		}
 		msg := eb.String()
 		if msg == "" {
 			msg = "无法打开码流"
 		}
-		return false, ms, msg
+		return false, ms, redactSecrets(msg)
 	}
 	return true, ms, "连通，耗时 " + strconv.FormatInt(ms, 10) + " ms"
 }

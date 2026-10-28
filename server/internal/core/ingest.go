@@ -46,14 +46,21 @@ type ingestStatus struct {
 	LastError     string `json:"lastError,omitempty"`
 }
 
-type ingestRetryError struct{ after time.Time }
+type ingestRetryError struct {
+	after     time.Time
+	operation string
+}
 
 func (e *ingestRetryError) Error() string {
 	seconds := (time.Until(e.after) + time.Second - 1) / time.Second
 	if seconds < 0 {
 		seconds = 0
 	}
-	return fmt.Sprintf("输入流中断，%d 秒后重连", seconds)
+	operation := e.operation
+	if operation == "" {
+		operation = "输入流"
+	}
+	return fmt.Sprintf("%s中断，%d 秒后重试", operation, seconds)
 }
 
 type ingestSession struct {
@@ -230,7 +237,7 @@ func (m *ingestMgr) start(ch Channel, h *ingestHistory) (*ingestSession, error) 
 			s.lastError = "摄像头输入已断开"
 		}
 		s.shutdown()
-		log.Printf("ingest exit channel=%q error=%q detail=%q", ch.ID, err, redactSecrets(eb.String()))
+		log.Printf("ingest exit channel=%q error=%v detail=%q", ch.ID, err, redactSecrets(eb.String()))
 		close(s.done)
 	}()
 	go func() {
@@ -284,14 +291,19 @@ func (m *ingestMgr) harvest(s *ingestSession) {
 
 func (m *ingestMgr) failed(h *ingestHistory, ended time.Time, detail string) {
 	h.failures++
-	delay := m.retryBase
-	for i := 1; i < h.failures && delay < 30*time.Second; i++ {
+	delay := mediaRetryDelay(m.retryBase, h.failures)
+	h.retryAt, h.lastError = ended.Add(delay), redactSecrets(detail)
+}
+
+func mediaRetryDelay(base time.Duration, failures int) time.Duration {
+	delay := base
+	for i := 1; i < failures && delay < 30*time.Second; i++ {
 		delay *= 2
 	}
 	if delay > 30*time.Second {
 		delay = 30 * time.Second
 	}
-	h.retryAt, h.lastError = ended.Add(delay), redactSecrets(detail)
+	return delay
 }
 
 func (m *ingestMgr) status(id string) *ingestStatus {
@@ -386,8 +398,9 @@ func (m *ingestMgr) stopAll() {
 	}
 }
 
-// Build a lossless transport, preserving audio for recording. Preview can
-// discard audio or transcode video downstream without reopening the camera.
+// Preserve the original video. Normalize optional audio to AAC once, at the
+// shared input: G.711/PCM copied into TS becomes private data and can otherwise
+// disappear when downstream consumers demux it. No second camera probe is used.
 func buildIngestArgs(inputURL, transport string) []string {
 	// Do not use nobuffer on the shared input: packets consumed during probing
 	// are needed by the recorder too, including the initial keyframe.
@@ -398,5 +411,8 @@ func buildIngestArgs(inputURL, transport string) []string {
 		}
 		args = append(args, "-rtsp_transport", transport)
 	}
-	return append(args, "-i", inputURL, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:v", "dump_extra=freq=keyframe", "-f", "mpegts", "-mpegts_start_pid", "256", "-mpegts_pmt_start_pid", "4096", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1", "pipe:1")
+	if !strings.Contains(inputURL, "://") {
+		args = append(args, "-re")
+	}
+	return append(args, "-i", inputURL, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-bsf:v", "dump_extra=freq=keyframe", "-f", "mpegts", "-mpegts_start_pid", "256", "-mpegts_pmt_start_pid", "4096", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1", "pipe:1")
 }

@@ -19,6 +19,9 @@ type recSession struct {
 	exited   bool
 	exitText string
 	done     chan struct{}
+	stdin    io.WriteCloser
+	failures int
+	retryAt  time.Time
 	cmd      *exec.Cmd
 	ext      *os.Process // ffmpeg this process did not spawn
 	started  time.Time
@@ -116,16 +119,17 @@ func recordingOutput(args []string) string {
 }
 
 type runtimeState struct {
-	ID           string        `json:"id"`
-	Recording    string        `json:"recording"`
-	Pid          *int          `json:"pid"`
-	LastError    *string       `json:"lastError"`
-	OutputDir    *string       `json:"outputDir"`
-	StartedAt    *string       `json:"startedAt"`
-	Preview      string        `json:"preview"`
-	PreviewURL   *string       `json:"previewUrl"`
-	PreviewError *string       `json:"previewError"`
-	Ingest       *ingestStatus `json:"ingest,omitempty"`
+	ID                string        `json:"id"`
+	Recording         string        `json:"recording"`
+	Pid               *int          `json:"pid"`
+	LastError         *string       `json:"lastError"`
+	OutputDir         *string       `json:"outputDir"`
+	StartedAt         *string       `json:"startedAt"`
+	Preview           string        `json:"preview"`
+	PreviewURL        *string       `json:"previewUrl"`
+	PreviewError      *string       `json:"previewError"`
+	Ingest            *ingestStatus `json:"ingest,omitempty"`
+	PreviewProcessing string        `json:"previewProcessing,omitempty"`
 }
 
 func (r *recorder) state(id string) (recording string, pid *int, last *string, dir *string, started *string) {
@@ -185,17 +189,29 @@ func (c *Core) States() []runtimeState {
 	for _, ch := range channels {
 		rec, pid, last, dir, started := c.rec.state(ch.ID)
 		prev, pURL, pErr := c.prev.state(ch.ID)
+		processing := ""
+		if c.ingest != nil {
+			c.prev.mu.Lock()
+			if s := c.prev.sess[ch.ID]; s != nil && !s.exited {
+				processing = "copy"
+				if s.h264 {
+					processing = "transcode"
+				}
+			}
+			c.prev.mu.Unlock()
+		}
 		out = append(out, runtimeState{
-			ID:           ch.ID,
-			Recording:    rec,
-			Pid:          pid,
-			LastError:    last,
-			OutputDir:    dir,
-			StartedAt:    started,
-			Preview:      prev,
-			PreviewURL:   pURL,
-			PreviewError: pErr,
-			Ingest:       c.ingest.status(ch.ID),
+			ID:                ch.ID,
+			Recording:         rec,
+			Pid:               pid,
+			LastError:         last,
+			OutputDir:         dir,
+			StartedAt:         started,
+			Preview:           prev,
+			PreviewURL:        pURL,
+			PreviewError:      pErr,
+			Ingest:            c.ingest.status(ch.ID),
+			PreviewProcessing: processing,
 		})
 	}
 	return out
@@ -270,11 +286,18 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 		return errStr("可用空间不足，录像已暂停")
 	}
 	r.mu.Lock()
+	previousFailures := 0
 	if s := r.sess[ch.ID]; s != nil {
 		if p := s.process(); p != nil && !s.exited && processAlive(p.Pid) {
 			r.mu.Unlock()
 			return nil
 		}
+		if r.c.ingest != nil && s.exited && time.Now().Before(s.retryAt) {
+			after := s.retryAt
+			r.mu.Unlock()
+			return &ingestRetryError{after: after, operation: "录像写入"}
+		}
+		previousFailures = s.failures
 	}
 	r.mu.Unlock()
 	if r.c.ingest != nil {
@@ -294,6 +317,11 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 	}
 	dir, cached := r.c.writeDir(ch.ID)
 	stem := sanitizeFileStem(ch.Name)
+	if r.c.ingest != nil {
+		// A new recording within the same second must not overwrite an earlier
+		// session. Keep the timestamp suffix for indexing and process discovery.
+		stem += "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
 	pattern := filepath.Join(dir, stem+"-"+segmentStrftimeSuffix)
 	seg := ch.SegmentTimeSec
 	if seg < 10 {
@@ -318,17 +346,24 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 	eb := tailBuf(4096)
 	cmd.Stderr = eb
 	cmd.Stdout = nil
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		lease.Close()
+		return err
+	}
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
 		lease.Close()
 		return err
 	}
 	trackMediaChild(cmd)
-	session := &recSession{cmd: cmd, started: time.Now(), reason: reason, dir: dir, cached: cached, errBuf: eb, done: make(chan struct{})}
+	session := &recSession{cmd: cmd, started: time.Now(), reason: reason, dir: dir, cached: cached, errBuf: eb, done: make(chan struct{}), stdin: stdin, failures: previousFailures}
 	r.mu.Lock()
 	r.sess[ch.ID] = session
 	r.mu.Unlock()
 	go func() {
 		err := cmd.Wait()
+		stdin.Close()
 		lease.Close()
 		r.mu.Lock()
 		session.exited = true
@@ -336,9 +371,16 @@ func (r *recorder) startLocked(ch Channel, reason string) error {
 			session.exitText = cmd.ProcessState.String()
 		}
 		active := r.sess[ch.ID] == session
+		if active && r.c.ingest != nil {
+			if time.Since(session.started) >= 30*time.Second {
+				session.failures = 0
+			}
+			session.failures++
+			session.retryAt = time.Now().Add(mediaRetryDelay(time.Second, session.failures))
+		}
 		r.mu.Unlock()
 		close(session.done)
-		log.Printf("recording exit channel=%q pid=%d unexpected=%t error=%q detail=%q", ch.ID, cmd.Process.Pid, active, err, redactSecrets(eb.String()))
+		log.Printf("recording exit channel=%q pid=%d unexpected=%t error=%v detail=%q", ch.ID, cmd.Process.Pid, active, err, redactSecrets(eb.String()))
 	}()
 	log.Printf("recording start channel=%q pid=%d reason=%q cached=%t output=%q", ch.ID, cmd.Process.Pid, reason, cached, dir)
 	return nil
@@ -360,6 +402,16 @@ func (r *recorder) stopLocked(id string) {
 	}
 	if proc := s.process(); proc != nil {
 		log.Printf("recording stop channel=%q pid=%d", id, proc.Pid)
+		if s.stdin != nil && s.done != nil {
+			_, _ = io.WriteString(s.stdin, "q\n")
+			_ = s.stdin.Close()
+			select {
+			case <-s.done:
+				r.flushChannel(id, true)
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
 		_ = proc.Kill()
 	}
 	if s.done != nil {
@@ -867,31 +919,34 @@ func (c *Core) RunLoops() {
 	}
 	every(2*time.Second, c.pushStates)
 	every(2*time.Second, c.pushTimelines)
-	every(30*time.Second, func() {
-		if c.ingest == nil {
+	if c.ingest == nil {
+		every(30*time.Second, func() {
 			c.resumeRemembered()
-		}
-		c.rec.recycle()
-		c.prev.recycle()
-	})
+			c.rec.recycle()
+			c.prev.recycle()
+		})
+	}
 	every(30*time.Second, c.maybeCleanup)
 	every(5*time.Second, c.reconcileMediaMetadata)
-	every(5*time.Second, func() {
-		info := c.Disk()
-		if info.RecordingBlocked {
-			c.rec.mu.Lock()
-			count := len(c.rec.sess)
-			c.rec.mu.Unlock()
-			if count > 0 {
-				cacheFree := "unavailable"
-				if info.CacheFreeBytes != nil {
-					cacheFree = strconv.FormatUint(*info.CacheFreeBytes, 10)
-				}
-				log.Printf("recording paused storage critical recordings=%q freeBytes=%d cacheLevel=%q cacheFreeBytes=%s channels=%d", info.Path, info.FreeBytes, info.CacheLevel, cacheFree, count)
-			}
-			c.rec.stopAll()
-		}
-	})
+	every(5*time.Second, c.enforceRecordingStorage)
 	<-c.shutdownCh
 	lanes.Wait()
+}
+
+func (c *Core) enforceRecordingStorage() {
+	info := c.Disk()
+	if !info.RecordingBlocked {
+		return
+	}
+	c.rec.mu.Lock()
+	count := len(c.rec.sess)
+	c.rec.mu.Unlock()
+	if count > 0 {
+		cacheFree := "unavailable"
+		if info.CacheFreeBytes != nil {
+			cacheFree = strconv.FormatUint(*info.CacheFreeBytes, 10)
+		}
+		log.Printf("recording paused storage critical recordings=%q freeBytes=%d cacheLevel=%q cacheFreeBytes=%s channels=%d", info.Path, info.FreeBytes, info.CacheLevel, cacheFree, count)
+	}
+	c.rec.stopAll()
 }

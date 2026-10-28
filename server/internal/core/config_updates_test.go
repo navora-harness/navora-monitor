@@ -23,6 +23,7 @@ func updateTestCore(t *testing.T) *Core {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(c.StopAllMedia)
 	_, err = c.UpsertChannel(Channel{ID: "test", Name: "test", URL: "rtsp://127.0.0.1:1/test", Enabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +314,18 @@ func TestChannelEditRestartsRecordingAndPreservesReason(t *testing.T) {
 		t.Fatal("replacement started before old process exited")
 	}
 	args := strings.Join(session.cmd.Args, "|")
-	if !strings.Contains(args, input) || !strings.Contains(args, "-segment_time|20") {
+	wantInput := input
+	if c.ingest != nil {
+		c.ingest.mu.Lock()
+		source := c.ingest.sessions["test"]
+		if source == nil || source.channel.URL != input {
+			c.ingest.mu.Unlock()
+			t.Fatal("shared input uses stale source")
+		}
+		wantInput = source.url
+		c.ingest.mu.Unlock()
+	}
+	if !strings.Contains(args, wantInput) || !strings.Contains(args, "-segment_time|20") {
 		t.Fatal("replacement uses stale source or segment duration")
 	}
 	deadline := time.Now().Add(5 * time.Second)

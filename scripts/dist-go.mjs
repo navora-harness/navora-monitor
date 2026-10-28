@@ -192,16 +192,24 @@ function buildTarget(target, mode) {
 首次启动会在这个窗口打印管理员账户和初始密码，只显示一次。
 浏览器打开窗口里的本机地址即可使用。
 FFmpeg 放在 ffmpeg\\ 目录；发行包内的 FFmpeg 遵循 GPLv3。
+本版本默认让录像、实时预览和连接测试共用每通道一个摄像头输入。
+视频保留原编码，音频统一转换为 AAC；预览不再单独读取子码流。
+Beta 请先用独立数据目录验收；兼容回退和验证范围见 统一取流说明.md。
 `
       : `Navora Monitor ${version} (${target.id})
-Unpack, then run: ./${target.exe}
+Unpack, then grant execution permission: chmod +x ${target.exe} ffmpeg/ffmpeg ffmpeg/ffprobe
+Run: ./${target.exe}
 Config is stored under ./portable/
 First launch prints the admin username and one-time password in the terminal.
 Open the printed local URL in a browser.
 Bundled FFmpeg is under ./ffmpeg/ (GPLv3).
+Recording, live preview and diagnostics share one camera input per channel.
+Video is copied; optional audio is normalized to AAC. Preview uses the main stream.
+Validate this beta with separate data first; see 统一取流说明.md for rollout and rollback.
 `
   writeFileSync(join(stage, '使用说明.txt'), readme, 'utf8')
   writeFileSync(join(stage, 'README.txt'), readme, 'utf8')
+  copyFileSync(join(root, 'docs', 'v1-shared-ingest.md'), join(stage, '统一取流说明.md'))
   copyFileSync(join(root, 'LICENSE'), join(stage, 'LICENSE'))
   const canExecute = (target.goos === 'windows' ? process.platform === 'win32' : process.platform === target.goos) && process.arch === (target.goarch === 'amd64' ? 'x64' : target.goarch)
   writeFileSync(join(stage, 'MEDIA-BUILDINFO.json'), JSON.stringify({
@@ -218,7 +226,7 @@ Bundled FFmpeg is under ./ffmpeg/ (GPLv3).
     copyFileSync(join(root, 'docs', 'windows-install-update.md'), join(stage, '安装更新说明.md'))
   }
   const manifest = {}
-  for (const name of [target.exe, 'README.txt', 'LICENSE', 'MEDIA-BUILDINFO.json', ...(target.goos === 'windows' ? ['windows-deploy.ps1', '安装更新说明.md'] : []), ...(ff ? ['ffmpeg/' + target.ffmpegBin, 'ffmpeg/' + target.ffmpegBin.replace('ffmpeg','ffprobe'), 'ffmpeg/LICENSE.txt'] : [])]) {
+  for (const name of [target.exe, 'README.txt', '统一取流说明.md', 'LICENSE', 'MEDIA-BUILDINFO.json', ...(target.goos === 'windows' ? ['windows-deploy.ps1', '安装更新说明.md'] : []), ...(ff ? ['ffmpeg/' + target.ffmpegBin, 'ffmpeg/' + target.ffmpegBin.replace('ffmpeg','ffprobe'), 'ffmpeg/LICENSE.txt'] : [])]) {
     manifest[name] = createHash('sha256').update(readFileSync(join(stage,name))).digest('hex')
   }
   writeFileSync(join(stage,'manifest.json'), JSON.stringify({version,target:target.id,sha256:manifest}, null, 2))
